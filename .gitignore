@@ -1,0 +1,106 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Environment variables
+.env
+.env.local
+.env.production
+.env.staging
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
+.claude/settings.local.json
+
+# Documentation (local drafts)
+docs/
+learnings/
+
+# ChromaDB
+chroma_db/
+*.db
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Streamlit
+.streamlit/
+
+# macOS
+.DS_Store
+
+# Cache
+.cache/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Test coverage
+htmlcov/
+.coverage
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# API Keys and Secrets
+*.key
+*.pem
+secrets/
+
+# OS specific
+Thumbs.db
+desktop.ini
+
+# PyTorch/ML models
+*.pth
+*.pt
+models/
+checkpoints/
+
+# Node.js (if any frontend components added)
+node_modules/
+npm-debug.log*
+
+# Environment specific
+.python-version#
+
