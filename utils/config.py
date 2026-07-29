@@ -54,7 +54,148 @@ class Config:
             raise ValueError("MAX_PROVIDERS_PER_SEARCH must be a valid integer")
 
         self.EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-        self.MAX_PROVIDERS_TO_ENRICH: int = int(os.getenv("MAX_PROVIDERS_TO_ENRICH", "5"))
+        # THE RESEARCH BUDGET. One cut, pinned before enrichment and then
+        # honoured by the judge and the critic too — so this gates all three
+        # stages, and providers past it reach no model at all (marked
+        # `over_budget`, still ranked and still listed, never carded).
+        #
+        # It scales the bill close to linearly, because the two stages it now
+        # gates are where the money is:
+        #
+        #     enrichment   ~9% of a run
+        #     judge        ~20%
+        #     critic       ~54%    <- Opus 4.8, two parallel calls
+        #
+        # Until round 10 this capped enrichment ALONE — rationing the 9% stage
+        # while the 74% pair ran over the whole pool, and scoring providers
+        # nobody had researched (a rubric on an empty record grades OUR
+        # coverage and reports it as their quality). The percentages are from
+        # a measured live run and shift with pool size.
+        #
+        # The comment here previously called this "a RUNAWAY GUARD, not a
+        # rationing device", which was true only while it capped one cheap
+        # stage. It rations.
+        #
+        # ENRICHMENT_POOL_SIZE was retired here: it existed solely as the
+        # tier-1 boundary of a tiered budget that, at the observed pool size of
+        # 10 against a cap of 10, never rationed anything. Its clamp invariant
+        # (round 4) went with it — there is no second knob left to fall out of
+        # step with this one.
+        #
+        # 10 -> 8 (2026-07-28). Two reasons, one measured and one structural:
+        #
+        #   * It equals ENRICHMENT_MAX_WORKERS, so enrichment is exactly ONE
+        #     wave. At 10 against 8 workers the second wave carried two
+        #     providers and still cost a full wave — ~18s of pure latency for
+        #     20% of the work. The alignment is a PROPERTY of these two
+        #     defaults, not an invariant: raise this knob alone and waves come
+        #     back, which is correct behaviour, just slower.
+        #   * It gates the two most expensive stages (judge ~20%, critic ~54%),
+        #     so the cut is close to linear in both.
+        #
+        # What it COSTS is shortlist headroom. The shortlist is 5, drawn only
+        # from providers that completed all three stages, so a budget of 10 left
+        # room for 5 to come back unrecommendable and a budget of 8 leaves room
+        # for 3. The 2026-07-28 run had at least 6 recommendable out of 10, so
+        # 8 should still fill a page — but a short shortlist is the correct
+        # failure here (see the register), not a bug to pad around, and this is
+        # the knob to raise if pages start arriving with four cards.
+        self.MAX_PROVIDERS_TO_ENRICH: int = int(os.getenv("MAX_PROVIDERS_TO_ENRICH", "8"))
+
+        # How many providers enrichment researches CONCURRENTLY. Each one is an
+        # independent Tavily search plus a Haiku extraction (~18s serially), so
+        # this sets the number of waves the stage runs in, not the amount of
+        # work: ceil(MAX_PROVIDERS_TO_ENRICH / this).
+        #
+        # It was a hardcoded 4, which at the standard budget of 10 meant THREE
+        # sequential waves — the last of them half empty and still costing a
+        # full wave. The 2026-07-28 field run measured the enrichment stage at
+        # ~54s of a 145s search, and the timeline blamed the preference scorer
+        # for all of it (see the orchestrator's enrich_reviews step).
+        #
+        # 8 rather than 10: it takes 10 providers from three waves to two, and
+        # keeps a bound if MAX_PROVIDERS_TO_ENRICH is ever raised — an unbounded
+        # pool would fan out as wide as the budget and invite provider-side
+        # throttling. `_search_providers` already retries once on a transient
+        # failure, which is the backstop if a burst is throttled anyway.
+        self.ENRICHMENT_MAX_WORKERS: int = int(os.getenv("ENRICHMENT_MAX_WORKERS", "8"))
+
+        # Whether the rubric judge scores the pool in TWO concurrent calls
+        # (~24.4s -> ~14s) instead of one. Off restores the single call and
+        # changes nothing else — see `_should_split_judge`.
+        #
+        # This is the only one of Phase 2's three splits with a knob, and the
+        # asymmetry is the point. Discovery's pages and the critic's verdicts
+        # are per-item and independent: nothing in either prompt compares one
+        # item to another, so a split cannot change an answer. The judge is
+        # different in kind — its bands are anchored PROSE, and a model
+        # calibrates prose against the examples in the call with it. Splitting
+        # it is a bet that the anchors are absolute enough, and the only way to
+        # settle that bet is a live run comparing the halves. Until one has
+        # been done, the bet needs an off switch that is not a code change.
+        self.JUDGE_PARALLEL_ENABLED: bool = os.getenv(
+            "JUDGE_PARALLEL_ENABLED", "true"
+        ).lower() == "true"
+
+        # Enrichment cache: how long stored review/tenure/insurance evidence
+        # stays usable. Seven rather than five because ratings and review
+        # counts drift slowly, while a 7-day window nearly doubles the hit rate
+        # over a 5-day one. Set to 0 to disable reuse entirely (every search
+        # runs cold) without touching the stored data.
+        self.PROVIDER_CACHE_TTL_DAYS: float = float(
+            os.getenv("PROVIDER_CACHE_TTL_DAYS", "7")
+        )
+
+        # Per-role model knobs — env flips instead of code changes for model
+        # experiments. GATHERER (extraction, highest call volume) and CRITIC
+        # are Anthropic model IDs; JUDGE is an OpenAI model ID (the scorer
+        # uses the OpenAI client — cross-family judge/critic independence is
+        # deliberate: the validator shouldn't share the scorer's blind
+        # spots). Critic defaults to Opus 4.8: bias detection and red-flag
+        # analysis are the deepest-reasoning role, and its output reorders
+        # the final list.
+        self.GATHERER_MODEL: str = os.getenv("GATHERER_MODEL", "claude-haiku-4-5")
+        # Judge default is the FULL id "gpt-5.6-terra" — the bare "gpt-5.6"
+        # alias routes to Sol, the $5/$30 frontier tier (2x Terra's price).
+        self.JUDGE_MODEL: str = os.getenv("JUDGE_MODEL", "gpt-5.6-terra")
+        self.CRITIC_MODEL: str = os.getenv("CRITIC_MODEL", "claude-opus-4-8")
+
+        # Multi-query recall (discovery). A single web query returns a pool
+        # pre-clustered by whatever "best-of" pages exist for one city; several
+        # phrasings surface more distinct providers, and — only when the home
+        # pool comes back THIN — the search rings out to nearby cities inside
+        # DEFAULT_SEARCH_RADIUS.
+        self.MULTI_QUERY_ENABLED: bool = os.getenv("MULTI_QUERY_ENABLED", "true").lower() == "true"
+        # Ring-expansion trigger — the tunable knob governing cost vs breadth.
+        #
+        # Set equal to MAX_PROVIDERS_TO_ENRICH so the rule has a derivation:
+        # ring out exactly when the home city cannot fill the research budget.
+        # The equality is INTENT, not an enforced invariant (round 4's clamp
+        # between two knobs was deliberately removed) — lowering this alone is
+        # a valid "only rescue genuinely sparse towns" setting.
+        #
+        # MIN_DISTINCT_LOCATIONS was deleted in round 10 along with the
+        # clustering trigger it fed; see the note at the trigger in
+        # agents/data_gatherer.py for why no unit repairs that metric.
+        #
+        # 10 -> 8 (2026-07-28), moved WITH MAX_PROVIDERS_TO_ENRICH so the
+        # derivation above survives rather than becoming a stale comment beside
+        # a changed number.
+        #
+        # This does NOT promise the ring stops firing. Round 12 measured
+        # discovery recall at ~7 names from a 15-entry listicle, so a home pool
+        # of 7 still trips a threshold of 8 — which is the ring behaving as the
+        # rescue it was built to be. What changes is its BLAST RADIUS: with the
+        # budget also at 8, a home pool of 7 leaves the ring at most ONE
+        # researched slot to fill, where at a budget of 10 it could fill three,
+        # each costing an enrichment search, a judge slot and an Opus verdict.
+        # `ring_contribution` on the next run says whether even that one earns
+        # its place; going to 6 or 7 is the setting that would stop it outright.
+        self.MIN_CANDIDATE_POOL: int = int(os.getenv("MIN_CANDIDATE_POOL", "8"))
+        self.MAX_RING_CITIES: int = int(os.getenv("MAX_RING_CITIES", "2"))
+        # Tavily depth: "basic" is 1 credit and fast, "advanced" is 2 credits
+        # and slower but digs deeper. The UI's fast-demo toggle sets this.
+        self.TAVILY_SEARCH_DEPTH: str = os.getenv("TAVILY_SEARCH_DEPTH", "basic")
 
         # FHIR Integration Settings
         self.FHIR_ENABLED: bool = os.getenv("FHIR_ENABLED", "false").lower() == "true"

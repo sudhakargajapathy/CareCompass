@@ -1,0 +1,19 @@
+# CareCompass theme — "Hearth" light design system
+# Palette source: the Care Navigator design prototype (Hearth tokens)
+
+[theme]
+base = "light"
+primaryColor = "#4A3525"              # clay-800: buttons, focus rings, progress
+backgroundColor = "#FBF7F1"           # warm cream page background
+secondaryBackgroundColor = "#F5EFE5"  # bone-50: sidebar, forms, expanders
+textColor = "#2B2018"                 # ink
+linkColor = "#7D5A3F"                 # clay-600
+borderColor = "#E0D3BE"               # bone-200
+baseRadius = "12px"
+buttonRadius = "999px"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false

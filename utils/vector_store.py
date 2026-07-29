@@ -1,16 +1,73 @@
 """ChromaDB vector store operations for healthcare provider data."""
 
 import logging
-from typing import Dict, List, Optional, Any
+import time
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any, Tuple
 import chromadb
 from chromadb.config import Settings
 from openai import OpenAI
 import json
 
 from .config import get_config
+from .cost_tracker import get_cost_tracker, safe_usage
 from .encryption import get_encryptor
+from .provider_key import provider_cache_key, resolve_cache_key
 
 logger = logging.getLogger(__name__)
+
+# Bumped whenever the stored record shape changes incompatibly. Records written
+# under an older version are ignored on read (and cleared on first use), because
+# a cache that silently serves a stale SHAPE is worse than a cold start.
+CACHE_SCHEMA_VERSION = "2"
+
+# Enrichment-derived fields — the expensive half of a search, and the only
+# thing worth storing. Everything else is either cheap to recompute or depends
+# on the CURRENT search (see _CACHE_EXCLUDED below).
+CACHEABLE_FIELDS = (
+    "review_observations",
+    "review_summary",
+    "review_sentiment",
+    "review_source_url",
+    "insurance_accepted",
+    "insurance_source_url",
+    "years_experience",
+    "location",
+)
+
+# Evidence that only enrichment can produce. `location` is excluded on purpose:
+# discovery already supplies it, so it cannot serve as proof that a search
+# learned anything. See `cacheable_payload`.
+SUBSTANTIVE_CACHE_FIELDS = tuple(f for f in CACHEABLE_FIELDS if f != "location")
+
+# Values the extractor writes when it found NOTHING. They are indistinguishable
+# from evidence by an emptiness test, which is how they defeated the guard.
+_PLACEHOLDER_VALUES = frozenset(
+    {"no reviews available", "unknown", "n/a", "na", "none", "not available"}
+)
+
+
+def _is_placeholder(value: Any) -> bool:
+    """True for a stand-in the extractor emits in place of missing data."""
+    return (
+        isinstance(value, str)
+        and value.strip().lower() in _PLACEHOLDER_VALUES
+    )
+
+# Never cached, and asserted in tests. Distance depends on the USER's location:
+# a Chandler distance restored into a Phoenix search would be wrong AND would
+# read as measured rather than imputed. Scores depend on per-search weights.
+_CACHE_EXCLUDED = (
+    "computed_distance_miles",
+    "location_match",
+    "location_evidence",
+    "distance",
+    "base_score",
+    "final_score",
+    "refined_score",
+    "ai_score",
+    "rank",
+)
 
 
 class ProviderVectorStore:
@@ -71,6 +128,28 @@ class ProviderVectorStore:
             logger.error(f"Failed to get embedding: {e}")
             raise
 
+    def _get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
+        """Get OpenAI embeddings for many texts in a single API call.
+
+        Args:
+            texts: Texts to embed
+
+        Returns:
+            One embedding per input text, in input order
+        """
+        try:
+            response = self.openai_client.embeddings.create(
+                model=self.config.EMBEDDING_MODEL,
+                input=texts
+            )
+            tokens, _ = safe_usage(response)
+            get_cost_tracker().record_embeddings(tokens, model=self.config.EMBEDDING_MODEL)
+            # response.data is index-ordered to match the input list
+            return [item.embedding for item in response.data]
+        except Exception as e:
+            logger.error(f"Failed to get batch embeddings: {e}")
+            raise
+
     def _create_provider_text(self, provider: Dict[str, Any]) -> str:
         """Create searchable text representation of provider.
 
@@ -123,7 +202,6 @@ class ProviderVectorStore:
             documents = []
             metadatas = []
             ids = []
-            embeddings = []
 
             for i, provider in enumerate(providers):
                 # Create searchable text
@@ -131,33 +209,38 @@ class ProviderVectorStore:
                 documents.append(doc_text)
 
                 # Encrypt sensitive provider data before storing
-                encrypted_provider, key_id = self.encryptor.encrypt_data_with_key_id(provider)
+                encrypted_provider = self.encryptor.encrypt_data(provider)
 
                 # Create metadata (ChromaDB requires string values)
                 # Store non-sensitive fields in plain text for searching
                 # Store full provider data encrypted
                 metadata = {
+                    "provider_key": provider_cache_key(
+                        provider.get("name"), provider.get("location")
+                    ),
                     "name": str(provider.get("name", "")),
                     "specialty": str(provider.get("specialty", "")),
                     "location": str(provider.get("location", "")),
                     "phone_encrypted": "yes",  # Indicator that phone is encrypted
                     "rating": str(provider.get("rating", "0")),
                     "distance": str(provider.get("distance", "0")),
-                    "raw_data_encrypted": encrypted_provider,  # Store encrypted full provider data
-                    "raw_data_key_id": key_id
+                    "raw_data_encrypted": encrypted_provider  # Full provider data, encrypted
                 }
                 metadatas.append(metadata)
 
-                # Create unique ID
-                provider_id = f"provider_{i}_{hash(provider.get('name', ''))}"
-                ids.append(provider_id)
+                # Deterministic ID. The previous scheme was
+                # f"provider_{i}_{hash(name)}" — Python salts str hashes per
+                # process, and `i` is the list index, so the same provider got
+                # a fresh ID on every restart AND at every rank. Nothing could
+                # ever be looked up, and the collection grew duplicates without
+                # bound.
+                ids.append(metadata["provider_key"])
 
-                # Get embedding
-                embedding = self._get_embedding(doc_text)
-                embeddings.append(embedding)
+            # One embeddings request for all providers instead of one per provider
+            embeddings = self._get_embeddings_batch(documents)
 
-            # Add to collection
-            self.collection.add(
+            # upsert, not add: re-encountering a provider must REPLACE its row.
+            self.collection.upsert(
                 documents=documents,
                 metadatas=metadatas,
                 ids=ids,
@@ -226,7 +309,7 @@ class ProviderVectorStore:
 
                     # Decrypt provider data
                     if "raw_data_encrypted" in metadata:
-                        provider_data = self.encryptor.decrypt_data(metadata["raw_data_encrypted"], metadata.get("raw_data_key_id"))
+                        provider_data = self.encryptor.decrypt_data(metadata["raw_data_encrypted"])
                     else:
                         # Fallback for unencrypted data (backwards compatibility)
                         provider_data = json.loads(metadata.get("raw_data", "{}"))
@@ -278,7 +361,7 @@ class ProviderVectorStore:
                 for metadata in results["metadatas"][0]:
                     # Decrypt provider data
                     if "raw_data_encrypted" in metadata:
-                        provider_data = self.encryptor.decrypt_data(metadata["raw_data_encrypted"], metadata.get("raw_data_key_id"))
+                        provider_data = self.encryptor.decrypt_data(metadata["raw_data_encrypted"])
                     else:
                         # Fallback for unencrypted data (backwards compatibility)
                         provider_data = json.loads(metadata.get("raw_data", "{}"))
@@ -292,6 +375,162 @@ class ProviderVectorStore:
         except Exception as e:
             logger.error(f"Failed to filter providers: {e}")
             return []
+
+    # ---- enrichment cache -------------------------------------------------
+    #
+    # A KEYED lookup, deliberately not a similarity search. Two neurologists in
+    # one city produce near-identical embeddings — same specialty, same town,
+    # similar profile text — so cosine nearest-neighbour would happily return
+    # one physician's enriched reviews for another, and the resulting card would
+    # look complete and well-evidenced while being wrong. That is the exact
+    # failure `_observation_is_same_person` and `_name_token_overlap` exist to
+    # prevent; re-introducing it here would undo them one layer down, where
+    # nothing is watching. The embedding stays on the record for a possible
+    # "similar providers" feature — it just never decides identity.
+
+    @staticmethod
+    def cacheable_payload(provider: Dict[str, Any]) -> Dict[str, Any]:
+        """The enrichment-derived subset worth storing, and nothing else.
+
+        Returns {} when nothing SUBSTANTIVE was learned. `location` alone does
+        not count: discovery already supplies it, so a provider whose
+        enrichment found nothing would otherwise produce a truthy payload, get
+        stored, and be served as a fresh hit for the whole TTL — the failed
+        lookup masquerading as cached evidence.
+
+        Neither do the extractor's PLACEHOLDERS. `_extract_provider_data` sets
+        `review_summary = "No reviews available"` and `review_sentiment =
+        "unknown"` on every provider whether or not anything was found, and
+        both fields are substantive — so the emptiness test alone admitted
+        them and the guard never fired for the case it exists to catch. A
+        provider whose enrichment found nothing was cached, then served for
+        the full TTL and excluded from every live retry, and the placeholder
+        could overwrite a real summary a later candidate pass had found.
+        """
+        payload = {
+            field: provider[field]
+            for field in CACHEABLE_FIELDS
+            if provider.get(field) not in (None, "", [], {})
+            and not _is_placeholder(provider.get(field))
+        }
+        if not any(field in payload for field in SUBSTANTIVE_CACHE_FIELDS):
+            return {}
+        return payload
+
+    def get_cached_providers(
+        self,
+        providers: List[Dict[str, Any]],
+        ttl_days: Optional[float] = None,
+    ) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+        """Fetch fresh cached enrichment for the given providers, by key.
+
+        One `.get` for the whole pool: no embedding call, no network request.
+
+        Returns (payload_by_key, stale_keys) — stale keys are reported so the
+        caller can log them; they are treated exactly like misses.
+        """
+        if not providers:
+            return {}, []
+
+        ttl = self.config.PROVIDER_CACHE_TTL_DAYS if ttl_days is None else ttl_days
+        keys = [
+            resolve_cache_key(p) for p in providers
+        ]
+
+        try:
+            result = self.collection.get(
+                where={"provider_key": {"$in": keys}},
+                include=["metadatas"],
+            )
+        except Exception as e:
+            # A cache that cannot be read is a cold start, never an error.
+            logger.warning(f"Cache lookup failed, treating as all-miss: {e}")
+            return {}, []
+
+        now = time.time()
+        cutoff = ttl * 86400.0
+        fresh: Dict[str, Dict[str, Any]] = {}
+        stale: List[str] = []
+
+        for metadata in (result.get("metadatas") or []):
+            if not metadata:
+                continue
+            key = metadata.get("provider_key")
+            if not key:
+                continue
+
+            if str(metadata.get("schema_version", "")) != CACHE_SCHEMA_VERSION:
+                stale.append(key)
+                continue
+
+            try:
+                age = now - float(metadata.get("enriched_at_epoch", 0) or 0)
+            except (TypeError, ValueError):
+                stale.append(key)
+                continue
+
+            # Freshness is compared HERE rather than as a Chroma numeric filter
+            # so the rule is unit-testable without a database.
+            if age >= cutoff:
+                stale.append(key)
+                continue
+
+            payload = self.encryptor.decrypt_data(metadata.get("raw_data_encrypted"))
+            if isinstance(payload, dict) and payload:
+                payload["cached_enriched_at"] = metadata.get("enriched_at_iso", "")
+                fresh[key] = payload
+
+        return fresh, stale
+
+    def upsert_enriched_providers(self, providers: List[Dict[str, Any]]) -> int:
+        """Store enrichment results under deterministic keys. Returns count written.
+
+        Only providers carrying real enrichment are written — storing an empty
+        payload would let a failed lookup masquerade as a fresh cache hit for
+        the next `PROVIDER_CACHE_TTL_DAYS`, which is strictly worse than a miss.
+        """
+        writable = [
+            (p, self.cacheable_payload(p))
+            for p in (providers or [])
+            if p.get("name")
+        ]
+        writable = [(p, payload) for p, payload in writable if payload]
+        if not writable:
+            return 0
+
+        try:
+            now = time.time()
+            stamped_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            ids, documents, metadatas = [], [], []
+            for provider, payload in writable:
+                key = resolve_cache_key(provider)
+                ids.append(key)
+                documents.append(self._create_provider_text(provider))
+                metadatas.append({
+                    "provider_key": key,
+                    "name": str(provider.get("name", "")),
+                    "specialty": str(provider.get("specialty", "")),
+                    "location": str(provider.get("location", "")),
+                    "schema_version": CACHE_SCHEMA_VERSION,
+                    "enriched_at_epoch": now,
+                    "enriched_at_iso": stamped_iso,
+                    "raw_data_encrypted": self.encryptor.encrypt_data(payload),
+                })
+
+            self.collection.upsert(
+                documents=documents,
+                metadatas=metadatas,
+                ids=ids,
+                embeddings=self._get_embeddings_batch(documents),
+            )
+            logger.info(f"Cached enrichment for {len(ids)} providers")
+            return len(ids)
+
+        except Exception as e:
+            # Failing to WRITE the cache must never fail the search.
+            logger.warning(f"Failed to cache enriched providers: {e}")
+            return 0
 
     def get_collection_stats(self) -> Dict[str, int]:
         """Get statistics about the provider collection.

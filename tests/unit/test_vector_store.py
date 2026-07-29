@@ -153,8 +153,8 @@ class TestAddProviders:
         result = store.add_providers([sample_providers[0]])
 
         assert result is True
-        mock_collection.add.assert_called_once()
-        call_args = mock_collection.add.call_args[1]
+        mock_collection.upsert.assert_called_once()
+        call_args = mock_collection.upsert.call_args[1]
         assert len(call_args["documents"]) == 1
         assert len(call_args["metadatas"]) == 1
         assert len(call_args["ids"]) == 1
@@ -179,8 +179,8 @@ class TestAddProviders:
         result = store.add_providers(sample_providers)
 
         assert result is True
-        mock_collection.add.assert_called_once()
-        call_args = mock_collection.add.call_args[1]
+        mock_collection.upsert.assert_called_once()
+        call_args = mock_collection.upsert.call_args[1]
         assert len(call_args["documents"]) == len(sample_providers)
         assert len(call_args["metadatas"]) == len(sample_providers)
 
@@ -195,7 +195,7 @@ class TestAddProviders:
         result = store.add_providers([])
 
         assert result is True
-        mock_collection.add.assert_not_called()
+        mock_collection.upsert.assert_not_called()
 
     @patch('utils.vector_store.chromadb.PersistentClient')
     @patch('utils.vector_store.OpenAI')
@@ -214,17 +214,17 @@ class TestAddProviders:
         store = ProviderVectorStore()
         store.add_providers([sample_providers[0]])
 
-        call_args = mock_collection.add.call_args[1]
+        call_args = mock_collection.upsert.call_args[1]
         metadata = call_args["metadatas"][0]
 
         # Check all metadata values are strings
         assert isinstance(metadata["name"], str)
         assert isinstance(metadata["specialty"], str)
         assert isinstance(metadata["rating"], str)
-        assert isinstance(metadata["raw_data"], str)
+        assert isinstance(metadata["raw_data_encrypted"], str)
 
-        # Check raw_data is valid JSON
-        provider_data = json.loads(metadata["raw_data"])
+        # Full provider data is stored encrypted and round-trips
+        provider_data = store.encryptor.decrypt_data(metadata["raw_data_encrypted"])
         assert provider_data["name"] == sample_providers[0]["name"]
 
     @patch('utils.vector_store.chromadb.PersistentClient')
@@ -232,7 +232,7 @@ class TestAddProviders:
     def test_add_providers_failure_handling(self, mock_openai, mock_chroma, mock_env_vars, sample_providers):
         """Test add_providers handles failures gracefully."""
         mock_collection = Mock()
-        mock_collection.add.side_effect = Exception("Database write error")
+        mock_collection.upsert.side_effect = Exception("Database write error")
         mock_chroma.return_value.get_or_create_collection.return_value = mock_collection
 
         mock_embedding_obj = Mock()

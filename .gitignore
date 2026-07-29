@@ -47,8 +47,11 @@ env/
 !.claude/hooks/
 .claude/settings.local.json
 
-# Documentation (local drafts)
-docs/
+# Documentation (local drafts; the public architecture doc is the tracked
+# exception — a bare `docs/` rule silently ate it, which is how the README
+# shipped with a dead ARCHITECTURE.md link)
+docs/*
+!docs/ARCHITECTURE.md
 learnings/
 
 # ChromaDB
@@ -60,8 +63,9 @@ chroma_db/
 *.log
 logs/
 
-# Streamlit
-.streamlit/
+# Streamlit — keep theme config in git, never secrets
+.streamlit/*
+!.streamlit/config.toml
 
 # macOS
 .DS_Store
@@ -104,3 +108,7 @@ npm-debug.log*
 # Environment specific
 .python-version#
 
+
+# Generated coverage artifacts
+coverage.xml
+htmlcov/

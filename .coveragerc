@@ -1,0 +1,14 @@
+# Coverage configuration (picked up automatically by pytest-cov)
+
+[run]
+omit =
+    */tests/*
+    */venv/*
+    */__pycache__/*
+    */chroma_db/*
+    utils/theme.py
+
+[report]
+precision = 2
+show_missing = True
+skip_covered = False

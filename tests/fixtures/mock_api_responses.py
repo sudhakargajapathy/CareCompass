@@ -63,7 +63,7 @@ MOCK_CLAUDE_EXTRACTION_RESPONSE = {
             ])
         }
     ],
-    "model": "claude-3-5-haiku-20241022",
+    "model": "claude-haiku-4-5",
     "usage": {"input_tokens": 500, "output_tokens": 300}
 }
 
@@ -78,7 +78,7 @@ MOCK_CLAUDE_INVALID_JSON_RESPONSE = {
             "text": "Here is the provider data: {invalid json that won't parse..."
         }
     ],
-    "model": "claude-3-5-haiku-20241022",
+    "model": "claude-haiku-4-5",
     "usage": {"input_tokens": 500, "output_tokens": 50}
 }
 
@@ -87,7 +87,7 @@ MOCK_GPT_RANKING_RESPONSE = {
     "id": "chatcmpl-ABC123",
     "object": "chat.completion",
     "created": 1234567890,
-    "model": "gpt-4o-mini",
+    "model": "gpt-5-mini",
     "choices": [
         {
             "index": 0,
@@ -161,7 +161,7 @@ MOCK_CLAUDE_VALIDATION_RESPONSE = {
             })
         }
     ],
-    "model": "claude-sonnet-4-20250514",
+    "model": "claude-sonnet-5",
     "usage": {"input_tokens": 1200, "output_tokens": 400}
 }
 
@@ -184,6 +184,6 @@ MOCK_CLAUDE_VALIDATION_MARKDOWN_WRAPPED = {
 ```"""
         }
     ],
-    "model": "claude-sonnet-4-20250514",
+    "model": "claude-sonnet-5",
     "usage": {"input_tokens": 1000, "output_tokens": 100}
 }

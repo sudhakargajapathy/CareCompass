@@ -4,11 +4,9 @@
 # Python files
 *.py text eol=lf
 *.pyw text eol=lf
-
 # Documentation
 *.md text eol=lf
 *.rst text eol=lf
-
 # Configuration files
 *.txt text eol=lf
 *.yml text eol=lf
@@ -17,22 +15,17 @@
 *.toml text eol=lf
 *.cfg text eol=lf
 *.ini text eol=lf
-
 # Docker files
 Dockerfile text eol=lf
 *.dockerfile text eol=lf
-
 # Shell scripts
 *.sh text eol=lf
-
 # Environment files
 .env* text eol=lf
-
 # Exclude files from language statistics
 *.md linguist-documentation
 requirements.txt linguist-generated
 .gitignore linguist-generated
-
 # Large File Storage (LFS) for ML models and data
 *.7z filter=lfs diff=lfs merge=lfs -text
 *.arrow filter=lfs diff=lfs merge=lfs -text
@@ -69,3 +62,4 @@ saved_model/**/* filter=lfs diff=lfs merge=lfs -text
 *.zip filter=lfs diff=lfs merge=lfs -text
 *.zst filter=lfs diff=lfs merge=lfs -text
 *tfevents* filter=lfs diff=lfs merge=lfs -text
+data/us_zip_coords.csv.gz filter=lfs diff=lfs merge=lfs -text
