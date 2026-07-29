@@ -121,7 +121,11 @@ See [`.env.example`](.env.example) for the full list of optional settings (auth,
 
 ## ☁️ Deploy to Hugging Face Spaces
 
-This repo is Docker-ready for Hugging Face Spaces (note the frontmatter at the top of this file). Create a **Docker** Space, push this repo, and set the API keys above under **Settings → Secrets**.
+This repo is Docker-ready for Hugging Face Spaces (note the frontmatter at the top of this file). In short: create a **Docker** Space, add the three API keys under **Settings → Variables and secrets**, and push this repo to the Space's `main` branch.
+
+**📖 Full walkthrough with diagrams, storage notes, and troubleshooting: [DEPLOY.md](DEPLOY.md).**
+
+> ⚠️ Leave `ENV` unset on Spaces. Setting `ENV=production` without an `AUTH_DATABASE_URL` locks the login screen and makes the Space unusable — see section 4 of [DEPLOY.md](DEPLOY.md).
 
 ## 🎯 Features
 
@@ -184,8 +188,9 @@ for rec in recommendations:
 ### Automated Tests
 
 ```bash
-pytest                # run the full suite
-pytest tests/unit     # unit tests only
+pip install -r requirements-dev.txt   # runtime deps + pytest
+pytest                                # run the full suite
+pytest tests/unit                     # unit tests only
 ```
 
 ### Running the MVP
@@ -214,8 +219,8 @@ pytest tests/unit     # unit tests only
 | **streamlit** | Web application framework | 1.29.0 |
 | **langchain** | LLM framework and utilities | 0.1.0 |
 | **langgraph** | Workflow orchestration | 0.0.20 |
-| **anthropic** | Claude API client | 0.8.1 |
-| **openai** | GPT-4 and embeddings | 1.6.1 |
+| **anthropic** | Claude API client | 0.75.0 |
+| **openai** | GPT-4 and embeddings | 2.14.0 |
 | **chromadb** | Vector database | 0.4.18 |
 | **tavily-python** | Web search API | 0.3.3 |
 | **plotly** | Interactive visualizations | 5.17.0 |
@@ -288,7 +293,7 @@ We welcome contributions to CareCompass! Please see our contributing guidelines 
 
 1. Fork the repository
 2. Create a feature branch: `git checkout -b feature/amazing-feature`
-3. Install development dependencies: `pip install -r requirements.txt`
+3. Install development dependencies: `pip install -r requirements-dev.txt`
 4. Make your changes with tests
 5. Submit a pull request
 

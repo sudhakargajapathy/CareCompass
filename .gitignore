@@ -77,6 +77,7 @@ temp/
 # Test coverage
 htmlcov/
 .coverage
+coverage.xml
 .pytest_cache/
 
 # Jupyter Notebook

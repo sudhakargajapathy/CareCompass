@@ -1,0 +1,38 @@
+# Keep the build context small so Hugging Face Spaces builds stay fast.
+.git
+.gitattributes
+.github
+.claude
+
+# Tests and dev tooling are not needed in the runtime image
+tests/
+pytest.ini
+requirements-dev.txt
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Local state that must never ship in the image
+.env
+.env.*
+!.env.example
+chroma_db/
+logs/
+*.log
+*.db
+*.sqlite3
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+*.swp
