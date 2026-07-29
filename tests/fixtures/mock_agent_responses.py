@@ -72,17 +72,27 @@ MOCK_OPENAI_RESPONSE = """
 [
   {
     "provider_index": 0,
-    "ai_rank": 1,
-    "ai_confidence": 95,
-    "reasoning": "Dr. Carter is the top choice due to her high rating and closer proximity.",
-    "strengths": ["Excellent ratings", "Accepts multiple insurances"],
+    "scores": {"review_substance": 42, "red_flags": 27, "practical_access": 15},
+    "evidence": {
+      "review_substance": "Patients praise her for her listening skills and accurate diagnoses.",
+      "red_flags": "no evidence",
+      "practical_access": "Patients mention easy scheduling and a responsive office."
+    },
+    "ai_score": 84,
+    "reasoning": "Dr. Carter has specific, consistent positive feedback and patients find the office easy to reach.",
+    "strengths": ["Excellent ratings", "Responsive office"],
     "concerns": ["None"]
   },
   {
     "provider_index": 1,
-    "ai_rank": 2,
-    "ai_confidence": 85,
-    "reasoning": "Dr. Adams is a strong second choice with extensive experience, but is farther away.",
+    "scores": {"review_substance": 33, "red_flags": 27, "practical_access": 9},
+    "evidence": {
+      "review_substance": "Patients say he is compassionate and thorough.",
+      "red_flags": "no evidence",
+      "practical_access": "no evidence"
+    },
+    "ai_score": 69,
+    "reasoning": "Dr. Adams has positive but generic feedback and no access signals either way.",
     "strengths": ["20+ years of experience"],
     "concerns": ["Greater distance"]
   }
@@ -168,13 +178,20 @@ MOCK_SCORED_PROVIDERS_RESULT = {
             "name": "Dr. Emily Carter",
             "final_rank": 1,
             "final_score": 95.5,
-            "ai_reasoning": "Top choice due to high ratings and close proximity."
+            "ai_reasoning": "Top choice due to high ratings and close proximity.",
+            # A scored provider carries the judge's rubric and the enrichment
+            # outcome; a recommendation asserts both, so a fixture without them
+            # is not a scored provider.
+            "enrichment_outcome": "enriched",
+            "ai_rubric": {"review_substance": 45.0, "red_flags": 28.0, "practical_access": 15.0},
         },
         {
             "name": "Dr. Ben Adams",
             "final_rank": 2,
             "final_score": 88.0,
-            "ai_reasoning": "Great experience, but farther away."
+            "ai_reasoning": "Great experience, but farther away.",
+            "enrichment_outcome": "enriched",
+            "ai_rubric": {"review_substance": 38.0, "red_flags": 26.0, "practical_access": 12.0},
         }
     ],
     "scoring_metadata": {

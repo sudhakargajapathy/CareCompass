@@ -232,11 +232,16 @@ class TestGatherProvidersFHIRMetadata:
     @patch("agents.data_gatherer.get_config")
     @patch("agents.data_gatherer.TavilyClient")
     @patch("agents.data_gatherer.Anthropic")
-    def test_search_metadata_includes_fhir_count(self, mock_anthropic_cls, mock_tavily_cls, mock_get_config, mock_config):
-        """gather_providers() includes fhir_count in search_metadata."""
+    def test_fhir_is_not_a_candidate_source(self, mock_anthropic_cls, mock_tavily_cls, mock_get_config, mock_config):
+        """Even with FHIR enabled, candidates come from the web search only.
+
+        The FHIR directory is a verification prototype, not a candidate
+        source — sandbox providers must never mix into real results.
+        """
         mock_get_config.return_value = mock_config
 
-        # Mock Tavily to return no results (isolate FHIR)
+        # Mock Tavily to return no results: with FHIR-as-source removed,
+        # no web results means no providers at all
         mock_tavily_instance = MagicMock()
         mock_tavily_instance.search.return_value = {"results": []}
         mock_tavily_cls.return_value = mock_tavily_instance
@@ -254,9 +259,9 @@ class TestGatherProvidersFHIRMetadata:
             agent = DataGathererAgent()
             result = agent.gather_providers("Neurology", "Phoenix, AZ")
 
-            assert "fhir_count" in result["search_metadata"]
-            assert result["search_metadata"]["fhir_count"] > 0
-            assert result["search_metadata"]["fhir_enabled"] is True
+            assert result["providers"] == []
+            assert result["status"] == "no_results"
+            assert result["search_metadata"]["fhir_count"] == 0
 
     @patch("agents.data_gatherer.get_config")
     @patch("agents.data_gatherer.TavilyClient")

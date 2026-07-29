@@ -14,6 +14,37 @@ from tests.fixtures.mock_api_responses import (
 )
 
 
+@pytest.fixture(autouse=True)
+def isolate_provider_cache(monkeypatch, request):
+    """Keep the unit suite away from the real ChromaDB on disk.
+
+    Phase 1 gave `enrich_providers` a cache read and write, which means any
+    test calling it reaches `get_vector_store()` — a singleton pointing at
+    ./chroma_db. That had two consequences, both found by a test that failed
+    only inside the full suite:
+
+      * tests mutated the developer's persistent store, and
+      * one test storing "Dr. Quiet" made the NEXT test's provider a cache
+        hit, so its enrichment was skipped and its assertions never ran.
+
+    A suite whose result depends on leftover disk state is worse than a
+    failing one. Tests that genuinely exercise the store (test_enrichment_cache)
+    construct ProviderVectorStore directly against tmp_path and opt out via the
+    `real_vector_store` marker.
+    """
+    if request.node.get_closest_marker("real_vector_store"):
+        yield
+        return
+
+    stub = MagicMock(name="isolated_vector_store")
+    stub.get_cached_providers.return_value = ({}, [])
+    stub.upsert_enriched_providers.return_value = 0
+    stub.add_providers.return_value = True
+    stub.get_collection_stats.return_value = {"total_providers": 0}
+    monkeypatch.setattr("utils.vector_store.get_vector_store", lambda: stub)
+    yield stub
+
+
 @pytest.fixture
 def mock_env_vars(monkeypatch):
     """Set up mock environment variables for testing."""
@@ -118,7 +149,7 @@ def mock_anthropic_client():
     mock_client = Mock()
     mock_message = Mock()
     mock_message.content = MOCK_CLAUDE_EXTRACTION_RESPONSE["content"]
-    mock_message.model = "claude-3-5-haiku-20241022"
+    mock_message.model = "claude-haiku-4-5"
     mock_client.messages.create = Mock(return_value=mock_message)
     return mock_client
 

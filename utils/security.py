@@ -156,8 +156,13 @@ class InputValidator:
         """
         sanitized = {}
 
-        # Validate numeric weights (must be 0-1)
-        for key in ['location_weight', 'rating_weight', 'insurance_priority']:
+        # Validate numeric weights (must be 0-1). ONLY the three real
+        # ranking weights survive: emitting legacy keys with defaults
+        # (insurance_priority: 0.0, notes: "") advertised phantom ranking
+        # factors to the critic — live, the bias analysis flagged
+        # "insurance excluded by weight 0.0" as a methodology bias when
+        # insurance was never a ranking factor at all.
+        for key in ['location_weight', 'rating_weight', 'experience_weight']:
             value = preferences.get(key, 0.0)
             try:
                 value = float(value)
@@ -167,10 +172,6 @@ class InputValidator:
             except (ValueError, TypeError):
                 logger.warning(f"Invalid preference value for {key}: {value}")
                 sanitized[key] = 0.0
-
-        # Sanitize notes
-        notes = preferences.get('notes', '')
-        sanitized['notes'] = InputValidator.sanitize_notes(notes)
 
         return sanitized
 

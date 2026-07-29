@@ -1,309 +1,171 @@
 """Unit tests for utils/config.py configuration management."""
 import pytest
-import os
 from utils.config import Config, get_config, check_environment
 
 
-class TestConfigValidation:
-    """Tests for API key validation."""
-
-    def test_validate_api_keys_all_present(self, mock_env_vars):
-        """Test validation when all API keys are present."""
+class TestApiKeyValidation:
+    def test_all_keys_present(self, mock_env_vars):
         config = Config()
-        validation = config.validate_api_keys()
+        assert config.validate_api_keys() == {"openai": True, "anthropic": True, "tavily": True}
+        assert config.get_missing_keys() == []
 
-        assert validation["openai"] is True
-        assert validation["anthropic"] is True
-        assert validation["tavily"] is True
+    @pytest.mark.parametrize(
+        "unset, expected_missing",
+        [
+            (["OPENAI_API_KEY"], {"openai"}),
+            (["APP_ANTHROPIC_API_KEY", "TAVILY_API_KEY"], {"anthropic", "tavily"}),
+            (["OPENAI_API_KEY", "APP_ANTHROPIC_API_KEY", "TAVILY_API_KEY"], {"openai", "anthropic", "tavily"}),
+        ],
+    )
+    def test_missing_keys_reported(self, mock_env_vars, monkeypatch, unset, expected_missing):
+        for var in unset:
+            monkeypatch.delenv(var, raising=False)
+        assert set(Config().get_missing_keys()) == expected_missing
 
-    def test_validate_api_keys_missing_openai(self, mock_env_missing_openai):
-        """Test validation when OpenAI key is missing."""
-        config = Config()
-        validation = config.validate_api_keys()
-
-        assert validation["openai"] is False
-        assert validation["anthropic"] is True
-        assert validation["tavily"] is True
-
-    def test_validate_api_keys_all_missing(self, mock_env_missing_all):
-        """Test validation when all keys are missing."""
-        config = Config()
-        validation = config.validate_api_keys()
-
-        assert validation["openai"] is False
-        assert validation["anthropic"] is False
-        assert validation["tavily"] is False
-
-    def test_validate_api_keys_empty_string(self, monkeypatch):
-        """Test validation treats empty strings as invalid."""
+    def test_blank_keys_treated_as_missing(self, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "")
         monkeypatch.setenv("APP_ANTHROPIC_API_KEY", "valid-key")
-        monkeypatch.setenv("TAVILY_API_KEY", "   ")  # Whitespace only
+        monkeypatch.setenv("TAVILY_API_KEY", "   ")  # whitespace only
 
-        config = Config()
-        validation = config.validate_api_keys()
-
-        assert validation["openai"] is False
-        assert validation["anthropic"] is True
-        assert validation["tavily"] is False
-
-
-class TestGetMissingKeys:
-    """Tests for get_missing_keys method."""
-
-    def test_get_missing_keys_none_missing(self, mock_env_vars):
-        """Test when no keys are missing."""
-        config = Config()
-        missing = config.get_missing_keys()
-
-        assert missing == []
-        assert len(missing) == 0
-
-    def test_get_missing_keys_one_missing(self, mock_env_missing_openai):
-        """Test when one key is missing."""
-        config = Config()
-        missing = config.get_missing_keys()
-
-        assert "openai" in missing
-        assert len(missing) == 1
-
-    def test_get_missing_keys_all_missing(self, mock_env_missing_all):
-        """Test when all keys are missing."""
-        config = Config()
-        missing = config.get_missing_keys()
-
-        assert set(missing) == {"openai", "anthropic", "tavily"}
-        assert len(missing) == 3
-
-    def test_get_missing_keys_multiple_missing(self, monkeypatch):
-        """Test when multiple keys are missing."""
-        monkeypatch.setenv("OPENAI_API_KEY", "valid-key")
-        monkeypatch.delenv("APP_ANTHROPIC_API_KEY", raising=False)
-        monkeypatch.delenv("TAVILY_API_KEY", raising=False)
-
-        config = Config()
-        missing = config.get_missing_keys()
-
-        assert "anthropic" in missing
-        assert "tavily" in missing
-        assert "openai" not in missing
-        assert len(missing) == 2
+        validation = Config().validate_api_keys()
+        assert validation == {"openai": False, "anthropic": True, "tavily": False}
 
 
 class TestEnvironmentSettings:
-    """Tests for environment-related settings."""
+    @pytest.mark.parametrize(
+        "env_value, expected",
+        [("production", True), ("PRODUCTION", True), ("development", False), (None, False)],
+    )
+    def test_is_production(self, monkeypatch, env_value, expected):
+        if env_value is None:
+            monkeypatch.delenv("ENV", raising=False)
+        else:
+            monkeypatch.setenv("ENV", env_value)
+        assert Config().is_production() is expected
 
-    def test_is_production_true(self, monkeypatch):
-        """Test is_production returns True for production env."""
-        monkeypatch.setenv("ENV", "production")
+
+class TestDefaultsAndOverrides:
+    def test_defaults(self, monkeypatch):
+        for var in (
+            "DEFAULT_SEARCH_RADIUS", "MAX_PROVIDERS_PER_SEARCH", "EMBEDDING_MODEL",
+            "APP_NAME", "DEBUG", "CHROMA_PERSIST_DIRECTORY", "CHROMA_COLLECTION_NAME",
+            "TAVILY_SEARCH_DEPTH", "MAX_PROVIDERS_TO_ENRICH",
+            "PROVIDER_CACHE_TTL_DAYS",
+            "GATHERER_MODEL", "JUDGE_MODEL", "CRITIC_MODEL",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
         config = Config()
-
-        assert config.is_production() is True
-
-    def test_is_production_true_case_insensitive(self, monkeypatch):
-        """Test is_production is case insensitive."""
-        monkeypatch.setenv("ENV", "PRODUCTION")
-        config = Config()
-
-        assert config.is_production() is True
-
-    def test_is_production_false_development(self, monkeypatch):
-        """Test is_production returns False for development."""
-        monkeypatch.setenv("ENV", "development")
-        config = Config()
-
-        assert config.is_production() is False
-
-    def test_is_production_false_default(self, monkeypatch):
-        """Test is_production returns False by default."""
-        monkeypatch.delenv("ENV", raising=False)
-        config = Config()
-
-        assert config.is_production() is False
-        assert config.ENV == "development"
-
-
-class TestDefaultValues:
-    """Tests for default configuration values."""
-
-    def test_default_search_radius(self, monkeypatch):
-        """Test DEFAULT_SEARCH_RADIUS has correct default."""
-        monkeypatch.delenv("DEFAULT_SEARCH_RADIUS", raising=False)
-        config = Config()
-
         assert config.DEFAULT_SEARCH_RADIUS == 25
-
-    def test_default_search_radius_custom(self, monkeypatch):
-        """Test DEFAULT_SEARCH_RADIUS can be customized."""
-        monkeypatch.setenv("DEFAULT_SEARCH_RADIUS", "50")
-        config = Config()
-
-        assert config.DEFAULT_SEARCH_RADIUS == 50
-
-    def test_max_providers_per_search_default(self, monkeypatch):
-        """Test MAX_PROVIDERS_PER_SEARCH has correct default."""
-        monkeypatch.delenv("MAX_PROVIDERS_PER_SEARCH", raising=False)
-        config = Config()
-
         assert config.MAX_PROVIDERS_PER_SEARCH == 20
-
-    def test_max_providers_per_search_custom(self, monkeypatch):
-        """Test MAX_PROVIDERS_PER_SEARCH can be customized."""
-        monkeypatch.setenv("MAX_PROVIDERS_PER_SEARCH", "30")
-        config = Config()
-
-        assert config.MAX_PROVIDERS_PER_SEARCH == 30
-
-    def test_embedding_model_default(self, monkeypatch):
-        """Test EMBEDDING_MODEL has correct default."""
-        monkeypatch.delenv("EMBEDDING_MODEL", raising=False)
-        config = Config()
-
         assert config.EMBEDDING_MODEL == "text-embedding-3-small"
-
-    def test_app_name_default(self, monkeypatch):
-        """Test APP_NAME has correct default."""
-        monkeypatch.delenv("APP_NAME", raising=False)
-        config = Config()
-
         assert config.APP_NAME == "CareCompass"
-
-    def test_debug_default_false(self, monkeypatch):
-        """Test DEBUG defaults to False."""
-        monkeypatch.delenv("DEBUG", raising=False)
-        config = Config()
-
         assert config.DEBUG is False
-
-    def test_debug_true(self, monkeypatch):
-        """Test DEBUG can be set to True."""
-        monkeypatch.setenv("DEBUG", "true")
-        config = Config()
-
-        assert config.DEBUG is True
-
-    def test_debug_case_insensitive(self, monkeypatch):
-        """Test DEBUG is case insensitive."""
-        monkeypatch.setenv("DEBUG", "TRUE")
-        config = Config()
-
-        assert config.DEBUG is True
-
-
-class TestChromaSettings:
-    """Tests for ChromaDB configuration."""
-
-    def test_chroma_persist_directory_default(self, monkeypatch):
-        """Test CHROMA_PERSIST_DIRECTORY has correct default."""
-        monkeypatch.delenv("CHROMA_PERSIST_DIRECTORY", raising=False)
-        config = Config()
-
         assert config.CHROMA_PERSIST_DIRECTORY == "./chroma_db"
-
-    def test_chroma_persist_directory_custom(self, monkeypatch):
-        """Test CHROMA_PERSIST_DIRECTORY can be customized."""
-        monkeypatch.setenv("CHROMA_PERSIST_DIRECTORY", "/tmp/test_chroma")
-        config = Config()
-
-        assert config.CHROMA_PERSIST_DIRECTORY == "/tmp/test_chroma"
-
-    def test_chroma_collection_name_default(self, monkeypatch):
-        """Test CHROMA_COLLECTION_NAME has correct default."""
-        monkeypatch.delenv("CHROMA_COLLECTION_NAME", raising=False)
-        config = Config()
-
         assert config.CHROMA_COLLECTION_NAME == "healthcare_providers"
+        assert config.TAVILY_SEARCH_DEPTH == "basic"
+        # THE RESEARCH BUDGET — it gates enrichment, the judge and the critic,
+        # so this number scales the bill close to linearly. Equal to
+        # ENRICHMENT_MAX_WORKERS by intent, which makes enrichment one wave.
+        assert config.MAX_PROVIDERS_TO_ENRICH == 8
+        assert config.ENRICHMENT_MAX_WORKERS == 8
+        assert config.PROVIDER_CACHE_TTL_DAYS == 7
+        # Per-role model knobs: critic defaults to the deepest-reasoning model;
+        # judge must be the FULL terra id (bare "gpt-5.6" routes to Sol at 2x)
+        assert config.GATHERER_MODEL == "claude-haiku-4-5"
+        assert config.JUDGE_MODEL == "gpt-5.6-terra"
+        assert config.CRITIC_MODEL == "claude-opus-4-8"
 
-    def test_chroma_collection_name_custom(self, monkeypatch):
-        """Test CHROMA_COLLECTION_NAME can be customized."""
-        monkeypatch.setenv("CHROMA_COLLECTION_NAME", "test_providers")
+    def test_cache_ttl_is_overridable(self, monkeypatch):
+        monkeypatch.setenv("PROVIDER_CACHE_TTL_DAYS", "3.5")
+        assert Config().PROVIDER_CACHE_TTL_DAYS == 3.5
+
+    def test_cache_ttl_zero_disables_reuse(self, monkeypatch):
+        """0 forces every search cold without discarding stored data — the
+        env-side equivalent of the sidebar's cold-run toggle."""
+        monkeypatch.setenv("PROVIDER_CACHE_TTL_DAYS", "0")
+        assert Config().PROVIDER_CACHE_TTL_DAYS == 0
+
+    def test_env_overrides(self, monkeypatch):
+        monkeypatch.setenv("DEFAULT_SEARCH_RADIUS", "50")
+        monkeypatch.setenv("MAX_PROVIDERS_PER_SEARCH", "10")
+        monkeypatch.setenv("DEBUG", "TRUE")
+        monkeypatch.setenv("CHROMA_PERSIST_DIRECTORY", "/custom/path")
+        monkeypatch.setenv("TAVILY_SEARCH_DEPTH", "advanced")
+        monkeypatch.setenv("CRITIC_MODEL", "claude-sonnet-5")
+
         config = Config()
+        assert config.DEFAULT_SEARCH_RADIUS == 50
+        assert config.MAX_PROVIDERS_PER_SEARCH == 10
+        assert config.DEBUG is True
+        assert config.CHROMA_PERSIST_DIRECTORY == "/custom/path"
+        assert config.TAVILY_SEARCH_DEPTH == "advanced"
+        assert config.CRITIC_MODEL == "claude-sonnet-5"
 
-        assert config.CHROMA_COLLECTION_NAME == "test_providers"
+    def test_invalid_integer_raises(self, monkeypatch):
+        monkeypatch.setenv("DEFAULT_SEARCH_RADIUS", "not-a-number")
+        with pytest.raises(ValueError, match="DEFAULT_SEARCH_RADIUS"):
+            Config()
 
 
 class TestFactoryFunctions:
-    """Tests for factory and helper functions."""
-
-    def test_get_config_returns_config_instance(self, mock_env_vars):
-        """Test get_config returns a Config instance."""
+    def test_get_config_returns_fresh_instance(self, mock_env_vars):
         config = get_config()
-
         assert isinstance(config, Config)
-        assert hasattr(config, "OPENAI_API_KEY")
-        assert hasattr(config, "validate_api_keys")
+        assert config.OPENAI_API_KEY is not None
 
-    def test_check_environment_all_keys_present(self, mock_env_vars):
-        """Test check_environment when all keys are valid."""
-        is_valid, missing_keys = check_environment()
+    def test_check_environment(self, mock_env_vars, monkeypatch):
+        is_valid, missing = check_environment()
+        assert is_valid is True and missing == []
 
-        assert is_valid is True
-        assert missing_keys == []
-
-    def test_check_environment_missing_keys(self, mock_env_missing_openai):
-        """Test check_environment when keys are missing."""
-        is_valid, missing_keys = check_environment()
-
-        assert is_valid is False
-        assert "openai" in missing_keys
-        assert len(missing_keys) == 1
-
-    def test_check_environment_all_missing(self, mock_env_missing_all):
-        """Test check_environment when all keys are missing."""
-        is_valid, missing_keys = check_environment()
-
-        assert is_valid is False
-        assert len(missing_keys) == 3
-        assert set(missing_keys) == {"openai", "anthropic", "tavily"}
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        is_valid, missing = check_environment()
+        assert is_valid is False and missing == ["openai"]
 
 
-class TestConfigIntegrity:
-    """Tests for configuration integrity and edge cases."""
+class TestResearchBudgetDefaults:
+    """The three knobs that decide how much of a search costs, and the two
+    relationships between their DEFAULTS that comments claim but nothing
+    checked."""
 
-    def test_api_keys_loaded_from_env(self, mock_env_vars):
-        """Test API keys are properly loaded from environment."""
+    def test_ring_trigger_defaults_to_the_research_budget(self):
+        """`MIN_CANDIDATE_POOL == MAX_PROVIDERS_TO_ENRICH` is what gives the
+        ring trigger a derivation rather than a preference: ring out exactly
+        when the home city cannot fill the research budget.
+
+        Both moved 10 -> 8 together on 2026-07-28. Moving one alone would leave
+        the other's comment describing a rule the code no longer follows —
+        which is how `MIN_CANDIDATE_POOL`'s justification would quietly become
+        fiction.
+
+        This pins the shipped DEFAULTS and deliberately does NOT constrain the
+        env vars. It is not round 4's clamp, which forced the two into step at
+        runtime and was removed on purpose: `MIN_CANDIDATE_POOL=5` ("only
+        rescue genuinely sparse towns") stays a legitimate setting.
+        """
         config = Config()
+        assert config.MIN_CANDIDATE_POOL == config.MAX_PROVIDERS_TO_ENRICH
 
-        assert config.OPENAI_API_KEY == "test-openai-key-12345"
-        assert config.ANTHROPIC_API_KEY == "test-anthropic-key-67890"
-        assert config.TAVILY_API_KEY == "test-tavily-key-abcde"
+    def test_the_budget_defaults_to_one_enrichment_wave(self):
+        """Enrichment costs ceil(budget / workers) waves. At a budget of 10
+        against 8 workers the second wave carried two providers and still cost
+        a full wave — ~18s of latency for 20% of the work.
 
-    def test_config_attributes_exist(self, mock_env_vars):
-        """Test all expected config attributes exist."""
+        Also a defaults-only property. Raising the budget alone brings waves
+        back, which is correct behaviour and not something to forbid.
+        """
         config = Config()
+        waves = -(-config.MAX_PROVIDERS_TO_ENRICH // config.ENRICHMENT_MAX_WORKERS)
+        assert waves == 1
 
-        # API Keys
-        assert hasattr(config, "OPENAI_API_KEY")
-        assert hasattr(config, "ANTHROPIC_API_KEY")
-        assert hasattr(config, "TAVILY_API_KEY")
+    def test_the_knobs_are_still_independently_overridable(self, monkeypatch):
+        """The defaults agree; the env is free. Guards against someone reading
+        the two tests above as an invariant and clamping them in code."""
+        monkeypatch.setenv("MIN_CANDIDATE_POOL", "5")
+        monkeypatch.setenv("MAX_PROVIDERS_TO_ENRICH", "12")
+        monkeypatch.setenv("ENRICHMENT_MAX_WORKERS", "4")
 
-        # App Settings
-        assert hasattr(config, "APP_NAME")
-        assert hasattr(config, "ENV")
-        assert hasattr(config, "DEBUG")
-
-        # ChromaDB
-        assert hasattr(config, "CHROMA_PERSIST_DIRECTORY")
-        assert hasattr(config, "CHROMA_COLLECTION_NAME")
-
-        # Search Parameters
-        assert hasattr(config, "DEFAULT_SEARCH_RADIUS")
-        assert hasattr(config, "MAX_PROVIDERS_PER_SEARCH")
-        assert hasattr(config, "EMBEDDING_MODEL")
-
-    def test_integer_parsing_handles_invalid_input(self, monkeypatch):
-        """Test integer config values handle invalid input gracefully."""
-        # Note: This will raise ValueError in current implementation
-        # This test documents the behavior - consider adding error handling
-        monkeypatch.setenv("DEFAULT_SEARCH_RADIUS", "invalid")
-
-        with pytest.raises(ValueError):
-            config = Config()
-
-    def test_multiple_config_instances_share_values(self, mock_env_vars):
-        """Test multiple Config instances see same environment values."""
-        config1 = Config()
-        config2 = Config()
-
-        assert config1.OPENAI_API_KEY == config2.OPENAI_API_KEY
-        assert config1.DEFAULT_SEARCH_RADIUS == config2.DEFAULT_SEARCH_RADIUS
+        config = Config()
+        assert config.MIN_CANDIDATE_POOL == 5
+        assert config.MAX_PROVIDERS_TO_ENRICH == 12
+        assert config.ENRICHMENT_MAX_WORKERS == 4

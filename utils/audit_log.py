@@ -37,9 +37,19 @@ def log_audit_event(
     }
 
     log_path = config.AUDIT_LOG_PATH
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
+    # Inside the try, not before it. `os.makedirs("")` raises FileNotFoundError
+    # — which AUDIT_LOG_PATH="audit.log" (a bare filename, with no directory
+    # part) produces every single time — and sitting outside the handler it
+    # escaped into the callers. Those callers are the login path
+    # (utils/auth.py) and the search path (app.py), including app.py's
+    # `workflow_failed` handler, so a one-word misconfiguration took down
+    # sign-in and turned every workflow error into a crash. Audit logging is
+    # observability: it must never be able to fail the action it observes.
     try:
+        directory = os.path.dirname(log_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
         with open(log_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, separators=(",", ":")) + "\n")
     except OSError as exc:
