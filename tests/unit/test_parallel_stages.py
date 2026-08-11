@@ -375,10 +375,15 @@ class TestValidationSplit:
         })
         return response
 
-    def test_a_full_pool_is_validated_by_two_concurrent_calls(self, critic_validator):
+    def test_a_full_pool_is_validated_by_three_concurrent_calls(self, critic_validator):
+        """Three since the 2026-08-06 call_timings reading (deep shards
+        18.88s/16.02s were the stage's pole against the trimmed bias call's
+        12.61s); a budget pool of 8 deals 3/3/2. The ceil(pool/3) cap keeps
+        the floor test below meaningful — a pool of 4 still deals 2/2, never
+        2/1/1."""
         critic_validator.anthropic_client.messages.create.return_value = self._response([])
         critic_validator._validate_top_recommendations(self._pool(8))
-        assert critic_validator.anthropic_client.messages.create.call_count == 2
+        assert critic_validator.anthropic_client.messages.create.call_count == 3
 
     def test_a_small_pool_stays_one_call(self, critic_validator):
         critic_validator.anthropic_client.messages.create.return_value = self._response([])

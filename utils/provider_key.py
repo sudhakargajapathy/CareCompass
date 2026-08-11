@@ -129,6 +129,18 @@ def normalized_place(location: Optional[str]) -> str:
     return _WS_RE.sub(" ", cleaned).strip()
 
 
+def basis_cache_key(basis: str) -> str:
+    """The key a given basis string ("normalized name|place") mints.
+
+    Split out of `provider_cache_key` so the cache-inventory join can hash a
+    provider's RECORDED `cache_basis` exactly as pinned, rather than
+    re-normalizing name and location — re-normalization would silently agree
+    with itself and could never expose a basis that drifted between runs,
+    which is the one thing the join exists to show.
+    """
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+
+
 def provider_cache_key(name: Optional[str], location: Optional[str]) -> str:
     """Deterministic cache key for one physician in one city.
 
@@ -139,8 +151,7 @@ def provider_cache_key(name: Optional[str], location: Optional[str]) -> str:
     previous ID scheme used it and therefore produced a different ID after
     every restart, which is why nothing could ever be looked up.
     """
-    basis = f"{normalized_name(name)}|{normalized_place(location)}"
-    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+    return basis_cache_key(f"{normalized_name(name)}|{normalized_place(location)}")
 
 
 # Where a provider's key is pinned for the duration of one enrichment pass.

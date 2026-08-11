@@ -484,3 +484,51 @@ class TestSingletonPattern:
 
         assert store1 is store2
         mock_chroma.assert_called_once()  # Should only initialize once
+
+
+class TestProvenanceTravelsWithItsValue:
+    """A warm hit must not pair a cached value with a stale label.
+
+    `provider.update(payload)` restores a cached address over a provider whose
+    `location_source` still names THIS run's listing page — a wrong answer to
+    the exact question the field exists to answer. So the provenance fields
+    are cacheable — and deliberately NOT substantive, or `location_source`
+    (which discovery writes on every parsed provider) would make an empty
+    enrichment look like evidence and revive the cache-a-failed-lookup bug.
+    """
+
+    def test_provenance_fields_are_cacheable(self):
+        from utils.vector_store import CACHEABLE_FIELDS
+        for field in ("location_source", "experience_source", "address_conflict"):
+            assert field in CACHEABLE_FIELDS
+
+    def test_provenance_alone_is_not_substantive(self):
+        from utils.vector_store import SUBSTANTIVE_CACHE_FIELDS
+        for field in ("location", "location_source", "experience_source",
+                      "address_conflict"):
+            assert field not in SUBSTANTIVE_CACHE_FIELDS
+
+    def test_a_provider_with_only_location_and_provenance_is_not_cached(self):
+        """The composed guard: the exact failed-lookup shape, now with the new
+        fields present, must still produce an empty payload."""
+        from utils.vector_store import ProviderVectorStore
+        payload = ProviderVectorStore.cacheable_payload({
+            "location": "Mesa, AZ 85202",
+            "location_source": "listing_parser:https://hg/usearch",
+            "experience_source": None,
+            "review_summary": "No reviews available",
+            "review_sentiment": "unknown",
+        })
+        assert payload == {}
+
+    def test_a_substantive_payload_carries_the_provenance_beside_it(self):
+        from utils.vector_store import ProviderVectorStore
+        payload = ProviderVectorStore.cacheable_payload({
+            "location": "1450 S Dobson Rd, Mesa, AZ 85202",
+            "location_source": "profile_parser:https://hg/x1",
+            "years_experience": 28,
+            "experience_source": "listing_parser:https://hg/usearch",
+            "review_summary": "Patients praise his thoroughness.",
+        })
+        assert payload["location_source"] == "profile_parser:https://hg/x1"
+        assert payload["experience_source"] == "listing_parser:https://hg/usearch"

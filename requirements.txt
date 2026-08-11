@@ -4,7 +4,14 @@ langgraph==0.0.20
 anthropic==0.75.0
 openai==2.14.0
 chromadb==0.4.18
-tavily-python==0.3.3
+# 0.3.3 -> 0.7.26: 0.3.3's _search() has a fixed 11-parameter whitelist and
+# raises TypeError on chunks_per_source, so the knob was unreachable through
+# the SDK. Adds no new transitive dependencies — every one it wants (tiktoken,
+# httpx, httpcore, h11, anyio, regex, certifi, urllib3, idna,
+# charset-normalizer, typing_extensions) is already installed via anthropic
+# and openai. Response shape is unchanged: results[] still carries url, title,
+# content, raw_content, score, which is every field this project reads.
+tavily-python==0.7.26
 requests==2.31.0
 beautifulsoup4==4.12.2
 python-dotenv==1.0.0

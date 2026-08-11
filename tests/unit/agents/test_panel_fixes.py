@@ -98,6 +98,45 @@ def test_the_live_parked_entry_is_still_a_pass():
     ) is False
 
 
+def test_the_2026_07_28_warranted_phrasing_is_a_pass():
+    """Round 6's failure, new phrasing: the panel published "1 inconsistency
+    was found and logged" on a run whose true count was zero. The live entry
+    ended "...which is appropriate; no correction warranted." and neither
+    clause was in the vocabulary — "warranted" appeared in no pattern, and
+    "appropriately reflects" does not match "which is appropriate" — so
+    default-to-concern published a confirmation as an inconsistency. The
+    quoted tail is the live phrasing preserved in the 2026-07-28 UI review."""
+    assert is_judge_concern(
+        "Judge scored practical_access in the neutral band and wrote "
+        '"no evidence", which is appropriate; no correction warranted.'
+    ) is False
+
+
+def test_which_is_appropriate_alone_is_a_pass():
+    assert is_judge_concern(
+        "The 12/20 reflects the mixed access evidence, which is appropriate."
+    ) is False
+
+
+def test_no_correction_warranted_alone_is_a_pass():
+    """Each phrase must hold on its own: the live entry carried BOTH new
+    phrases, so a fixture quoting it whole stays green when only one of the
+    two vocabulary additions is reverted — exactly the weak-guard shape the
+    revert-in-isolation rule exists to catch (and did, first try)."""
+    assert is_judge_concern(
+        "The neutral score stands; no correction warranted."
+    ) is False
+
+
+def test_warranted_in_a_mixed_verdict_still_reports_the_finding():
+    """The new pass phrases must not weaken the contrastive-pivot precedence:
+    an all-clear clause followed by a real finding is still a finding."""
+    assert is_judge_concern(
+        "No correction warranted for red_flags, but practical_access should "
+        "have been lowered given the summary's scheduling complaints."
+    ) is True
+
+
 def test_unrecognized_phrasing_defaults_to_concern():
     """Better to show a developer one extra line than to drop a real finding."""
     assert is_judge_concern("Something about the rubric looks off here.") is True
@@ -180,6 +219,44 @@ def test_bias_prompt_forbids_inferring_causality_from_inputs(critic):
     assert "MUST cite weighted_contribution" in prompt
     # And the specific false claim the run produced is pre-empted by name.
     assert "amplified beyond its nominal value" in prompt
+
+
+def test_bias_payload_carries_the_judge_share(critic):
+    """Round 30. The 2026-08-10 run's #1 beat #2 by 0.20 while LOSING the
+    core contributions by ~1.9 — the whole margin was the judge's
+    practical_access 20 vs 15 — and with no ai term in the payload the
+    critic wrote "margin comes entirely from location (24.82 vs 24.82 —
+    identical)", a self-refuting sentence. The payload now carries the
+    judge total and the per-criterion SCORES — without the evidence
+    strings, which belong to the deep-validation call."""
+    provider = _scored_provider("Dr. Hodgson", 93.0, 82.0, 91.0)
+    provider["ai_score"] = 99.0
+    provider["ai_rubric"] = {
+        "review_substance": {"score": 49, "evidence": "long quoted text"},
+        "red_flags": {"score": 30, "evidence": "more quoted text"},
+        "practical_access": {"score": 20, "evidence": "short waits"},
+    }
+    prompt = _bias_prompt(critic, [provider])
+
+    ranking = json.loads(prompt.split("CURRENT TOP RANKINGS:")[1]
+                               .split("SCORING MECHANICS")[0].strip())
+    assert ranking[0]["ai_score"] == 99.0
+    assert ranking[0]["ai_rubric_scores"] == {
+        "review_substance": 49, "red_flags": 30, "practical_access": 20,
+    }
+    assert "long quoted text" not in prompt   # scores only, never evidence
+
+
+def test_bias_prompt_states_the_blend_and_the_judge_margin_rule(critic):
+    """The mechanics block must state final = 0.7 x core + 0.3 x ai_score
+    and allow the margin to be named IN the judge share — the old "find the
+    dimension whose weighted_contribution supplies the margin" cornered the
+    model into naming a core dimension even when no core dimension supplied
+    it."""
+    prompt = _bias_prompt(critic, [_scored_provider("Dr. An", 83.2, 92.0, 94.6)])
+    assert "final_score = 0.7 x core + 0.3 x ai_score" in prompt
+    assert "NEVER force a judge-share margin" in prompt
+    assert "or the 0.3 x ai_score judge share" in prompt
 
 
 # ---- Change 2: two registers, one finding ----

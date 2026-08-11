@@ -346,6 +346,66 @@ def test_an_unresearched_provider_never_reaches_the_shortlist(orchestrator: Prov
     assert all(n.startswith("Researched") for n in shortlisted), shortlisted
 
 
+def test_unresearched_providers_are_ordered_after_every_researched_one(
+    orchestrator: ProviderMatchingOrchestrator,
+):
+    """A2, composed. `_pool` scores the unresearched HIGHEST (90+ against 70-),
+    which is the live-run inversion: only a provider the critic SAW can be
+    docked, and its +2/-14 range is wider than any scoring dimension's realized
+    span. Excluding them from the shortlist was already true; this asserts they
+    also do not interleave with researched providers in the remainder."""
+    out = _finalize(_pool(researched=8, unresearched=4), orchestrator)
+    others = out["workflow_summary"]["other_providers"]
+
+    researched_flags = [o["researched"] for o in others]
+    assert researched_flags == sorted(researched_flags, reverse=True), (
+        f"researched/unresearched interleaved: {[(o['name'], o['researched']) for o in others]}"
+    )
+
+
+def test_other_provider_ranks_ascend_in_the_order_they_render(
+    orchestrator: ProviderMatchingOrchestrator,
+):
+    """A3. The numbers must not jump around in display order.
+
+    On 2026-07-29 this list showed #15 between #9 and #10: ranks were assigned
+    over `recommendable[5:] + withheld` while the UI regrouped the rows, so the
+    printed sequence no longer matched the printed numbers."""
+    out = _finalize(_pool(researched=8, unresearched=4), orchestrator)
+    ranks = [o["rank"] for o in out["workflow_summary"]["other_providers"]]
+
+    assert ranks == sorted(ranks), ranks
+    assert ranks == list(range(ranks[0], ranks[0] + len(ranks))), (
+        f"display ranks must be gapless and consecutive, got {ranks}"
+    )
+
+
+def test_every_refinement_move_carries_the_rank_the_reader_will_see(
+    orchestrator: ProviderMatchingOrchestrator,
+):
+    """A3, the wiring. `refine_rankings` numbers the whole refined pool; the page
+    numbers cards 1..5 then continues through the remainder. The panel quoted the
+    former beside cards showing the latter, so "is now #4" named a different
+    doctor than card #4. `display_rank` is the orchestrator resolving that
+    against the two lists it has just built.
+
+    Composed on `_finalize_results`, not on the helper: a helper test would stay
+    green if this mapping were deleted from the node."""
+    out = _finalize(_pool(researched=8, unresearched=4), orchestrator)
+    moves = out["workflow_summary"]["refinement"]["moves"]
+
+    visible = {r["provider"]["name"]: r["rank"] for r in out["final_recommendations"]}
+    visible.update({o["name"]: o["rank"] for o in out["workflow_summary"]["other_providers"]})
+
+    assert moves, "the fixture inverts the order, so something must have moved"
+    for move in moves:
+        assert "display_rank" in move, f"{move['name']} has no visible rank"
+        assert move["display_rank"] == visible[move["name"]], (
+            f"{move['name']}: panel would say #{move['display_rank']}, "
+            f"page shows #{visible[move['name']]}"
+        )
+
+
 def test_the_shortlist_never_exceeds_the_researched_set(orchestrator: ProviderMatchingOrchestrator):
     """There is no "fill from unresearched" path, and none is reachable.
 
@@ -560,3 +620,145 @@ def test_ring_contribution_is_zero_rather_than_absent_on_a_home_only_run(
     assert out["workflow_summary"]["ring_contribution"] == {
         "added": 0, "researched": 0, "shortlisted": 0
     }
+
+
+def test_review_coverage_carries_the_cache_key_basis():
+    """The basis is only useful if it reaches a surface someone can diff:
+    7-of-8 repeat-search misses were undiagnosable because the key's inputs
+    were computed, used, and shown nowhere. Source-inspected like the other
+    review_coverage keys."""
+    import inspect
+    from agents.orchestrator import ProviderMatchingOrchestrator
+
+    source = inspect.getsource(ProviderMatchingOrchestrator)
+    assert '"cache_basis": provider.get("cache_basis")' in source
+
+
+def test_validation_step_event_carries_the_call_timings():
+    """The timeline's event view renders whatever the step details hold, so
+    the wiring IS the feature: drop this key and the per-call breakdown
+    silently vanishes from the Agent Execution Timeline while the critic keeps
+    computing it. Source-inspected like the review_coverage keys, because the
+    step event is built deep inside a LangGraph node."""
+    import inspect
+    from agents.orchestrator import ProviderMatchingOrchestrator
+
+    source = inspect.getsource(ProviderMatchingOrchestrator)
+    assert '"call_timings": validation_results.get("validation_metadata", {}).get("call_timings")' in source
+
+
+def test_finalize_emits_the_final_progress_step():
+    """The live progress bar topped out at validate-completed's 85% under a
+    header reading "Search complete in 68.4s" (owner screenshot, 2026-08-09):
+    the step map always defined finalize_results at 85/100, but
+    _finalize_results never called _emit_progress, so nothing ever fired the
+    last hop. The finalize step now emits started and completed — completed
+    at exactly 100, with the deterministic-fold wording — so the bar finishes
+    with the search."""
+    orchestrator = ProviderMatchingOrchestrator()
+    events = []
+    orchestrator.progress_callback = events.append
+
+    _finalize([_recommendable("Dr. Bar Finisher", 80.0)], orchestrator=orchestrator)
+
+    finalize_events = [e for e in events if e["step_name"] == "finalize_results"]
+    assert [e["status"] for e in finalize_events] == ["started", "completed"]
+    assert finalize_events[-1]["progress_percentage"] == 100
+    assert "recommendation" in finalize_events[-1]["action"]
+
+
+def _collapsed_validation_result():
+    """The exact shape validate_rankings returns when every deep shard fails:
+    zero validations, the merge fallback's error/low validity — and top-level
+    status still "success", because shard failures are contained by design."""
+    return {
+        "validation_results": {
+            "bias_analysis": {},
+            "top_provider_validation": {
+                "top_provider_validations": [],
+                "overall_ranking_validity": {
+                    "status": "error",
+                    "confidence": "low",
+                    "summary": (
+                        "Validation could not be completed — Validation error: "
+                        "Error code: 400 - credit balance is too low"
+                    ),
+                    "improvement_suggestions": [],
+                },
+            },
+            "final_recommendations": {},
+        },
+        "validation_metadata": {
+            "total_providers_analyzed": 8,
+            "ranking_confidence": "low",
+            "bias_severity": "unknown",
+        },
+        "status": "success",
+        "message": "Critical validation completed for 8 providers",
+    }
+
+
+def _validation_state():
+    return {
+        "current_step": "",
+        "preferences": {},
+        "scored_providers": {"ranked_providers": [{"name": "Dr. A"}]},
+        "validation_results": {},
+        "error_messages": [],
+        "execution_log": [],
+    }
+
+
+def test_a_collapsed_validation_says_so_not_low_confidence(
+    orchestrator: ProviderMatchingOrchestrator,
+):
+    """A collapse is not a verdict. On 2026-08-11 every critic call failed on
+    an exhausted API credit balance; the merge fallback carries confidence
+    "low" and zero validations, and the completed progress line read
+    "Validation complete with low confidence" — indistinguishable from a
+    legitimate low-confidence verdict, on the run where every researched
+    provider was about to be withheld `not_critiqued`."""
+    orchestrator.critic_validator.validate_rankings.return_value = (
+        _collapsed_validation_result()
+    )
+    events = []
+    orchestrator.progress_callback = events.append
+
+    orchestrator._validate_rankings(_validation_state())
+
+    completed = [
+        e for e in events
+        if e["step_name"] == "validate_rankings" and e["status"] == "completed"
+    ][-1]
+    assert "could not complete" in completed["action"]
+    assert "confidence" not in completed["action"]
+    assert completed["metrics"]["validation_collapsed"] is True
+
+
+def test_a_legitimate_low_confidence_verdict_keeps_its_wording(
+    orchestrator: ProviderMatchingOrchestrator,
+):
+    """The collapse wording must not swallow the real low-confidence case:
+    a critic that DID validate and wasn't confident still reports a verdict."""
+    result = _collapsed_validation_result()
+    result["validation_results"]["top_provider_validation"] = {
+        "top_provider_validations": [{"rank": 1, "provider_name": "Dr. A"}],
+        "overall_ranking_validity": {
+            "status": "validated",
+            "confidence": "low",
+            "summary": "Thin evidence.",
+            "improvement_suggestions": [],
+        },
+    }
+    orchestrator.critic_validator.validate_rankings.return_value = result
+    events = []
+    orchestrator.progress_callback = events.append
+
+    orchestrator._validate_rankings(_validation_state())
+
+    completed = [
+        e for e in events
+        if e["step_name"] == "validate_rankings" and e["status"] == "completed"
+    ][-1]
+    assert completed["action"] == "Validation complete with low confidence"
+    assert completed["metrics"]["validation_collapsed"] is False

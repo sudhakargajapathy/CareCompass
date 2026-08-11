@@ -112,7 +112,7 @@ class WorkflowState(TypedDict):
     insurance: Optional[str]
     preferences: Dict[str, Any]
     # Per-search, not per-orchestrator: get_orchestrator() is cached on
-    # (fhir_enabled, fast_demo), so routing the cache flag through construction
+    # fhir_enabled, so routing the cache flag through construction
     # would rebuild the whole orchestrator every time the sidebar toggled.
     use_cache: bool
 
@@ -354,7 +354,11 @@ class ProviderMatchingOrchestrator:
                 specialty=state["specialty"],
                 location=state["location"],
                 insurance=state.get("insurance"),
-                enrich=False
+                enrich=False,
+                # Bounds the POOL. The location weight below orders what
+                # survives — two different jobs that the UI used to conflate,
+                # since "Location: High" reads as "search near me" and is not.
+                radius_miles=(state.get("preferences") or {}).get("search_radius_miles"),
             )
 
             state["gathered_data"] = gathered_data
@@ -611,10 +615,35 @@ class ProviderMatchingOrchestrator:
                     f"Validation failed with status: {validation_results.get('status')}"
                 )
 
+            # A COLLAPSE is not a verdict. When every deep shard fails, the
+            # merge's fallback carries confidence "low" and zero validations,
+            # and validate_rankings still reports success because shard
+            # failures are contained by design — so this step's completed line
+            # read "Validation complete with low confidence" on a run where NO
+            # validation had completed. On 2026-08-11 (every critic call
+            # failed on an exhausted API credit balance) that line was the
+            # only clue the user saw above an empty shortlist, and it is
+            # indistinguishable from a legitimate low-confidence verdict.
+            top_validation = (
+                validation_results.get("validation_results") or {}
+            ).get("top_provider_validation") or {}
+            validation_collapsed = (
+                not (top_validation.get("top_provider_validations") or [])
+                and str(
+                    (top_validation.get("overall_ranking_validity") or {}).get("status") or ""
+                ) == "error"
+            )
+
             self._log_step(state, "validate_rankings", "completed", {
                 "validation_status": validation_results.get("status"),
+                "validation_collapsed": validation_collapsed,
                 "bias_severity": validation_results.get("validation_metadata", {}).get("bias_severity"),
-                "ranking_confidence": validation_results.get("validation_metadata", {}).get("ranking_confidence")
+                "ranking_confidence": validation_results.get("validation_metadata", {}).get("ranking_confidence"),
+                # Per-call wall times (bias + each deep shard). The stage total
+                # is max() of concurrent calls, so it cannot say which call is
+                # the long pole — the fact the shard-count decision turns on.
+                # The timeline's event view renders whatever sits here.
+                "call_timings": validation_results.get("validation_metadata", {}).get("call_timings"),
             })
 
             # Emit progress: completed
@@ -623,9 +652,14 @@ class ProviderMatchingOrchestrator:
                 step_name="validate_rankings",
                 agent_name="CriticValidatorAgent",
                 status="completed",
-                action=f"Validation complete with {confidence} confidence",
+                action=(
+                    "Validation could not complete this run — recommendations will be withheld"
+                    if validation_collapsed
+                    else f"Validation complete with {confidence} confidence"
+                ),
                 metrics={
                     "confidence": confidence,
+                    "validation_collapsed": validation_collapsed,
                     "bias_severity": validation_results.get("validation_metadata", {}).get("bias_severity", "unknown")
                 }
             )
@@ -644,6 +678,20 @@ class ProviderMatchingOrchestrator:
             self._log_step(state, "finalize_results", "started", {
                 "consolidating_results": True
             })
+
+            # Finalize never emitted progress, so the live bar topped out at
+            # validate-completed's 85% forever — a run header saying "Search
+            # complete" sat above a bar that visibly wasn't (owner screenshot,
+            # 2026-08-09). The step map always had finalize at 85/100; nothing
+            # fired it. No model label on purpose: this stage is the
+            # deterministic fold, and the progress line should say so.
+            self._emit_progress(
+                step_name="finalize_results",
+                agent_name="Orchestrator",
+                status="started",
+                action="Folding the critic's verdicts into the final ranking (deterministic — no extra LLM calls)",
+                metrics={}
+            )
 
             # Extract final recommendations
             ranked_providers = state["scored_providers"].get("ranked_providers", [])
@@ -790,6 +838,39 @@ class ProviderMatchingOrchestrator:
                 for offset, provider in enumerate(remainder)
             ]
 
+            # ONE numbering for anything a reader can see.
+            #
+            # There were three. `refine_rankings` numbers the whole refined pool
+            # (`final_rank`, which the refinement moves quote); the cards number
+            # the SHORTLIST 1..5; "Other providers considered" continues the
+            # display sequence 6..N. On 2026-07-29 the panel printed "Dr. Marianne
+            # De Lima, MD is now #4" three lines above a card numbered 4 belonging
+            # to Dr. Yeeshu Arora, and the same list showed #15 between #9 and #10.
+            #
+            # The visible numbering is the display sequence — cards then remainder
+            # — so that is the one the prose has to speak. `final_rank` is a real
+            # and useful quantity, but it names positions in a list nobody renders:
+            # withheld providers occupy ranks inside it, so it and the card
+            # ordinals diverge by however many were withheld above.
+            #
+            # Rewriting the ordinal rather than the model's prose, for the reason
+            # the reconciliation line already exists: stripping ordinals out of
+            # generated text with a regex breaks silently, while a number computed
+            # from the two lists we just built cannot disagree with them.
+            display_rank_by_name = {
+                str(entry["name"]): entry["rank"]
+                for entry in (
+                    [{"name": r["provider"].get("name", ""), "rank": r["rank"]}
+                     for r in final_recommendations]
+                    + [{"name": o["name"], "rank": o["rank"]} for o in other_providers]
+                )
+                if entry["name"]
+            }
+            for move in refinement_summary.get("moves", []):
+                shown = display_rank_by_name.get(str(move.get("name", "")))
+                if shown is not None:
+                    move["display_rank"] = shown
+
             # Per-provider review-coverage diagnostic, for the developer surface
             # only (the "Data Gatherer" tab). Kept OUT of the recommendation and
             # `other_providers` shapes because it answers a question about OUR
@@ -839,10 +920,31 @@ class ProviderMatchingOrchestrator:
                     "name": provider.get("name", "Unknown"),
                     "discovery_source": provider.get("discovery_source"),
                     "outcome": provider.get("enrichment_outcome"),
+                    # The cache key's two inputs (normalized name | city+state),
+                    # pinned before enrichment. A repeat search missed 7 of 8
+                    # and no surface could say whether the NAME variant or the
+                    # discovery CITY had moved between the runs — diffing this
+                    # field across two runs answers it per provider.
+                    "cache_basis": provider.get("cache_basis"),
                     "platform_pairs": provider.get("platform_pair_count", 0),
                     "profile_backed_platforms": provider.get("profile_backed_platforms", 0),
                     "headline_source": provider.get("review_source_url"),
                     "headline_kind": url_page_kind(provider.get("review_source_url")),
+                    # The address AND where it was read. Two providers came back
+                    # on one street address at one distance, and "where did this
+                    # come from" had no answer on any surface: the gatherer has
+                    # recorded `location_source` since the model-address guard
+                    # went in, but nothing rendered it, so the one question the
+                    # field exists to answer still could not be asked.
+                    "location": provider.get("location"),
+                    "location_source": provider.get("location_source"),
+                    # Tenure with its producer, and the flag for platforms
+                    # disagreeing about where the provider practises — the
+                    # triage row answers "where did each ranked number come
+                    # from" without a log dive.
+                    "years_experience": provider.get("years_experience"),
+                    "experience_source": provider.get("experience_source"),
+                    "address_conflict": provider.get("address_conflict"),
                     # Absent on a cache hit, which ran no search — see
                     # `_enrich_one`. An empty list would read as "we looked and
                     # found nothing".
@@ -877,6 +979,16 @@ class ProviderMatchingOrchestrator:
             state["workflow_summary"] = workflow_summary
 
             self._log_step(state, "finalize_results", "completed", workflow_summary)
+
+            self._emit_progress(
+                step_name="finalize_results",
+                agent_name="Orchestrator",
+                status="completed",
+                action=(
+                    f"Done — {len(final_recommendations)} recommendation(s) ready"
+                ),
+                metrics={"recommendations": len(final_recommendations)}
+            )
 
             return state
 

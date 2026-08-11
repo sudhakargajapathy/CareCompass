@@ -186,3 +186,63 @@ class TestNearbyCities:
     def test_unresolvable_home_returns_empty(self):
         assert nearby_cities("Nowhereville", 25) == []
         assert nearby_cities("", 25) == []
+
+
+# ---------------------------------------------------------------------------
+# Round 28: the location allowlist's data source. The search form's pickers
+# and sanitize_location's membership check both read these, so every
+# choosable location is geocodable BY CONSTRUCTION.
+
+class TestLocationAllowlistHelpers:
+    def test_known_states_is_sorted_and_complete(self):
+        from utils.geo import known_states
+        states = known_states()
+        assert states == sorted(states)
+        assert "AZ" in states and "NY" in states
+        assert len(states) >= 50
+
+    def test_cities_for_state_is_sorted_and_geocodable(self):
+        from utils.geo import cities_for_state, distance_miles
+        az = cities_for_state("AZ")
+        assert az == sorted(az)
+        assert "Phoenix" in az and "Chandler" in az and "Gilbert" in az
+        # The whole point: an option offered by the picker can be measured.
+        assert distance_miles("Phoenix, AZ", "Chandler, AZ") is not None
+
+    def test_cities_for_state_handles_unknowns(self):
+        from utils.geo import cities_for_state
+        assert cities_for_state("ZZ") == []
+        assert cities_for_state(None) == []
+        assert cities_for_state("az") == cities_for_state("AZ")
+
+    def test_canonical_place_is_membership_and_casing_in_one(self):
+        from utils.geo import canonical_place
+        assert canonical_place("chandler", "az") == "Chandler, AZ"
+        assert canonical_place("Gotham", "AZ") is None
+        assert canonical_place(None, "AZ") is None
+        # The dataset's own mid-word casing survives verbatim — .title()
+        # would return "Mccall" (measured: McCall and McCammon are the
+        # dataset's only two mid-word capitals).
+        assert canonical_place("MCCALL", "id") == "McCall, ID"
+
+    def test_zips_for_city_offers_only_that_citys_zips(self):
+        """Round 29: the ZIP field became a dropdown fed by this helper, so
+        the ZIP↔city consistency that round 28 CHECKED after typing is now
+        unreachable to violate — every offered ZIP files under the chosen
+        city in the dataset, making it geocodable and consistent by
+        construction."""
+        from utils.geo import city_state_for_zip, zips_for_city
+        chandler = zips_for_city("Chandler", "AZ")
+        assert chandler == sorted(chandler)
+        assert "85224" in chandler
+        # The property the dropdown exists for: every option round-trips to
+        # exactly the city that offered it.
+        for zip_code in chandler:
+            assert city_state_for_zip(zip_code) == "Chandler, AZ"
+
+    def test_zips_for_city_handles_unknowns_and_case(self):
+        from utils.geo import zips_for_city
+        assert zips_for_city("Gotham", "AZ") == []
+        assert zips_for_city(None, "AZ") == []
+        assert zips_for_city("Chandler", None) == []
+        assert zips_for_city("chandler", "az") == zips_for_city("Chandler", "AZ")

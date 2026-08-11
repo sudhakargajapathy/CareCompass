@@ -13,6 +13,7 @@ from openai import OpenAI
 from utils.config import get_config
 from utils.cost_tracker import get_cost_tracker, safe_usage
 from utils.excerpt import SUMMARY_MAX_CHARS, clip_words
+from utils.json_salvage import salvage_json_objects
 from utils.provenance import source_domain
 from utils.provider_key import normalize_name_tokens, resolve_cache_key
 from utils.shard import round_robin_shards
@@ -46,47 +47,12 @@ def _judge_token_budget(provider_count: int) -> int:
                          _JUDGE_MAX_TOKENS))
 
 
-def _salvage_json_objects(text: str) -> List[Dict[str, Any]]:
-    """Recover complete top-level JSON objects from a truncated array.
-
-    A response cut off mid-array is unparseable as a whole but the entries
-    before the cut are intact. Losing all twenty because the twentieth was
-    clipped is the difference between a degraded ranking and no judge at all.
-    The critic already recovers from malformed JSON (`_parse_json_with_repair`);
-    the scorer had no equivalent despite making the more expensive call.
-    """
-    objects: List[Dict[str, Any]] = []
-    depth = 0
-    start = None
-    in_string = False
-    escaped = False
-    for position, char in enumerate(text):
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            if depth == 0:
-                start = position
-            depth += 1
-        elif char == "}":
-            if depth:
-                depth -= 1
-                if depth == 0 and start is not None:
-                    try:
-                        parsed = json.loads(text[start:position + 1])
-                    except json.JSONDecodeError:
-                        parsed = None
-                    if isinstance(parsed, dict):
-                        objects.append(parsed)
-                    start = None
-    return objects
+# The truncation-salvage walker moved to utils/json_salvage.py when
+# discovery extraction gained the same recovery (round 27 — its truncation
+# zeroed the pool and fired the ring on a bug). Re-exported under the
+# original name by IDENTITY, not a copy: round 9's tests bind to this
+# symbol, and an identity test pins that the two consumers cannot drift.
+_salvage_json_objects = salvage_json_objects
 
 
 def _parse_ranking_response(response_text: str) -> List[Dict[str, Any]]:
@@ -171,8 +137,8 @@ _EVIDENCE_MAX_CHARS = 400
 # do NOT also score them here, or one signal is charged twice"). The critic was
 # asking for the double-charge, because it had never been shown the rule.
 #
-# Same doctrine as DESIGN §10.9's payload parity, applied to the STANDARD
-# rather than the evidence: an auditor reading a different standard than the
+# Same doctrine as the judge/critic payload parity rule, applied to the
+# STANDARD rather than the evidence: an auditor reading a different standard than the
 # agent it audits is not an independent check. The import direction is
 # deliberate — the critic reads the judge's rubric, so the two cannot drift.
 JUDGE_RUBRIC = """<rubric>
@@ -186,7 +152,7 @@ need a score that no band describes.
    11-20: mixed feedback with substantive concerns.
    0-10: credible pattern of serious complaints.
    Source credibility: when review_source is the provider's OWN practice site (not an
-   independent platform like healthgrades/vitals/webmd/zocdoc), the evidence is
+   independent platform like healthgrades/vitals/webmd), the evidence is
    self-published marketing — cap review_substance at the 28-40 band and say so; the top
    band requires independent-platform evidence.
 2. red_flags (0-30) — internal consistency and absence of credible red flags.
@@ -206,6 +172,14 @@ need a score that no band describes.
 3. practical_access (0-20) — access signals in the review text and page evidence.
    Access means scheduling, wait times, office reachability, follow-up, and how much
    time the provider gives a visit.
+   CITATION DISCIPLINE: a practical_access citation must itself be ABOUT those access
+   subjects. A quote about bedside manner, diagnosis quality, or outcomes is not access
+   evidence and cannot justify any non-neutral band here, however strong it reads —
+   score what it says under review_substance instead. Your evidence entry for this
+   criterion IS the on-topic quote that funded the band — never the strongest quote
+   overall: choosing the band and choosing the quote are ONE decision, not two. If no
+   on-topic quote exists, you are in the neutral band and your evidence entry for this
+   criterion says "no evidence"; in the MIXED band, BOTH quoted sides must be on-topic.
    17-20: concrete access positives cited (easy scheduling, short waits, responsive
    office, accepting new patients) and no friction reported — quote them.
    14-16: mild or incidental access positives ("appointments are not rushed", "willing
@@ -529,6 +503,47 @@ EXPERIENCE_KNEE_RATE = 1.5
 EXPERIENCE_POST_KNEE_RATE = 0.5
 EXPERIENCE_CAP = 85.0
 
+# Above this, a "years of experience" value is not a career length.
+#
+# A 2026-07-29 card read "2026 yrs experience" — the extractor had picked up a
+# YEAR. The only rejection here was `years < 0`, so 2026 ran up the ramp and
+# clamped to EXPERIENCE_CAP, i.e. the MAXIMUM experience score, on a dimension
+# carrying 36% of the core weight. The worst data in the pool scored best on it,
+# and the same value won the card's "Most experienced" chip.
+#
+# 70 admits every real career — an MD at ~26 practising to ~90 is ~64 years, and
+# the ramp has been flat past EXPERIENCE_KNEE_YEARS 15 since round 16 so nothing
+# above ~30 changes the score anyway — while rejecting the two shapes actually
+# observed: a 4-digit year, and a scraped review COUNT landing in the tenure
+# field. It is a plausibility floor for the SCORE, not a cap on the ramp; the
+# ramp's own ceiling is EXPERIENCE_CAP and that is unchanged.
+EXPERIENCE_MAX_PLAUSIBLE_YEARS = 70.0
+
+
+def _as_float(value: Any) -> Optional[float]:
+    """`float(value)` or None. Separated from the plausibility rule because the
+    two failures are different facts: "15 years" is an extraction gap, 2026 is a
+    number that cannot be a career."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def plausible_experience_years(years_experience: Any) -> Optional[float]:
+    """The value as a career length, or None when it cannot be one.
+
+    Shared so the SCORE, the card's "N yrs experience" line and the pool's
+    "Most experienced" superlative all agree. Clamping only inside
+    `calculate_experience_score` left "2026 yrs experience" rendered on the card
+    and still winning that chip — a neutral score does not un-print a number the
+    UI reads straight off the provider dict.
+    """
+    years = _as_float(years_experience)
+    if years is None or years < 0 or years > EXPERIENCE_MAX_PLAUSIBLE_YEARS:
+        return None
+    return years
+
 
 def calculate_experience_score(years_experience: Any) -> Dict[str, Any]:
     """Experience component: rewards long careers, neutral when unknown.
@@ -544,19 +559,33 @@ def calculate_experience_score(years_experience: Any) -> Dict[str, Any]:
     field evidence that a steeper one out-swings measured patient ratings at
     equal weight.
     """
-    try:
-        years = float(years_experience)
-    except (TypeError, ValueError):
-        years = None
+    years = plausible_experience_years(years_experience)
 
-    if years is None or years < 0:
+    if years is None:
+        # An IMPLAUSIBLE value and a MISSING one score the same — we do not know
+        # this provider's tenure either way — but they are different facts and the
+        # warning reaches the patient, so it says which. The split is on whether
+        # the value parsed to a NUMBER: "15 years" is an extraction gap (missing),
+        # 2026 is a number that cannot be a career (implausible).
+        parsed = _as_float(years_experience)
+        if parsed is None:
+            return {
+                "score": EXPERIENCE_UNKNOWN_SCORE,
+                "years": None,
+                "data_quality": "missing",
+                "warning": (
+                    "Years of experience not found — scored as an unknown "
+                    f"(equivalent to {EXPERIENCE_UNKNOWN_EQUIV_YEARS} years), not as a new provider"
+                ),
+            }
         return {
             "score": EXPERIENCE_UNKNOWN_SCORE,
             "years": None,
-            "data_quality": "missing",
+            "data_quality": "implausible",
             "warning": (
-                "Years of experience not found — scored as an unknown "
-                f"(equivalent to {EXPERIENCE_UNKNOWN_EQUIV_YEARS} years), not as a new provider"
+                f"Years of experience was reported as {years_experience} — not a "
+                "possible career length, so it was discarded and scored as an "
+                f"unknown (equivalent to {EXPERIENCE_UNKNOWN_EQUIV_YEARS} years)"
             ),
         }
 
@@ -575,6 +604,15 @@ def calculate_experience_score(years_experience: Any) -> Dict[str, Any]:
         "data_quality": "known",
         "warning": None,
     }
+
+
+# What each location tier is WORTH in miles, as an imputation. Scored through
+# the same falloff a measured distance is, so the two are on one scale and the
+# tiers rescale coherently when the patient narrows or widens the search.
+# At the default 25-mile radius these give the historical 90 / 82 / 55 / 25.
+_TIER_IMPUTED_MILES = {
+    "same_zip": 5.0, "same_city": 9.0, "same_state": 22.5, "different": 37.5,
+}
 
 
 class PreferenceScorerAgent:
@@ -661,17 +699,49 @@ class PreferenceScorerAgent:
             #   2. distance — explicitly stated on a page (rare)
             #   3. location_match tier — textual same-zip/city/state fallback
             #   4. missing-data path (weight-sensitive neutral)
-            # Falloff reuses DEFAULT_SEARCH_RADIUS: score hits 0 at twice the
-            # radius (2×25 = 50 mi by default, matching the old hardcoded /50).
-            falloff_miles = 2 * self.config.DEFAULT_SEARCH_RADIUS
+            # Falloff scales to the radius the PATIENT chose, hitting 0 at
+            # twice it (2×25 = 50 mi at the default, matching the old hardcoded
+            # /50 — so an untouched form scores exactly as before).
+            #
+            # It has to follow the choice, or choosing 10 miles changes only who
+            # is in the pool and not how they rank. Measured on a real 2.7–11.4
+            # mile pool, the location dimension's weighted contribution span
+            # moves 5.80 → 14.50 and the whole core's span 4.43 → 13.13 when the
+            # falloff tracks a 10-mile choice instead of sitting at 50. "Far"
+            # is only meaningful relative to how far someone said they would go.
+            #
+            # The tier scores below keep their VALUES and therefore shift their
+            # distance-equivalence with the scale: same_city 82 is ~9 mi at
+            # radius 25 and ~3.6 mi at radius 10. That is the intended reading —
+            # "same city" implies nearer to someone searching a 10-mile radius —
+            # and it preserves the ordering property those numbers exist for.
+            falloff_miles = 2 * (
+                preferences.get("search_radius_miles")
+                or self.config.DEFAULT_SEARCH_RADIUS
+            )
             # Tier scores are IMPUTATIONS (no measured distance), so each sits
             # at the pessimistic edge of its plausible band — a provider we've
             # actually measured must never be out-scored by one we've only
-            # tiered. At radius 25: same_city 82 ≡ a verified ~9 mi; same_zip
-            # 90 ≡ a verified ~5 mi. (Were same_city 90, a city-only address
-            # would tie a genuinely-close measured provider — the inversion
-            # that let unverified locations ride at the top.)
-            tier_scores = {"same_zip": 90, "same_city": 82, "same_state": 55, "different": 25}
+            # tiered. (Were same_city as generous as same_zip, a city-only
+            # address would tie a genuinely-close measured provider — the
+            # inversion that let unverified locations ride at the top.)
+            #
+            # Each tier is a DISTANCE, run through the same falloff as a real
+            # measurement — not a fixed score. That is what the numbers always
+            # meant ("same_city 82 ≡ a verified ~9 mi") and at the default
+            # radius it reproduces them exactly: 5 / 9 / 22.5 / 37.5 mi through
+            # a 50-mile falloff give 90 / 82 / 55 / 25.
+            #
+            # Leaving them as fixed scores broke the ordering property the
+            # moment the falloff could change. At a 10-mile radius the falloff
+            # is 20, so a provider MEASURED at 4 miles scores 80 — below a
+            # hardcoded same_city 82. An imputation would have out-scored a
+            # measurement, which is the one thing these numbers exist to
+            # prevent.
+            tier_scores = {
+                tier: max(0, 100 - (miles / falloff_miles * 100))
+                for tier, miles in _TIER_IMPUTED_MILES.items()
+            }
             # A city-centroid distance is an IMPUTATION too — every provider in
             # that city shares one coordinate — so it gets the same pessimistic
             # treatment as a tier: a margin roughly a small city's radius, which
@@ -750,6 +820,18 @@ class PreferenceScorerAgent:
             data_quality_flags['experience'] = experience_result["data_quality"]
 
             provider_copy = provider.copy()
+            if (
+                experience_result["data_quality"] == "implausible"
+                and provider_copy.get("years_experience") is not None
+            ):
+                # Drop the value, don't just decline to score it. The card reads
+                # `years_experience` straight off this dict for its "N yrs
+                # experience" line, and the pool's "Most experienced" superlative
+                # ranks on the same field — so a neutral SCORE still left
+                # "2026 yrs experience" printed and still awarded that chip to the
+                # provider with the worst data. `data_warnings` carries the
+                # discarded value, so nothing is hidden.
+                provider_copy["years_experience"] = None
             provider_copy["base_score"] = round(score, 2)
             provider_copy["score_breakdown"] = score_breakdown
             provider_copy["data_quality_flags"] = data_quality_flags
@@ -965,9 +1047,20 @@ class PreferenceScorerAgent:
         the neutral 50) and never the whole pool's.
         """
         try:
-            # Shuffle presentation order: LLM judges favor early positions
+            # Shuffle presentation order: LLM judges favor early positions.
+            # SEEDED from the shard's own membership, because `random.shuffle`
+            # drew from OS entropy and gave the SAME pool a different
+            # presentation order — and therefore different rubric scores —
+            # on every run: the top five swapped between two runs of one
+            # search with no evidence change, ai_score being 30% of final.
+            # Anti-anchoring only needs the order to be uncorrelated with
+            # core RANK, and a name-derived permutation is; it does not need
+            # a fresh permutation per run. A PRIVATE Random instance, never
+            # random.seed(): reseeding the global RNG would silently make
+            # every other `random` caller in the process deterministic too.
             shuffled_summaries = provider_summaries[:]
-            random.shuffle(shuffled_summaries)
+            pool_seed = "|".join(sorted(str(s.get("name", "")) for s in provider_summaries))
+            random.Random(pool_seed).shuffle(shuffled_summaries)
 
             prompt = f"""You are a healthcare-provider evaluation judge. Score every provider against the rubric below using ONLY the evidence provided. Quote evidence — never invent it.
 

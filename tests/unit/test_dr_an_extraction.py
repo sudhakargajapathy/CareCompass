@@ -158,7 +158,7 @@ class TestSourceYields:
             {"source_url": "https://doctor.webmd.com/doctor/andrea-an-x-overview",
              "rating": 4.5, "review_count": 61},
         ])
-        assert out[1]["yielded"] == {"rating": 4.5, "review_count": 61}
+        assert out[1]["yielded"] == {"rating": 4.5, "review_count": 61, "via": "llm"}
 
     def test_a_page_that_produced_nothing_reads_none(self):
         out = _annotate_source_yields(self.SOURCES, [])
@@ -173,7 +173,7 @@ class TestSourceYields:
             {"source_url": "https://www.healthgrades.com/physician/dr-andrea-an-2pfjn",
              "rating": "4.1 out of 5", "review_count": None},
         ])
-        assert out[0]["yielded"] == {"rating": 4.1, "review_count": None}
+        assert out[0]["yielded"] == {"rating": 4.1, "review_count": None, "via": "llm"}
 
     def test_the_fetch_fields_survive_annotation(self):
         """The new key is additive — `raw_chars` still separates "Tavily
@@ -297,5 +297,5 @@ class TestTheWiring:
         # a rating, and it produced no count — so it loses the same-domain
         # collapse before page kind is consulted.
         assert hg["raw_chars"] == 44138 and hg["kind"] == "profile"
-        assert hg["yielded"] == {"rating": 4.1, "review_count": None}
-        assert wm["yielded"] == {"rating": 4.5, "review_count": 61}
+        assert hg["yielded"] == {"rating": 4.1, "review_count": None, "via": "llm"}
+        assert wm["yielded"] == {"rating": 4.5, "review_count": 61, "via": "llm"}

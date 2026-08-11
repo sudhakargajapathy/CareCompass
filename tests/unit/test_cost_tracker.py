@@ -53,14 +53,23 @@ class TestCostTracker:
 
     def test_opus_critic_pricing_entry(self):
         """The critic's default model must be priced — an unpriced model
-        silently reports $0 and the cost card would understate."""
-        tracker = CostTracker()
-        tracker.record_llm("claude-opus-4-8", 1_000_000, 1_000_000, agent="critic_validator")
+        silently reports $0 and the cost card would understate. Asserted as
+        a property of Config().CRITIC_MODEL, not a copied string, so flipping
+        the default WITHOUT adding a pricing row goes red (the exact gap the
+        2026-08-07 Opus 4.8 -> Opus 5 move would otherwise have shipped: the
+        critic is ~54% of a run's spend, all of it silently unpriced)."""
+        from utils.config import Config
 
-        summary = tracker.summary()
-        pricing = PRICING_PER_MTOK["claude-opus-4-8"]
-        assert pricing == {"input": 5.00, "output": 25.00}
-        assert summary["llm"]["cost_usd"] == pytest.approx(30.00)
+        critic_default = Config().CRITIC_MODEL
+        assert critic_default in PRICING_PER_MTOK
+        # Opus 5 ships at Opus 4.8's exact price; the 4-8 row stays priced
+        # because CRITIC_MODEL=claude-opus-4-8 remains a valid env override.
+        assert PRICING_PER_MTOK["claude-opus-5"] == {"input": 5.00, "output": 25.00}
+        assert PRICING_PER_MTOK["claude-opus-4-8"] == {"input": 5.00, "output": 25.00}
+
+        tracker = CostTracker()
+        tracker.record_llm(critic_default, 1_000_000, 1_000_000, agent="critic_validator")
+        assert tracker.summary()["llm"]["cost_usd"] == pytest.approx(30.00)
 
     def test_default_judge_model_is_priced(self):
         """Whatever JUDGE_MODEL defaults to must have a pricing row — the

@@ -332,9 +332,11 @@ def test_refine_does_not_misattribute_verdicts_when_critic_reorders():
 
 
 def test_critic_calls_use_configured_model(critic_validator: CriticValidatorAgent):
-    """All three analysis calls read CRITIC_MODEL (default Opus 4.8 — the
-    validator is the deepest-reasoning role and its output reorders the
-    final list); the JSON-repair utility stays on Haiku regardless."""
+    """All three analysis calls read CRITIC_MODEL (default Opus 4.8 —
+    briefly Opus 5, 2026-08-07 to 2026-08-09, reverted on measured
+    latency: ~35-40% slower per call at the identical $5/$25 price, so
+    the flip bought reasoning depth the demo pays for in visible
+    seconds); the JSON-repair utility stays on Haiku regardless."""
     assert critic_validator.config.CRITIC_MODEL == "claude-opus-4-8"
 
     mock_response = MagicMock()
@@ -714,8 +716,8 @@ def test_low_confidence_guidance_is_earned(critic_validator: CriticValidatorAgen
 
 
 class TestValidationTokenBudget:
-    """A flat ceiling on a pool that became a knob — DESIGN §10.17, one agent
-    over from where it was first learned.
+    """A flat ceiling on a pool that became a knob — the same defect the judge
+    hit one agent over, and it was not re-derived here when it was fixed there.
 
     Round 13 raised the blast radius: an unrecoverable critic response leaves
     every provider `not_critiqued`, which correctly EMPTIES the shortlist. The
@@ -749,7 +751,10 @@ class TestValidationTokenBudget:
         critic_validator.anthropic_client.messages.create.return_value = response
 
         seen = {}
-        for count in (2, 12):
+        # 24, not 12: under three shards a pool of 12 deals shards of 4,
+        # whose budget sits on the same floor as a pool of 2 — the scaling
+        # only becomes visible once a SHARD is big enough to clear the floor.
+        for count in (2, 24):
             critic_validator.anthropic_client.messages.create.reset_mock()
             critic_validator._validate_top_recommendations(
                 [{"name": f"Dr. {i}", "final_score": 80.0} for i in range(count)]
@@ -757,13 +762,14 @@ class TestValidationTokenBudget:
             calls = critic_validator.anthropic_client.messages.create.call_args_list
             seen[count] = [c.kwargs["max_tokens"] for c in calls]
 
-        assert max(seen[12]) > max(seen[2]), f"max_tokens must scale with the pool, got {seen}"
+        assert max(seen[24]) > max(seen[2]), f"max_tokens must scale with the pool, got {seen}"
         # The budget scales to what ONE CALL has to return, which after the
         # Phase 2 split is a shard. Asserting against the whole pool's size
         # would demand a ceiling twice as large as the response it bounds —
         # and would pass just as well if the split silently stopped happening.
         assert seen[2] == [_validation_token_budget(2)], "a small pool stays one call"
-        assert seen[12] == [_validation_token_budget(6), _validation_token_budget(6)]
+        assert seen[24] == [_validation_token_budget(8)] * 3, \
+            "24 providers deal three shards of eight, each budgeted per shard"
 
     def test_truncation_is_logged_with_its_named_cause(self, critic_validator, caplog):
         """Not "JSON parse failed" — the number that has to change, and what it
@@ -814,3 +820,394 @@ def test_the_bias_payload_uses_the_research_budget_not_a_parallel_cap(critic_val
     prompt = critic_validator.anthropic_client.messages.create.call_args.kwargs["messages"][0]["content"]
     assert "Dr. 2" in prompt
     assert "Dr. 3" not in prompt, "the payload must stop at the research budget"
+
+
+class TestBiasOutputContract:
+    """The bias call's output contract is the validation stage's latency lever.
+
+    First instrumented run (2026-08-05): bias 35.37s == the stage total, both
+    deep shards (~18s) finished and waiting — and with thinking disabled that
+    time is output generation. The prompt requested eleven fields; SIX were
+    parsed and read by nothing (validity_concerns x3, blind_spots.impact,
+    blind_spots.recommendations, overall_assessment — checked consumer by
+    consumer), the patient-facing explanation is discarded by the panel
+    unless a bias was flagged, and the live output stated the same two facts
+    three times. The contract now requests only consumed fields, caps them
+    at what the consumers render, and tells the model a clean run earns one
+    sentence, not an essay.
+    """
+
+    def _prompt(self, critic_validator):
+        response = MagicMock()
+        response.stop_reason = "end_turn"
+        response.content = [MagicMock(text=MOCK_BIAS_ANALYSIS_RESPONSE)]
+        critic_validator.anthropic_client.messages.create.return_value = response
+        critic_validator._analyze_ranking_bias(MOCK_RANKED_PROVIDERS, {})
+        return critic_validator.anthropic_client.messages.create.call_args.kwargs
+
+    def test_no_dead_fields_are_requested(self, critic_validator):
+        """Every schema key the prompt asks for must have a consumer; a field
+        nobody reads is pure generation latency on the stage's long pole."""
+        prompt = self._prompt(critic_validator)["messages"][0]["content"]
+
+        for dead in ("validity_concerns", "ranking_issues", "misleading_aspects",
+                     "overall_assessment", '"impact"', '"recommendations"',
+                     "RANKING VALIDITY"):
+            assert dead not in prompt, f"dead field {dead!r} is being requested again"
+        for live in ("detected_biases", "severity", "explanation",
+                     "technical_explanation", "missing_factors"):
+            assert live in prompt
+
+    def test_the_caps_and_the_clean_case_contract_are_stated(self, critic_validator):
+        """The caps mirror the consumers (the panel renders at most 4 bias
+        bullets and 3 missing factors), and a clean run must not fund an
+        essay the panel will discard — app gates the explanation on a bias
+        actually being flagged."""
+        prompt = self._prompt(critic_validator)["messages"][0]["content"]
+
+        assert "at most 4 entries" in prompt
+        assert "at most 3 sentences" in prompt
+        assert "at most 3 entries" in prompt
+        assert "Do not manufacture findings" in prompt
+        assert "must NOT restate the detected_biases entries" in prompt
+
+    def test_clean_runs_still_earn_a_patient_read(self, critic_validator):
+        """Round 30 (owner call): the panel renders the explanation on EVERY
+        run — the critic's independent read is portfolio-grade prose ("the
+        top two are separated by a very small margin — both are strong
+        choices") and hiding it on clean runs hid the validator's best
+        moments. The old clean-case rule forced ONE throwaway sentence
+        because the panel used to discard it; the prompt must now tell the
+        model the sentence budget is worth spending — while lists stay
+        empty and findings stay unmanufactured."""
+        prompt = self._prompt(critic_validator)["messages"][0]["content"]
+
+        assert '"explanation" is NOT discarded on clean runs' in prompt
+        assert "how close the top ranks are" in prompt
+        # The old rule must not linger beside the new one.
+        assert "write ONE short sentence for each explanation field" not in prompt
+
+    def test_the_severity_vocabulary_is_pinned(self, critic_validator):
+        """This run wrote "moderate" — not in the low/medium/high set that
+        three surfaces string-match. It degraded gracefully by luck (the
+        biases-exist branches fired), but a clean run with severity
+        "moderate" would SUPPRESS the callout the model meant to raise. An
+        output field downstream code string-matches is a contract, and a
+        contract the prompt doesn't state is one the model improvises on."""
+        prompt = self._prompt(critic_validator)["messages"][0]["content"]
+
+        assert 'EXACTLY one of "low", "medium", or "high"' in prompt
+
+    def test_missing_data_imputations_are_stated_as_verified_equivalents(self, critic_validator):
+        """The 2026-07-28 run's panel told patients "Doctors with no listed
+        years of experience are treated as fairly new (a low, fixed
+        experience score)" — false since the imputation sweeps: unknown
+        tenure scores exactly what a VERIFIED 10-year career scores, and an
+        unknown rating scores the 3.5-star Bayesian prior itself. The
+        mechanics block stated neither equivalence, so the model invented a
+        mechanism — the same failure class as the causality claims the
+        weighted_contribution rule closed. The equivalences are now stated
+        and the "fairly new" framing is named as forbidden."""
+        prompt = self._prompt(critic_validator)["messages"][0]["content"]
+
+        assert "NEUTRAL VERIFIED-EQUIVALENT" in prompt
+        assert "3.5-star" in prompt
+        assert "VERIFIED 10-year career" in prompt
+        assert '"fairly new"' in prompt
+
+    def test_the_severity_ladder_is_anchored(self, critic_validator):
+        """Pinning the vocabulary settled WHICH words; nothing said WHEN. Two
+        consecutive live runs then scored "medium" for findings the same
+        output's arithmetic register called the chosen weights working as
+        chosen — an un-anchored rung is not reproducible, the same defect the
+        judge's practical_access band had before it was tiled. Each rung now
+        states its entry criterion: low = advisory/preference-dependent (a
+        chosen weight doing its job is not a bias), medium = could mislead a
+        reader who skips the panel, high = the arithmetic shows distortion."""
+        prompt = self._prompt(critic_validator)["messages"][0]["content"]
+
+        assert "A chosen weight doing its job is NOT a bias" in prompt
+        assert "could mislead a reader who never opens this panel" in prompt
+        assert "arithmetic shows real distortion" in prompt
+
+    def test_detected_biases_admits_only_distortions(self, critic_validator):
+        """The severity ladder fixed the WORD; nothing fixed the LIST. Both
+        2026-08-09 live runs filed working-as-designed observations
+        (Bayesian shrinkage doing its job, chosen weights realized as
+        chosen) as detected_biases, so the panel announced "2 potential
+        biases flagged" on runs whose own technical register concluded no
+        factor distorted anything — the tile contradicting the prose
+        beneath it. The list now has an entry criterion of its own:
+        distortions only; system-working-as-designed observations go to
+        the explanation or user_guidance."""
+        prompt = self._prompt(critic_validator)["messages"][0]["content"]
+
+        assert '"detected_biases" lists ONLY distortions' in prompt
+        assert "is NOT a detected bias and must NOT appear in that list" in prompt
+        assert "put it in the explanation or user_guidance instead" in prompt
+
+    def test_the_patient_register_is_gated_by_the_arithmetic(self, critic_validator):
+        """On 2026-08-06 the two registers disagreed and the PATIENT got the
+        wrong one: the plain-language bullet said the #1 doctor "edges ahead
+        almost entirely because of how near they are", while the technical
+        register — the only one forced to cite weighted_contribution — read
+        rating +0.54 / location +0.44 / experience -0.36 and concluded "the
+        decisive factor is NOT distance". The no-jargon rule had become a
+        no-arithmetic rule. Plain language is now a TRANSLATION step only
+        survivors of the arithmetic reach; refuted candidates are dropped,
+        not translated."""
+        prompt = self._prompt(critic_validator)["messages"][0]["content"]
+
+        assert 'Derive "technical_explanation" FIRST' in prompt
+        assert "never translated into plain language" in prompt
+
+    def test_the_ceiling_matches_the_capped_contract(self, critic_validator):
+        """4500 tokens sized the old eleven-field essay; the capped contract
+        needs ~700 and gets ~3x headroom, not the old ceiling back."""
+        assert self._prompt(critic_validator)["max_tokens"] == 2000
+
+    def test_truncation_is_named_not_silent(self, critic_validator, caplog):
+        """Round-9 lesson, applied here when the ceiling dropped: a response
+        cut by max_tokens fails the parse and falls back, which without the
+        log reads as a model failure — the wrong bug to hunt."""
+        import logging
+        response = MagicMock()
+        response.stop_reason = "max_tokens"
+        response.content = [MagicMock(text='{"bias_assessment": {"sever')]
+        critic_validator.anthropic_client.messages.create.return_value = response
+
+        with caplog.at_level(logging.WARNING, logger="agents.critic_validator"):
+            critic_validator._analyze_ranking_bias(MOCK_RANKED_PROVIDERS, {})
+
+        assert any("ceiling" in r.message for r in caplog.records)
+
+
+class TestCriticSendsNoSamplingParams:
+    """The critic must send NO `temperature` — the live API rejects it.
+
+    Round 23 shipped `temperature=0` on both verdict-affecting calls to stop
+    sampled verdict flips (-8/+2 in refine_rankings). The live API returned
+    400 "`temperature` is deprecated for this model" on EVERY call — Opus 4.8
+    is in the same no-temperature family as the reasoning judge — so both
+    deep shards died, every provider fell to `not_critiqued`, and the live
+    shortlist rendered EMPTY while the suite stayed green: mocks are blind
+    to wire-level param validation. These tests pin the ABSENCE, so the next
+    determinism attempt cannot re-ship the outage; critic sampling is part
+    of the honest stability floor. Re-verified live 2026-08-07 against the
+    new Opus 5 default: temperature draws the identical 400 there, so the
+    pins remain both correct and necessary.
+    """
+
+    def test_the_bias_call_sends_no_temperature(self, critic_validator):
+        response = MagicMock()
+        response.stop_reason = "end_turn"
+        response.content = [MagicMock(text=MOCK_BIAS_ANALYSIS_RESPONSE)]
+        critic_validator.anthropic_client.messages.create.return_value = response
+
+        critic_validator._analyze_ranking_bias(MOCK_RANKED_PROVIDERS, {})
+
+        assert "temperature" not in (critic_validator.anthropic_client
+                                     .messages.create.call_args.kwargs)
+
+    def test_the_deep_validation_sends_no_temperature(self, critic_validator):
+        response = MagicMock()
+        response.stop_reason = "end_turn"
+        response.content = [MagicMock(text=MOCK_VALIDATION_RESPONSE)]
+        critic_validator.anthropic_client.messages.create.return_value = response
+
+        critic_validator._validate_top_recommendations(MOCK_RANKED_PROVIDERS)
+
+        assert "temperature" not in (critic_validator.anthropic_client
+                                     .messages.create.call_args.kwargs)
+
+
+class TestValidationCallTimings:
+    """Per-call wall times for the validation stage's concurrent Opus calls.
+
+    The stage total is max() of three concurrent calls (bias + two deep
+    shards), so the timeline's 35.7s cannot say WHICH call is the long pole —
+    and "shard the deep validation 3 ways?" turns exactly on that: if the
+    bias call is the pole, more deep shards buy ~nothing, because bias
+    reasons about the ORDERING and cannot be split. These timings are the
+    measurement that decision reads.
+    """
+
+    def test_sharded_deep_validation_times_each_shard(self, critic_validator):
+        """A pool of 4 still deals TWO shards, not `_VALIDATION_SHARDS` (3):
+        the ceil(pool/3) cap exists because three shards over four providers
+        is 2/1/1, and a single-record shard is exactly what the split floor
+        exists to prevent — "find the real differences between these
+        providers" has no meaning for a call holding one."""
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text=MOCK_VALIDATION_RESPONSE)]
+        mock_response.stop_reason = "end_turn"
+        critic_validator.anthropic_client.messages.create.return_value = mock_response
+
+        pool = [dict(p, name=f"{p['name']} {i}") for i, p in
+                enumerate(MOCK_RANKED_PROVIDERS * 2)]
+        result = critic_validator._validate_top_recommendations(pool)
+
+        timings = result["call_timings"]
+        assert [t["call"] for t in timings] == ["deep_shard_1_of_2", "deep_shard_2_of_2"]
+        assert all(isinstance(t["seconds"], float) and t["seconds"] >= 0 for t in timings)
+        assert [t["providers"] for t in timings] == [2, 2]
+
+    def test_a_budget_pool_deals_three_shards(self, critic_validator):
+        """Taken on the measured reading the timing instrumentation existed
+        for (2026-08-06: deep shards 18.88s/16.02s over 4+4 while the trimmed
+        bias call sat at 12.61s — deep is the stage's pole). Eight providers
+        deal 3/3/2: one thin shard is the accepted cost; the next run's
+        eyeball check is whether the 2-provider shard's verdicts read flatter
+        than the others."""
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text=MOCK_VALIDATION_RESPONSE)]
+        mock_response.stop_reason = "end_turn"
+        critic_validator.anthropic_client.messages.create.return_value = mock_response
+
+        pool = [dict(p, name=f"{p['name']} {i}") for i, p in
+                enumerate(MOCK_RANKED_PROVIDERS * 4)]
+        result = critic_validator._validate_top_recommendations(pool)
+
+        timings = result["call_timings"]
+        assert [t["call"] for t in timings] == [
+            "deep_shard_1_of_3", "deep_shard_2_of_3", "deep_shard_3_of_3"]
+        assert sorted(t["providers"] for t in timings) == [2, 3, 3]
+
+    def test_a_pool_of_six_deals_threes_not_all_twos(self, critic_validator):
+        """min(3, ceil(6/3)) == 2, so six providers deal 3/3 — three shards
+        would make EVERY shard a 2-provider shard, the thin-material failure
+        in every call at once rather than in the one accepted straggler."""
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text=MOCK_VALIDATION_RESPONSE)]
+        mock_response.stop_reason = "end_turn"
+        critic_validator.anthropic_client.messages.create.return_value = mock_response
+
+        pool = [dict(p, name=f"{p['name']} {i}") for i, p in
+                enumerate(MOCK_RANKED_PROVIDERS * 3)]
+        result = critic_validator._validate_top_recommendations(pool)
+
+        timings = result["call_timings"]
+        assert [t["call"] for t in timings] == ["deep_shard_1_of_2", "deep_shard_2_of_2"]
+        assert [t["providers"] for t in timings] == [3, 3]
+
+    def test_unsharded_deep_validation_reports_one_timing(self, critic_validator):
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text=MOCK_VALIDATION_RESPONSE)]
+        mock_response.stop_reason = "end_turn"
+        critic_validator.anthropic_client.messages.create.return_value = mock_response
+
+        result = critic_validator._validate_top_recommendations(MOCK_RANKED_PROVIDERS)
+
+        assert [t["call"] for t in result["call_timings"]] == ["deep_1_of_1"]
+        assert result["call_timings"][0]["providers"] == len(MOCK_RANKED_PROVIDERS)
+
+    @patch('agents.critic_validator.CriticValidatorAgent._analyze_ranking_bias')
+    @patch('agents.critic_validator.CriticValidatorAgent._validate_top_recommendations')
+    def test_metadata_merges_bias_and_deep_timings(self, mock_validate, mock_bias,
+                                                   critic_validator):
+        """The stage's timings live in ONE place — validation_metadata — and
+        are POPPED off the deep result, not copied: top_provider_validation
+        flows to the panel and the recommendation builder, which read provider
+        entries and must not grow a second shape to skip."""
+        mock_bias.return_value = json.loads(MOCK_BIAS_ANALYSIS_RESPONSE)
+        deep = json.loads(MOCK_VALIDATION_RESPONSE)
+        deep["call_timings"] = [{"call": "deep_shard_1_of_2", "seconds": 1.23, "providers": 4}]
+        mock_validate.return_value = deep
+
+        result = critic_validator.validate_rankings(MOCK_RANKED_PROVIDERS, {})
+
+        timings = result["validation_metadata"]["call_timings"]
+        assert timings[0]["call"] == "bias"
+        assert isinstance(timings[0]["seconds"], float)
+        assert timings[1:] == [{"call": "deep_shard_1_of_2", "seconds": 1.23, "providers": 4}]
+        assert "call_timings" not in result["validation_results"]["top_provider_validation"]
+
+
+def test_per_provider_fields_must_be_self_contained(critic_validator: CriticValidatorAgent):
+    """No cross-provider comparatives in per-provider output — every shard.
+
+    The 2026-08-07 run (the first on Opus 5) carded Dr. Hagevik's
+    For-patients line with "about 6.4 mi from the search ZIP, the farthest
+    of the three" — "the three" being his VALIDATION SHARD, a grouping no
+    reader can see: the page shows five cards, and shard composition is an
+    implementation artifact. The rubric already forbade SCORING providers
+    against each other; nothing forbade the notes from referencing
+    shard-mates, and the richer model was the first to write that shape.
+    The rule must reach every shard, because any shard can leak."""
+    providers = [
+        {"name": f"Dr. Number {i}", "final_score": 90 - i, "rating": 4.0,
+         "review_count": 10, "review_summary": "Fine.", "review_sentiment": "positive"}
+        for i in range(1, 11)
+    ]
+    mock_response = MagicMock()
+    mock_response.content[0].text = MOCK_VALIDATION_RESPONSE
+    critic_validator.anthropic_client.messages.create.return_value = mock_response
+
+    critic_validator._validate_top_recommendations(providers)
+
+    calls = critic_validator.anthropic_client.messages.create.call_args_list
+    assert len(calls) > 1, "the pool must actually shard, or the per-shard claim is untested"
+    for call in calls:
+        prompt = call.kwargs["messages"][0]["content"]
+        assert "must be SELF-CONTAINED about that provider alone" in prompt
+        assert '"the farthest of the three"' in prompt
+        assert "write conclusions about one provider at a time" in prompt
+
+
+class TestMergeCarriesTheCollapseReason:
+    """Round 32 (2026-08-11): all four critic calls failed on "credit balance
+    is too low to access the Anthropic API". Each deep shard's fallback had
+    recorded the exception text in its summary, but the all-failed merge
+    discarded every copy and returned the bare "Validation could not be
+    completed" — so the one surface that could have named the cause above a
+    zero-card page said nothing, and the diagnosis needed container logs.
+    """
+
+    _CREDIT_ERROR = (
+        "Validation error: Error code: 400 - credit balance is too low to "
+        "access the Anthropic API"
+    )
+
+    def _failed_shard(self, text=None):
+        return {
+            "top_provider_validations": [],
+            "overall_ranking_validity": {
+                "status": "error",
+                "confidence": "low",
+                "summary": text or self._CREDIT_ERROR,
+                "improvement_suggestions": [],
+            },
+        }
+
+    def test_all_failed_merge_names_the_cause(self):
+        from agents.critic_validator import _merge_validation_shards
+
+        merged = _merge_validation_shards(
+            [self._failed_shard(), self._failed_shard(), self._failed_shard()]
+        )
+        validity = merged["overall_ranking_validity"]
+        assert validity["status"] == "error"
+        assert validity["confidence"] == "low"
+        assert validity["summary"].startswith("Validation could not be completed")
+        assert "credit balance is too low" in validity["summary"]
+
+    def test_a_healthy_merge_still_ignores_failed_shard_prose(self):
+        """When any shard produced verdicts, failed shards stay excluded from
+        the confidence vote AND their error prose stays out of the summary —
+        the collapse note is for the all-failed case only."""
+        from agents.critic_validator import _merge_validation_shards
+
+        healthy = {
+            "top_provider_validations": [{"rank": 1, "provider_name": "Dr. A"}],
+            "overall_ranking_validity": {
+                "status": "validated",
+                "confidence": "high",
+                "summary": "Ranking holds.",
+                "improvement_suggestions": [],
+            },
+        }
+        merged = _merge_validation_shards([healthy, self._failed_shard()])
+        validity = merged["overall_ranking_validity"]
+        assert validity["summary"] == "Ranking holds."
+        assert "credit balance" not in validity["summary"]
+        assert validity["confidence"] == "high"

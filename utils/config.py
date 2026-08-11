@@ -151,9 +151,19 @@ class Config:
         # are Anthropic model IDs; JUDGE is an OpenAI model ID (the scorer
         # uses the OpenAI client — cross-family judge/critic independence is
         # deliberate: the validator shouldn't share the scorer's blind
-        # spots). Critic defaults to Opus 4.8: bias detection and red-flag
-        # analysis are the deepest-reasoning role, and its output reorders
-        # the final list.
+        # spots). Critic defaults to Opus 4.8. It ran on Opus 5 from
+        # 2026-08-07 to 2026-08-09 — flipped only after a live 16-token
+        # probe of the exact call shape (thinking disabled + max_tokens,
+        # no sampling params: accepted, temperature still drawing the
+        # same 400 that caused the temperature=0 outage) — and reverted
+        # on MEASURED latency: Opus 5 ran the same calls ~35-40% slower
+        # (~+6s on the validation stage in a normal run; 48s of a 79s
+        # warm run, where the cache had made the critic the only
+        # expensive stage left) at the identical $5/$25 per MTok. The
+        # flip bought reasoning depth, not speed, and on a live demo the
+        # seconds are user-visible while the price is a wash. The revert
+        # needed no new probe — the shipped shape was built and probed
+        # on 4.8 — and any future flip repeats the probe-first check.
         self.GATHERER_MODEL: str = os.getenv("GATHERER_MODEL", "claude-haiku-4-5")
         # Judge default is the FULL id "gpt-5.6-terra" — the bare "gpt-5.6"
         # alias routes to Sol, the $5/$30 frontier tier (2x Terra's price).
@@ -194,8 +204,50 @@ class Config:
         self.MIN_CANDIDATE_POOL: int = int(os.getenv("MIN_CANDIDATE_POOL", "8"))
         self.MAX_RING_CITIES: int = int(os.getenv("MAX_RING_CITIES", "2"))
         # Tavily depth: "basic" is 1 credit and fast, "advanced" is 2 credits
-        # and slower but digs deeper. The UI's fast-demo toggle sets this.
-        self.TAVILY_SEARCH_DEPTH: str = os.getenv("TAVILY_SEARCH_DEPTH", "basic")
+        # and slower but digs deeper.
+        #
+        # Default "advanced" since the fast-demo toggle was removed
+        # (2026-08-07): the UI used to write this env var on every
+        # orchestrator build — "advanced" in normal mode — so the config
+        # default "basic" was dead in the app and only looked live; the
+        # flip preserves what a normal run actually used. SCOPE, measured
+        # against the call sites rather than assumed: every standard search
+        # pins its own depth in code — discovery and the ring run basic per
+        # query spec (one domain per call holds at basic, half the
+        # credits), enrichment forces advanced (basic recovered 22
+        # providers to advanced's 40) — so this knob's ONLY consumer is the
+        # single-query fallback path (MULTI_QUERY_ENABLED=false). The first
+        # draft of this comment claimed every search would have degraded
+        # without the flip; the pinned call sites are why it could not.
+        self.TAVILY_SEARCH_DEPTH: str = os.getenv("TAVILY_SEARCH_DEPTH", "advanced")
+
+        # How many relevance-selected chunks Tavily returns per result in the
+        # `content` field. Advanced search only; the API caps it at 5 ("must be
+        # an integer between 1 and 5, or 'auto'") and defaults to 3 when unset.
+        #
+        # Both extraction prompts have always included `content` alongside the
+        # anchored excerpt of `raw_content` — so this knob was already steering
+        # extraction input, unset, at the vendor's default. Measured on one
+        # advanced search over the five review platforms, counting providers
+        # recovered with a rating AND a review count:
+        #
+        #     chunks_per_source=3   43,371 content chars  ->  35 providers
+        #     chunks_per_source=5   72,718 content chars  ->  60 providers
+        #
+        # The 25 gained at 5 include Dr. Yeeshu Arora and Dr. Andrea An, both
+        # of whom had failed extraction entirely on their own profile pages:
+        # a directory page states "Rated 4.1 out of 5 4.1 from 70 ratings"
+        # beside the name, while the physician profile states a rating and NO
+        # count anywhere on the page. The count is what a headline needs, so
+        # for those providers the directory was the only source that could
+        # ever have produced one.
+        #
+        # Costs no extra credits — it changes what one search returns, not how
+        # many searches run. It does grow the extraction payload, which is why
+        # `content` is now bounded per page rather than pasted whole.
+        self.TAVILY_CHUNKS_PER_SOURCE: int = int(
+            os.getenv("TAVILY_CHUNKS_PER_SOURCE", "5")
+        )
 
         # FHIR Integration Settings
         self.FHIR_ENABLED: bool = os.getenv("FHIR_ENABLED", "false").lower() == "true"
