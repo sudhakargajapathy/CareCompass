@@ -206,15 +206,17 @@ def test_the_discovery_prompt_asks_for_an_insurance_source():
 @pytest.mark.parametrize("url", [
     "https://www.vitals.com/doctors/marianne-de-lima-md",
     "https://www.vitals.com/doctors/hodgson",
-    "https://www.ratemds.com/doctor-ratings/dr-jane-doe-chandler-az/",
     "https://www.healthgrades.com/physician/dr-andrea-an-3xyz9",
     "https://doctor.webmd.com/doctor/marianne-de-lima-md-abc",
 ])
 def test_real_profile_shapes_are_recognised(url):
-    """vitals required the slug to BEGIN with "dr", and ratemds' real
-    `/doctor-ratings/` matched neither marker — so no ratemds URL could ever
-    be a profile, while its probation exit criterion is "a clean profile-based
-    pair"."""
+    """vitals required the slug to BEGIN with "dr" — its own fixtures
+    (`/doctors/hodgson`) already failed the marker. (A ratemds case lived here
+    until 2026-08-04: its real `/doctor-ratings/` matched neither of its
+    markers while its probation exit criterion was "a clean profile-based
+    pair". The platform was then dropped from the roster on the round-20
+    measurement, so its URLs are non-platform now and the case would pass
+    vacuously — removed rather than left asserting the wrong thing.)"""
     assert url_page_kind(url) == "profile"
     assert "listing page" not in label_source(url)
 
@@ -501,3 +503,53 @@ def test_the_detail_always_says_the_providers_are_still_listed():
         ({"total": 1, "no_data": 0, "pipeline_failures": 1}, [_OUR_FAULT]),
     ):
         assert "Other providers considered" in _withheld_detail(withheld, rows)
+
+
+def test_budget_cut_rows_are_counted_not_named():
+    """This is the TRIAGE surface, and a 99-provider discovery pool put 91
+    withheld rows on it — ~85 of them the research-budget cut, a deliberate
+    and uninformative-by-design outcome burying the zero-to-three failure
+    rows the section exists to surface while duplicating "Other providers
+    considered" name for name. A budget cut is not a failure: it gets a
+    count and a pointer; failures keep their names."""
+    over_budget = [
+        {"name": f"Dr. Cut {i}", "withheld_reason": "over_budget",
+         "withheld_label": "not researched — outside this search's research budget"}
+        for i in range(3)
+    ]
+    markup = _withheld_detail(
+        {"total": 4, "no_data": 0, "pipeline_failures": 1},
+        [_OUR_FAULT] + over_budget,
+    )
+
+    assert "Dr. Unscored" in markup, "failures keep their names"
+    assert "Dr. Cut 0" not in markup and "Dr. Cut 2" not in markup
+    assert "3 more" in markup
+    assert "outside this search's research budget" in markup
+    assert "(4)" in markup, "the header still counts everyone withheld"
+
+
+def test_the_timeline_renders_before_the_decision_process():
+    """Cosmetic but load-bearing for the reading order: the timeline answers
+    "where did the seconds go" — the natural next question after the cost
+    card directly above it — so it renders first and the decision-process
+    deep dive follows. Asserted on source order because both calls live
+    inside the results branch of the page flow."""
+    import inspect
+    import app as app_module
+
+    source = inspect.getsource(app_module)
+    timeline_call = source.index("render_execution_timeline(execution_log)")
+    workflow_call = source.index("render_agent_workflow(workflow_results)")
+    assert timeline_call < workflow_call
+
+
+def test_the_salvage_walker_is_shared_by_identity():
+    """Round 27 gave discovery extraction the same truncation salvage the
+    judge earned in round 9, by MOVING the walker to utils/json_salvage and
+    re-exporting it here under the original name — by identity, not copy,
+    so the two consumers cannot drift. Every behavior test above therefore
+    covers both call sites."""
+    from utils.json_salvage import salvage_json_objects
+
+    assert _salvage_json_objects is salvage_json_objects

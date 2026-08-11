@@ -35,7 +35,7 @@ An intelligent multi-agent system that revolutionizes healthcare provider discov
 - **Self-critique pattern** — a validator agent that detects bias, red-flags providers with cited evidence, and audits the judge's own rubric citations
 - **Responsible-AI surfaces** — a bias check panel, withheld-provider transparency (every provider that didn't make the shortlist is listed with the reason), and a per-search cost card
 - **RAG / semantic caching** — a ChromaDB enrichment cache keyed by provider identity, encrypted at rest, with a warm-run-must-reproduce-cold-run acceptance bar
-- **Production concerns** — typed state, error handling and retries, structured audit logging, and an 809-test suite under [`tests/`](tests/) that runs fully mocked (no API keys, no network)
+- **Production concerns** — typed state, error handling and retries, structured audit logging, every-search-field input allowlisting, and a 1,100+-test suite under [`tests/`](tests/) that runs fully mocked (no API keys, no network)
 
 ## 🌟 Overview
 
@@ -72,7 +72,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full walkthrough — di
 #### 🔍 **Data Gatherer Agent**
 - **AI Model**: Claude Haiku 4.5
 - **Purpose**: Discovers providers on the live web and extracts structured data
-- **How**: Multi-query Tavily discovery (with adaptive expansion to nearby cities when the home pool is thin), then a per-provider enrichment pass over five independent patient-review platforms
+- **How**: Multi-query Tavily discovery (with adaptive expansion to nearby cities when the home pool is thin), then a per-provider enrichment pass over three independent patient-review platforms
 - **Output**: Structured provider profiles with cross-platform ratings, tenure, location, and source provenance for every claim
 
 #### 📊 **Preference Scorer Agent**
@@ -84,7 +84,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full walkthrough — di
 #### 🛡️ **Critic Validator Agent**
 - **AI Model**: Claude Opus 4.8
 - **Purpose**: Independently validates rankings and identifies potential issues
-- **Analysis**: Bias detection over the whole ordering, plus per-provider deep validation with evidence-cited verdicts (two parallel Claude calls); it also audits the judge's rubric citations against the same evidence
+- **Analysis**: Bias detection over the whole ordering, plus per-provider deep validation with evidence-cited verdicts (one bias call + three concurrent deep-validation shards); it also audits the judge's rubric citations against the same evidence
 - **Feedback loop**: Findings (red flags, statuses, confidence) are applied to refine the final ranking — pure post-processing, no added latency; only the user's weights and the critic's evidence-bound verdicts move scores
 
 #### 🎯 **LangGraph Orchestrator**
@@ -98,7 +98,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full walkthrough — di
 > **Note:** the bundled ZIP-centroid dataset (`data/us_zip_coords.csv.gz`) is stored in
 > **Git LFS** — install [git-lfs](https://git-lfs.com) before cloning, or run
 > `git lfs pull` afterwards. Without it, distance scoring falls back to coarse
-> city/state tiers and 19 geo tests fail.
+> city/state tiers, the State → City location pickers lose their city list
+> (it reads the same dataset), and ~50 location-dependent tests fail.
 
 ```bash
 # 1. Clone the repository (with LFS)
@@ -131,7 +132,7 @@ See [`.env.example`](.env.example) for the full list of optional settings — pe
 
 ## ☁️ Deploy to Hugging Face Spaces
 
-This repo is Docker-ready for Hugging Face Spaces (note the frontmatter at the top of this file). Create a **Docker** Space, push this repo, and set the API keys above under **Settings → Secrets**. Binary assets ship through Git LFS, which Spaces requires for files like `data/us_zip_coords.csv.gz`.
+This repo is Docker-ready for Hugging Face Spaces (note the frontmatter at the top of this file). Create a **Docker** Space, push this repo, and set the API keys above under **Settings → Secrets**. Also set a stable `ENCRYPTION_KEY` secret (generate one with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`): provider-cache payloads are encrypted at rest, and without it each restart mints a fresh ephemeral key, so rows cached by earlier runs can never be read again and the cache stays permanently cold. Binary assets ship through Git LFS, which Spaces requires for files like `data/us_zip_coords.csv.gz`.
 
 ## 🎯 Features
 
@@ -148,7 +149,8 @@ This repo is Docker-ready for Hugging Face Spaces (note the frontmatter at the t
 - **Enrichment Cache**: ChromaDB store keyed by provider identity — repeat searches reuse verified review evidence within a TTL instead of re-searching
 - **Provenance Tracking**: Review and insurance claims carry their source URLs, classified as profile vs. directory-listing pages
 - **Code-Computed Distances**: Vendored GeoNames ZIP/city centroids + haversine — the LLM never estimates a distance
-- **Cost Transparency**: A per-search cost card itemizes tokens, search credits, and step timings
+- **Input Allowlisting**: Every search field is checked against an allowlist before any prompt sees it — specialty and city from fixed lists (the city list is the same GeoNames data that computes distances), ZIP verified against the chosen city
+- **Cost Transparency**: A per-search cost card itemizes tokens, search credits, and step timings — a full search measures ≈ $0.50–0.60
 - **Workflow Orchestration**: LangGraph-powered agent coordination with live progress
 - **Error Handling**: Robust retry logic and graceful degradation — failures are labeled, never hidden
 - **Execution Logging**: Structured audit log and a step-by-step agent timeline
@@ -156,7 +158,7 @@ This repo is Docker-ready for Hugging Face Spaces (note the frontmatter at the t
 ### User Interface
 
 - **Hearth Design System**: A warm, professional healthcare theme
-- **Minimal Search Form**: Specialty, location, and Low/Medium/High preference controls
+- **Minimal Search Card**: One bordered card — specialty dropdown, State → City pickers, an optional ZIP dropdown listing only the chosen city's ZIPs (every field selection-only and allowlisted — free text never reaches a query or prompt), a search-radius control, and Low/Medium/High preference weights
 - **Provider Cards**: Match ring, "why this match" callout, at-a-glance chips, and expandable AI analysis
 - **Agent Workflow View**: Real-time visibility into agent decision processes
 - **Responsible-AI Panel**: Bias check, red-flag tiles, and what the ranking *doesn't* capture
@@ -193,7 +195,7 @@ for rec in recommendations:
 
 ### Automated Tests
 
-An 809-test pytest suite with fully mocked clients — no live API keys, no network:
+A 1,100+-test pytest suite with fully mocked clients — no live API keys, no network:
 
 ```bash
 python -m pytest -q --no-cov
@@ -204,8 +206,8 @@ python -m pytest -q --no-cov
 1. Configure your API keys (see [Quick Start](#-quick-start-local) above)
 2. Start the app with `streamlit run app.py` and open http://localhost:8501
 3. Configure your search:
-   - **Specialty**: Select "Neurology"
-   - **Location**: Enter "Phoenix, AZ"
+   - **Location**: Pick **AZ** → **Phoenix** in the State and City dropdowns (ZIP optional — its dropdown lists only Phoenix ZIPs)
+   - **Specialty**: Select "Neurology" and keep the default 25-mile radius
    - **Preferences**: Set Low/Medium/High priority for location, ratings, and experience (all default to Medium)
 4. Click "Find Providers" and watch live agent progress; results include an estimated per-search cost card (tokens, API credits, timings)
 
@@ -228,7 +230,7 @@ python -m pytest -q --no-cov
 | **anthropic** | Claude API client | 0.75.0 |
 | **openai** | GPT-5.6 Terra + embeddings | 2.14.0 |
 | **chromadb** | Vector database | 0.4.18 |
-| **tavily-python** | Web search API | 0.3.3 |
+| **tavily-python** | Web search API | 0.7.26 |
 | **cryptography** | Fernet encryption at rest | 42.0.0 |
 
 ### AI Model Selection Rationale
@@ -271,7 +273,7 @@ python -m pytest -q --no-cov
 ### Phase 2: Advanced Features
 - ✅ Patient review sentiment analysis (cross-platform review blend)
 - ✅ Geographic scoring (GeoNames centroids + haversine distance)
-- ✅ Insurance directory verification prototype (FHIR network check)
+- ✅ Insurance directory verification prototype (FHIR network check — coverage is **simulated** in the demo and labeled as such on every chip; a real Plan-Net endpoint plugs in via `FHIR_USE_MOCK=false` and runs the same check live)
 - [ ] Real-time appointment availability integration
 
 ### Phase 3: Enterprise Features

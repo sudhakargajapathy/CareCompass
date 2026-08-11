@@ -156,6 +156,88 @@ def city_state_for_zip(text: Optional[str]) -> Optional[str]:
     return _load_data()[2].get(parts["zip"])
 
 
+@lru_cache(maxsize=1)
+def _canonical_city_names() -> Dict[Tuple[str, str], str]:
+    """(city_lower, STATE) -> the dataset's own display casing for the city.
+
+    Derived from `zip_place`, not `city_coords`: the centroid dict's keys
+    are lowercased at load, so the display casing only survives here.
+    Kept VERBATIM rather than re-cased — .title() would mangle the two
+    names the dataset does case mid-word (McCall and McCammon, measured),
+    and faithfully echoing the dataset means the picker, the canonical
+    location string, and the geocoder can never disagree about a name.
+    (GeoNames itself title-cases nearly everything — it writes "Mcallen"
+    — and that spelling is what the rest of the pipeline resolves.)"""
+    names: Dict[Tuple[str, str], str] = {}
+    for place in _load_data()[2].values():
+        city, _, state = place.rpartition(", ")
+        if city and state:
+            names.setdefault((city.lower(), state), city)
+    return names
+
+
+def known_states() -> list:
+    """State/territory codes present in the vendored dataset, sorted.
+
+    This is the location allowlist's outer ring: the search form's state
+    picker offers exactly these, so nothing outside the dataset — and
+    therefore nothing ungeocodable — can be asked for."""
+    return sorted({state for (_, state) in _canonical_city_names()})
+
+
+def cities_for_state(state: Optional[str]) -> list:
+    """City display names for a state, sorted; empty for unknown states.
+
+    Feeds the search form's city picker: every option is a place the geo
+    pipeline can resolve to a centroid, so a selected location is geocodable
+    BY CONSTRUCTION — the failure where a mistyped city silently degraded
+    every distance to a tier imputation cannot start here."""
+    if not state:
+        return []
+    code = str(state).strip().upper()
+    return sorted(
+        city for (_, s), city in _canonical_city_names().items() if s == code
+    )
+
+
+def zips_for_city(city: Optional[str], state: Optional[str]) -> list:
+    """ZIP codes the dataset files under exactly this (city, state), sorted.
+
+    Feeds the search form's ZIP dropdown (round 29): offering only the ZIPs
+    that belong to the chosen city makes a mismatched or nonexistent ZIP
+    unreachable from the UI — the dropdown is the same allowlist the
+    server-side check enforces, one step earlier. Chandler has 7; the
+    largest postal cities run to a few dozen — trivially small option lists.
+    """
+    if not city or not state:
+        return []
+    # Lowercase the WHOLE comparison key: the first version uppercased the
+    # state inside `want` while lowercasing the stored place, so
+    # "chandler, AZ" was compared against "chandler, az" and the helper
+    # returned [] for every (city, state) pair in the dataset — an empty
+    # ZIP dropdown that read as "this city has no ZIPs".
+    want = f"{str(city).strip()}, {str(state).strip()}".lower()
+    return sorted(
+        zip_code
+        for zip_code, place in _load_data()[2].items()
+        if place.lower() == want
+    )
+
+
+def canonical_place(city: Optional[str], state: Optional[str]) -> Optional[str]:
+    """"City, ST" in the dataset's own casing when the pair exists, else None.
+
+    The membership test AND the canonicalizer in one: a None here means the
+    pair is not in the allowlist, and a hit returns the one spelling every
+    downstream consumer should see — cache keys normalize the city, so
+    canonical input stops typo variants of one city minting distinct rows."""
+    if not city or not state:
+        return None
+    code = str(state).strip().upper()
+    name = _canonical_city_names().get((str(city).strip().lower(), code))
+    return f"{name}, {code}" if name else None
+
+
 def _coords_for(parts: Dict[str, Optional[str]]) -> Optional[Tuple[float, float]]:
     zip_coords, city_coords, _, _ = _load_data()
     if parts["zip"] and parts["zip"] in zip_coords:

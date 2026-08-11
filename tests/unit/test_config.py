@@ -63,15 +63,26 @@ class TestDefaultsAndOverrides:
         assert config.DEBUG is False
         assert config.CHROMA_PERSIST_DIRECTORY == "./chroma_db"
         assert config.CHROMA_COLLECTION_NAME == "healthcare_providers"
-        assert config.TAVILY_SEARCH_DEPTH == "basic"
+        # "advanced": the removed fast-demo toggle used to write this env
+        # var on every orchestrator build, so the old "basic" default was
+        # dead in the app — the flip preserves what a normal run actually
+        # used. Scope: discovery/ring/enrichment pin their own depths in
+        # code, so the knob reaches only the MULTI_QUERY_ENABLED=false
+        # single-query fallback.
+        assert config.TAVILY_SEARCH_DEPTH == "advanced"
         # THE RESEARCH BUDGET — it gates enrichment, the judge and the critic,
         # so this number scales the bill close to linearly. Equal to
         # ENRICHMENT_MAX_WORKERS by intent, which makes enrichment one wave.
         assert config.MAX_PROVIDERS_TO_ENRICH == 8
         assert config.ENRICHMENT_MAX_WORKERS == 8
         assert config.PROVIDER_CACHE_TTL_DAYS == 7
-        # Per-role model knobs: critic defaults to the deepest-reasoning model;
-        # judge must be the FULL terra id (bare "gpt-5.6" routes to Sol at 2x)
+        # Per-role model knobs: critic defaults to Opus 4.8 — it ran on
+        # Opus 5 2026-08-07 to 2026-08-09 (probe-first flip) and was
+        # reverted on measured latency: ~35-40% slower per call at the
+        # identical $5/$25, i.e. the flip bought depth, not speed, and on
+        # a live demo the seconds are visible while the price is a wash.
+        # Judge must be the FULL terra id (bare "gpt-5.6" routes to Sol
+        # at 2x the price).
         assert config.GATHERER_MODEL == "claude-haiku-4-5"
         assert config.JUDGE_MODEL == "gpt-5.6-terra"
         assert config.CRITIC_MODEL == "claude-opus-4-8"

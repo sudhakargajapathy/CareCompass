@@ -36,8 +36,8 @@ _STATUS_PENALTY_NOT_APPROVED = 8.0
 # Output-token allowance for one deep-validation call, scaled to the pool.
 #
 # It was a flat 6500 with a comment reading "8 entries with capped notes fit
-# comfortably" — true for the pool of the day, and exactly the assumption
-# DESIGN §10.17 records as the way a budget fails: the pool is now a knob
+# comfortably" — true for the pool of the day, and exactly how a budget
+# fails: the pool is now a knob
 # (MAX_PROVIDERS_TO_ENRICH, env-tunable upward) and nothing re-derived this.
 #
 # Each entry carries a verdict, confidence, validation_notes, red_flags,
@@ -70,11 +70,38 @@ def _validation_token_budget(provider_count: int) -> int:
 # prompt that IS about the group: below 4 providers a shard holds one, and
 # "find the real differences between these providers" has no meaning for a
 # call holding a single record.
-_VALIDATION_SHARDS = 2
+#
+# 3, taken on the measured reading it was waiting for (2026-08-06
+# call_timings: deep shards 18.88s/16.02s over 4+4 providers while the
+# trimmed bias call sat at 12.61s — deep is the stage's pole). At the budget
+# of 8 the deal is 3/3/2, projecting the stage ~18.9s -> ~14.5s. THREE is
+# also the stop line: 4-way makes every shard a 2-provider shard — the
+# thin-material failure the differentiation check exists to catch, in every
+# call at once — for ~1.5s more, at which point the bias call is the pole
+# anyway. The ceil cap at the call site keeps small pools from being dealt
+# thinner than the deal that was actually measured: without it a pool of 4
+# would split 2/1/1, and a pool of 6 into all-2s.
+_VALIDATION_SHARDS = 3
 _MIN_PROVIDERS_TO_SPLIT_VALIDATION = 4
 
 # Least-to-most confident. Used to merge shards conservatively — see below.
 _CONFIDENCE_ORDER = ("low", "medium", "high")
+
+
+def _timed_call(label: str, fn, *args) -> tuple:
+    """(result, {"call", "seconds"}) — wall time of ONE model call.
+
+    The validation stage is three concurrent Opus calls and the timeline shows
+    only their max, so "shard the deep validation 3 ways?" was undecidable:
+    the stage reads ~35.7s whether the deep shards are the long pole (sharding
+    helps) or the bias call is (sharding buys ~nothing — bias reasons about
+    the ORDERING and cannot be split). Per-call wall time is the measurement
+    that decision needs, and it must be taken INSIDE the executor's worker so
+    concurrency is untouched.
+    """
+    start = time.monotonic()
+    result = fn(*args)
+    return result, {"call": label, "seconds": round(time.monotonic() - start, 2)}
 
 
 def _merge_validation_shards(shards: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -97,6 +124,7 @@ def _merge_validation_shards(shards: List[Dict[str, Any]]) -> Dict[str, Any]:
     statuses: List[str] = []
     summaries: List[str] = []
     suggestions: List[str] = []
+    error_notes: List[str] = []
 
     for shard in shards:
         if not isinstance(shard, dict):
@@ -110,7 +138,21 @@ def _merge_validation_shards(shards: List[Dict[str, Any]]) -> Dict[str, Any]:
         # A shard that returned nothing has no opinion on the ranking, and
         # counting its fallback "low" would let one failed call drag the whole
         # verdict down while its providers are separately marked not_critiqued.
+        #
+        # But it did record WHY it returned nothing — the per-shard fallback
+        # writes the exception text into its summary — and the all-failed
+        # merge below used to discard every copy and return the bare
+        # "Validation could not be completed". On 2026-08-11 all shards died
+        # on "credit balance is too low to access the Anthropic API" and the
+        # only surface that could have named the cause on a zero-card page
+        # said nothing; the answer lived in container logs. Kept OUT of the
+        # healthy merge on purpose: when any shard produced verdicts, failed
+        # shards' prose stays ignored, exactly as before.
         if not entries:
+            if str(validity.get("status") or "") == "error" and validity.get("summary"):
+                note = str(validity["summary"])
+                if note not in error_notes:
+                    error_notes.append(note)
             continue
         if validity.get("confidence") in _CONFIDENCE_ORDER:
             confidences.append(validity["confidence"])
@@ -128,7 +170,8 @@ def _merge_validation_shards(shards: List[Dict[str, Any]]) -> Dict[str, Any]:
             "overall_ranking_validity": {
                 "status": "error",
                 "confidence": "low",
-                "summary": "Validation could not be completed",
+                "summary": "Validation could not be completed"
+                + (f" — {error_notes[0]}" if error_notes else ""),
                 "improvement_suggestions": [],
             },
         }
@@ -179,10 +222,18 @@ _JUDGE_PASS_RE = re.compile(
     r"|scoring\s+(?:is|was)\s+consistent"
     r"|is\s+consistent\s+with"
     r"|correctly\s+scored"
-    r"|no\s+correction\s+needed"
+    r"|no\s+correction\s+(?:needed|warranted)"
     r"|no\s+(?:judge\s+)?(?:inconsistenc|discrepanc|issue|error)"
     r"|fairly\s+(?:reflects|credits|represents)"
     r"|appropriately\s+(?:reflects|scored|credits)"
+    # "which is appropriate" — a 2026-07-28 live PASS verdict ended
+    # "...which is appropriate; no correction warranted." and neither clause
+    # was in the vocabulary, so the default-to-concern published it as an
+    # inconsistency and the panel told patients "1 inconsistency was found"
+    # on a run whose true count was zero. Phrase-anchored (not bare
+    # "appropriate"): concern wording like "is not appropriate" carries a
+    # negation the concern regex catches first.
+    r"|which\s+is\s+appropriate"
     r"|(?:score|scoring)\s+is\s+accept",
     re.IGNORECASE,
 )
@@ -192,8 +243,8 @@ _JUDGE_PASS_RE = re.compile(
 # No correction needed." — descriptive problem vocabulary wrapped around an
 # explicit all-clear. A stated verdict outranks inferred tone.
 _JUDGE_STRONG_PASS_RE = re.compile(
-    r"no\s+correction\s+needed"
-    r"|no\s+(?:judge\s+)?(?:inconsistenc|discrepanc|error|correction)s?\s+(?:found|needed|required)"
+    r"no\s+correction\s+(?:needed|warranted)"
+    r"|no\s+(?:judge\s+)?(?:inconsistenc|discrepanc|error|correction)s?\s+(?:found|needed|required|warranted)"
     r"|scoring\s+match(?:es|ed)?\s+(?:the\s+)?evidence",
     re.IGNORECASE,
 )
@@ -298,6 +349,19 @@ def is_judge_concern(text: str) -> bool:
     return not _JUDGE_PASS_RE.search(entry)
 
 
+# The +2 for HIGH confidence stays in the arithmetic — considered for
+# removal 2026-08-07 and rejected. The case against it: it is the expected
+# verdict for a clean record, lands on most of the pool, and a term with no
+# variance carries no ranking information (the reasoning that already keeps
+# it out of `refinement_findings` and the panel's adjusted count). The case
+# that won: it is EARNED signal, not a default — a provider the critic
+# vouched for at high confidence did move up on it, and removing it would
+# rescore verdicts we have field evidence for. The caveat that travels with
+# the decision: because it lands widely, its causal role in any single pass
+# is ambiguous (Kumar passed Arora while BOTH held +2 — the pass was the
+# others' penalties, not his bump), so if a panel bullet ever credits a +2
+# with a move it didn't cause, the fix is that bullet's wording, never this
+# constant.
 _CONFIDENCE_ADJUSTMENT = {"high": 2.0, "low": -4.0}
 
 # "approved" and "rejected" as bare substrings both misread their own
@@ -509,8 +573,8 @@ def refine_rankings(
         # nearly everyone, so the 2026-07-29 run reported 8 when exactly one
         # provider had been docked. A term with no variance across the pool
         # carries no ranking information and is not a finding — the same
-        # reasoning §10.42 applied one level up, where the count was of rows
-        # that moved.
+        # reasoning that stopped the panel counting rows that merely MOVED as
+        # rows the critic had changed.
         findings = 0
 
         validation, best_overlap, best_position = None, 0.0, None
@@ -616,8 +680,36 @@ def refine_rankings(
             len(unbound), ", ".join(sorted(unbound)),
         )
 
-    # Stable sort keeps the scorer's order for untouched providers
-    refined.sort(key=lambda p: -p["refined_score"])
+    # Providers that reached no model sort BELOW every provider that did, and
+    # only then by score. Stable, so the scorer's order survives within each
+    # group.
+    #
+    # The two groups are not on one scale, and the 2026-07-29 run showed the
+    # cost: five providers who were never searched sat at ranks 4-8, above one
+    # with 4.8 stars over 102 reviews at 9 and one with 4.2 over 175 at 13. No
+    # single term was wrong. The critic's adjustments — -8 conditional, -4 per
+    # red flag, +-4 confidence — can only reach a provider it SAW, and their
+    # +2/-14 range is wider than any scoring dimension's realized span across a
+    # real pool (location contributes 0.87 points end to end). So being
+    # researched cost ~7 points on average and being unresearched cost nothing:
+    # the ranking rewarded absence of evidence, and did it most to the
+    # best-documented doctors, who have the most for a critic to qualify.
+    #
+    # This is a DISPLAY-order fix, deliberately not an arithmetic one. Rescaling
+    # the penalties would change verdicts we have field evidence for; suppressing
+    # them for the researched half would discard the critic's actual work. The
+    # honest statement is that an unresearched provider's score is not comparable
+    # — which the "Other providers considered" expander already tells the reader
+    # in those words. This makes the ORDER agree with the copy.
+    for provider in refined:
+        if provider.get("enrichment_outcome") == "over_budget":
+            provider["refinement_reasons"] = list(provider["refinement_reasons"]) + [
+                "ranked below researched providers — reached no model, so this "
+                "score is provisional and not comparable"
+            ]
+    refined.sort(
+        key=lambda p: (p.get("enrichment_outcome") == "over_budget", -p["refined_score"])
+    )
 
     moves = []
     for index, provider in enumerate(refined):
@@ -785,6 +877,24 @@ class CriticValidatorAgent:
                     # What actually moved this provider. Without it the analyst
                     # sees inputs and a total, and must guess at the middle.
                     "score_contributions": _score_contributions(provider),
+                    # The JUDGE share — total plus per-criterion scores, WITHOUT
+                    # the evidence strings (the deep-validation call audits
+                    # evidence; this call needs arithmetic). Round 30: a rank
+                    # margin can live entirely in the judge's 30% — on the
+                    # 2026-08-10 run the #1 provider beat #2 by 0.20 while
+                    # LOSING the core contributions by ~1.9, the whole margin
+                    # being practical_access 20 vs 15 — and with no ai term in
+                    # this payload the required weighted_contribution
+                    # arithmetic could not account for it: the model, cornered
+                    # by "name the dimension", wrote "margin comes entirely
+                    # from location (24.82 vs 24.82 — identical)", a
+                    # self-refuting sentence on a developer surface.
+                    "ai_score": provider.get("ai_score"),
+                    "ai_rubric_scores": {
+                        criterion: entry.get("score")
+                        for criterion, entry in (provider.get("ai_rubric") or {}).items()
+                        if isinstance(entry, dict)
+                    },
                 })
 
             prompt = f"""As a critical healthcare analytics expert, analyze this provider ranking for potential biases and blind spots.
@@ -801,15 +911,18 @@ SCORING MECHANICS (ground your bias claims in these facts, not assumptions):
 - adjusted_rating IS the star value actually scored (post-shrinkage). When arguing a thin-evidence rating is over-rewarded, compare adjusted_rating values, not the raw 5.0 vs 4.8 headlines — the shrinkage has already happened.
 - blended_rating/blended_review_count/blended_platform_count show cross-platform evidence volume; cite these numbers when claiming a rating rests on thin evidence.
 - location_evidence is each provider's ACTUAL distance basis. A "tier fallback" or "not resolved" value is an already-penalized imputation (its tier score sits BELOW a comparable measured distance), NOT unearned leniency — critique missing address COVERAGE if you like, but never claim an unresolved provider received a non-penalizing "N/A distance".
+- Missing data imputes a NEUTRAL VERIFIED-EQUIVALENT, never a low score: a provider with NO rating scores exactly what a measured 3.5-star rating scores (the Bayesian prior itself), and a provider with NO listed tenure scores exactly what a VERIFIED 10-year career scores. NEVER describe a missing-data imputation as the provider being "new", "fairly new", "low", or penalized — that invents an attribute of the provider out of a gap in OUR data. If a missing value concerns you, flag it as an evidence-coverage gap, in those words.
 - Insurance is verification-only BY DESIGN: a sidebar payer-directory (FHIR) check, deliberately not a ranking factor. Never flag its absence from the scoring weights as a bias or gap.
 - score_contributions shows what ACTUALLY moved each provider: per dimension, its 0-100 score, its weight, and the weighted_contribution those produce. The core score is the sum of the three contributions.
+- final_score = 0.7 x core + 0.3 x ai_score. ai_score is the rubric-scored judge's 0-100 total and ai_rubric_scores is its per-criterion split (review_substance /50, red_flags /30, practical_access /20, each scaled x2 into the total). A rank margin can therefore live ENTIRELY in the judge share: when the core contributions favor the LOWER-ranked provider, compare ai_score values and name the rubric criterion supplying the difference. NEVER force a judge-share margin onto a core dimension whose contributions are equal or point the other way — that produces a self-contradictory sentence.
 - ANY claim about which dimension drove the ordering MUST cite weighted_contribution values and MUST NOT be inferred from the raw inputs. Compare contributions between the providers you are contrasting, and say which dimension supplied the margin.
-- A weight cannot be "silently exceeded" or "amplified beyond its nominal value": the weight multiplies the dimension score and nothing else. Bayesian shrinkage moves the rating VALUE toward the prior, which NARROWS the gap between a thin 5.0 and a well-evidenced 4.2 — it never increases the rating dimension's influence. If the top-ranked provider is not the highest-rated, find the dimension whose weighted_contribution supplies the margin and name that one.
+- A weight cannot be "silently exceeded" or "amplified beyond its nominal value": the weight multiplies the dimension score and nothing else. Bayesian shrinkage moves the rating VALUE toward the prior, which NARROWS the gap between a thin 5.0 and a well-evidenced 4.2 — it never increases the rating dimension's influence. If the top-ranked provider is not the highest-rated, find the term that supplies the margin — one of the three core contributions or the 0.3 x ai_score judge share — and name that one.
 
 WRITING FOR TWO AUDIENCES — this matters as much as the analysis:
 - "explanation" and every entry in "detected_biases" are shown DIRECTLY TO PATIENTS on the results page. Write them in plain language a non-technical person can act on. NEVER use internal field names (adjusted_rating, blended_review_count, years_experience, ai_reasoning, score_contributions, weighted_contribution), snake_case, raw internal scores (e.g. 89.96), or scoring jargon ("post-shrinkage", "quantization", "monotonic"). Say "review score" not "adjusted_rating"; "how far away they are" not "location_evidence"; "how many reviews back it up" not "blended_review_count".
+- In the patient register, refer to providers by NAME or by group ("the top two", "the lower-ranked doctors"), not by numbered position ("#3", "ranked 3rd"): the final reorder runs AFTER this analysis, so a numbered position can be stale by the time a patient reads it, and every numbered position you write forces a timing caveat onto the panel. Numbered positions stay fine in technical_explanation.
 - "technical_explanation" is for DEVELOPERS ONLY and is never shown to patients. Put the field names, the weighted_contribution arithmetic, and the exact numbers there. Be as precise and technical as you like.
-- Say the same thing in both. They are two registers of one finding, not two different findings.
+- Derive "technical_explanation" FIRST, and let its arithmetic gate everything else: a candidate bias must survive the weighted_contribution numbers before it may appear ANYWHERE. A candidate the numbers refute is DROPPED — from detected_biases and from the explanation — never translated into plain language. "detected_biases" and "explanation" are the plain-language versions of claims the technical arithmetic supports: two registers of one finding, never two different findings.
 
 CRITICAL ANALYSIS REQUIRED:
 
@@ -819,14 +932,20 @@ CRITICAL ANALYSIS REQUIRED:
    - Are there geographic or demographic biases?
 
 2. BLIND SPOTS:
-   - What important factors might be missing?
-   - Are there hidden quality indicators not considered?
-   - Could the ranking mislead patients?
+   - What important factors that patients would care about might be missing?
 
-3. RANKING VALIDITY:
-   - Do top-ranked providers truly serve user needs?
-   - Are lower-ranked providers unfairly penalized?
-   - Is the ranking methodology sound?
+OUTPUT DISCIPLINE — the length rules are part of the task:
+- "severity": EXACTLY one of "low", "medium", or "high". Downstream code string-matches these three words; any other word ("moderate", "minimal", "significant") silently degrades a safety surface. Pick the rung by its entry criterion, not by feel:
+  * "low" — nothing found, or advisory observations only: the ordering follows the weights the patient chose, working as chosen. A chosen weight doing its job is NOT a bias, however large its weighted_contribution.
+  * "medium" — a finding that could mislead a reader who never opens this panel (a data-coverage imbalance flattering one provider, a caveat that lives only in fine print), while the weighted_contribution arithmetic does NOT show the ordering itself distorted.
+  * "high" — the weighted_contribution arithmetic shows real distortion: ranks decided by a factor the patient did not choose, or by a data artifact rather than evidence about the providers.
+- "detected_biases" lists ONLY distortions — factors steering the order AGAINST the user's intent. An observation that the system is working as designed (Bayesian shrinkage ranking thin ratings below well-evidenced ones, chosen weights realized as chosen, top ranks separated by small margins) is NOT a detected bias and must NOT appear in that list, however useful — put it in the explanation or user_guidance instead. Both 2026-08-09 live runs filed exactly such observations as detected_biases, and the panel then announced "2 potential biases flagged" on runs whose own technical register concluded no factor distorted anything.
+- "detected_biases": at most 4 entries, each at most 2 sentences, one finding per entry. Never restate one finding as two entries.
+- "explanation": at most 3 sentences. It summarizes the overall picture and must NOT restate the detected_biases entries — the reader sees both side by side.
+- "technical_explanation": at most 4 sentences.
+- "missing_factors": at most 3 entries, each ONE short noun phrase.
+- If severity is "low" and detected_biases is empty, keep every list empty. Do not manufacture findings to fill space. But "explanation" is NOT discarded on clean runs — it renders to the patient as your independent read of this ranking. Spend its sentence budget on what the arithmetic supports and a patient can act on: how close the top ranks are and what genuinely separates them, and what review evidence moved the lower ranks ("the top two are separated by a very small margin — both are strong choices" is the shape of a useful clean-run read). "technical_explanation" may stay one sentence when there is nothing technical to flag.
+- Be critical and selective: report only findings that would change a reader's decision, each stated exactly once.
 
 IMPORTANT: Return ONLY valid JSON. No markdown, no explanations, just pure JSON.
 Ensure all strings are properly escaped. Use double quotes for all keys and string values.
@@ -840,24 +959,53 @@ Return analysis as this exact JSON structure:
     "technical_explanation": "The numeric reasoning, for developers"
   }},
   "blind_spots": {{
-    "missing_factors": ["factor1", "factor2"],
-    "impact": "Impact description",
-    "recommendations": ["rec1", "rec2"]
-  }},
-  "validity_concerns": {{
-    "ranking_issues": ["issue1", "issue2"],
-    "misleading_aspects": ["aspect1", "aspect2"],
-    "confidence_level": "medium"
-  }},
-  "overall_assessment": "Brief assessment summary"
+    "missing_factors": ["factor1", "factor2"]
+  }}
 }}
 
-Be thorough and critical. Return ONLY the JSON object, nothing else."""
+Return ONLY the JSON object, nothing else."""
 
+            # The OUTPUT CONTRACT above is the latency lever, and this ceiling
+            # follows it. This call was the validation stage's long pole —
+            # 35.37s on the first instrumented run, EQUAL to the stage total
+            # while both deep shards (~18s) sat finished — and with thinking
+            # disabled that time is output generation. Eleven fields were
+            # requested; six were parsed and read by NOTHING
+            # (validity_concerns x3, blind_spots.impact,
+            # blind_spots.recommendations, overall_assessment — the RANKING
+            # VALIDITY section duplicated the deep-validation call's whole
+            # job), and the live output stated
+            # the same two facts three times (paragraph + two bullets). The
+            # caps mirror what the consumers render — the panel shows at most
+            # 4 bias bullets and 3 missing factors. (Since round 30 the
+            # patient-facing explanation renders on EVERY run — the critic's
+            # independent read, an owner-requested showcase — so the
+            # clean-case rule below spends its sentence budget on a useful
+            # read instead of forcing one throwaway sentence; the ceiling
+            # math is unchanged.) 2000 is ~3x the capped
+            # response's expected size, not a target; the stop_reason check
+            # below is the round-9 lesson (a silent ceiling reads as a model
+            # failure, and nothing here says which it was).
             llm_started = time.perf_counter()
+            # NO sampling params — deliberately, and load-bearing. Round 23
+            # shipped `temperature=0` here to stop verdict flips (-8/+2 in
+            # refine_rankings), and the live API rejected it on EVERY call:
+            # 400 "`temperature` is deprecated for this model" (Opus 4.8 sits
+            # in the same no-temperature family as the reasoning judge). Both
+            # deep shards died, every provider fell to `not_critiqued`, and
+            # the live shortlist rendered EMPTY — the suite stayed green the
+            # whole time because mocks are blind to wire-level param
+            # validation. Critic-side sampling is therefore part of the
+            # honest stability floor; probe a new request param against the
+            # live API before shipping it. Re-probed 2026-08-07 when the
+            # default moved to Opus 5: this exact shape is accepted, and
+            # temperature still draws the same 400 there. The 2026-08-09
+            # revert to Opus 4.8 (measured latency, identical price)
+            # needed no new probe — this shape was built and probed on
+            # 4.8, and both models pin the same way.
             response = self.anthropic_client.messages.create(
                 model=self.config.CRITIC_MODEL,
-                max_tokens=4500,
+                max_tokens=2000,
                 thinking={"type": "disabled"},
                 messages=[{"role": "user", "content": prompt}]
             )
@@ -866,6 +1014,14 @@ Be thorough and critical. Return ONLY the JSON object, nothing else."""
                 self.config.CRITIC_MODEL, in_tokens, out_tokens,
                 agent="critic_validator", duration_s=time.perf_counter() - llm_started
             )
+
+            if getattr(response, "stop_reason", None) == "max_tokens":
+                logger.warning(
+                    "Bias analysis hit its %d-token ceiling — the response is "
+                    "truncated and will likely fall back; if this fires with "
+                    "the output caps in place, something upsized the contract",
+                    2000,
+                )
 
             response_text = response.content[0].text.strip()
             # Extract JSON from markdown if needed
@@ -877,20 +1033,20 @@ Be thorough and critical. Return ONLY the JSON object, nothing else."""
                 return bias_analysis
 
             logger.error(f"Bias analysis response unusable; preview: {cleaned_response[:500]}...")
+            # Fallback shape matches the trimmed contract: the fields the old
+            # fallback also carried (validity_concerns, overall_assessment,
+            # blind_spots.impact/.recommendations) were read by nothing —
+            # verified consumer-by-consumer before the trim.
             return {
                 "bias_assessment": {"detected_biases": [], "severity": "unknown", "explanation": "Analysis failed"},
-                "blind_spots": {"missing_factors": [], "impact": "Unknown", "recommendations": []},
-                "validity_concerns": {"ranking_issues": [], "misleading_aspects": [], "confidence_level": "low"},
-                "overall_assessment": "Critical analysis could not be completed"
+                "blind_spots": {"missing_factors": []},
             }
 
         except Exception as e:
             logger.error(f"Bias analysis failed: {e}")
             return {
                 "bias_assessment": {"detected_biases": [], "severity": "unknown", "explanation": "Analysis failed"},
-                "blind_spots": {"missing_factors": [], "impact": "Unknown", "recommendations": []},
-                "validity_concerns": {"ranking_issues": [], "misleading_aspects": [], "confidence_level": "low"},
-                "overall_assessment": f"Error during analysis: {str(e)}"
+                "blind_spots": {"missing_factors": []},
             }
 
     def _validate_top_recommendations(self, ranked_providers: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1000,13 +1156,27 @@ Be thorough and critical. Return ONLY the JSON object, nothing else."""
                     "location_evidence": _location_evidence(provider)
                 })
 
+            # Shard count is capped at ceil(pool/3) so the AVERAGE shard holds
+            # at least three providers: _VALIDATION_SHARDS alone would deal a
+            # pool of 4 into 2/1/1 (a single-record shard is exactly what the
+            # split floor exists to prevent) and a pool of 6 into all-2s. At
+            # the budget of 8 this yields the measured-for 3/3/2; one thin
+            # shard is the accepted cost, every shard thin is not.
+            shard_count = min(
+                _VALIDATION_SHARDS, -(-len(validation_data) // 3)
+            )
             shards = (
-                round_robin_shards(validation_data, _VALIDATION_SHARDS)
+                round_robin_shards(validation_data, shard_count)
                 if len(validation_data) >= _MIN_PROVIDERS_TO_SPLIT_VALIDATION
                 else [validation_data]
             )
             if len(shards) <= 1:
-                return self._validate_shard(validation_data)
+                result, timing = _timed_call(
+                    "deep_1_of_1", self._validate_shard, validation_data
+                )
+                timing["providers"] = len(validation_data)
+                result["call_timings"] = [timing]
+                return result
 
             logger.info(
                 "Critic deep validation split across %d concurrent calls "
@@ -1015,9 +1185,20 @@ Be thorough and critical. Return ONLY the JSON object, nothing else."""
             )
             with ThreadPoolExecutor(max_workers=len(shards)) as executor:
                 futures = [
-                    executor.submit(self._validate_shard, shard) for shard in shards
+                    executor.submit(
+                        _timed_call,
+                        f"deep_shard_{i + 1}_of_{len(shards)}",
+                        self._validate_shard,
+                        shard,
+                    )
+                    for i, shard in enumerate(shards)
                 ]
-                return _merge_validation_shards([future.result() for future in futures])
+                pairs = [future.result() for future in futures]
+                for (_, timing), shard in zip(pairs, shards):
+                    timing["providers"] = len(shard)
+                merged = _merge_validation_shards([result for result, _ in pairs])
+                merged["call_timings"] = [timing for _, timing in pairs]
+                return merged
 
         except Exception as e:
             logger.error(f"Top provider validation failed: {e}")
@@ -1110,6 +1291,7 @@ IMPORTANT: Return ONLY valid JSON. No markdown, no explanations, just pure JSON.
 Ensure all strings are properly escaped. Use double quotes for all keys and string values.
 Return one entry PER PROVIDER, echoing each provider's given "rank" value exactly.
 "rank" is the provider's position in the FULL ranking, so these values may not be consecutive and may not start at 1 — that is expected and is not an error to report. Never renumber them.
+Every per-provider field (validation_notes, patient_considerations, red_flags) must be SELF-CONTAINED about that provider alone. Never compare them to the other providers in this list — no "the farthest of the three", "best of this group", "unlike the others": the providers in front of you may be an arbitrary subset of the ranking, and these fields render on that provider's own card, where the group does not exist and the comparison is unreadable. Reason about the group internally if it helps; write conclusions about one provider at a time.
 Keep validation_notes to at most 2 sentences per provider.
 
 Return detailed validation as this exact JSON structure:
@@ -1138,6 +1320,10 @@ Be rigorous and evidence-bound — every verdict must survive the rubric above. 
 
             llm_started = time.perf_counter()
             budget = _validation_token_budget(len(validation_data))
+            # NO sampling params — see the bias call: the API rejects
+            # `temperature` for this model (400), and a param rejection here
+            # kills BOTH shards, which correctly-but-catastrophically empties
+            # the shortlist via `not_critiqued`.
             response = self.anthropic_client.messages.create(
                 model=self.config.CRITIC_MODEL,
                 max_tokens=budget,
@@ -1244,11 +1430,22 @@ Be rigorous and evidence-bound — every verdict must survive the rubric above. 
             # of the sum.
             logger.info("Running bias analysis and top-provider validation in parallel...")
             with ThreadPoolExecutor(max_workers=2) as executor:
-                bias_future = executor.submit(self._analyze_ranking_bias, ranked_providers, safe_preferences)
+                bias_future = executor.submit(
+                    _timed_call, "bias", self._analyze_ranking_bias,
+                    ranked_providers, safe_preferences,
+                )
                 top_future = executor.submit(self._validate_top_recommendations, ranked_providers)
 
-                bias_analysis = bias_future.result()
+                bias_analysis, bias_timing = bias_future.result()
                 top_validation = top_future.result()
+
+            # Popped, not copied: `top_provider_validation` flows to the panel
+            # and the final-recommendation builder, which read provider
+            # entries — a timings list there would be one more shape for every
+            # consumer to skip. The stage's timings live in ONE place,
+            # `validation_metadata`, beside the other stage-level facts the
+            # timeline event already reads.
+            call_timings = [bias_timing] + list(top_validation.pop("call_timings", []))
 
             # Fold the two analyses into final critical recommendations
             final_recommendations = self._generate_final_recommendations(
@@ -1265,7 +1462,8 @@ Be rigorous and evidence-bound — every verdict must survive the rubric above. 
                     "total_providers_analyzed": len(ranked_providers),
                     "validation_method": "claude_sonnet_critical_analysis",
                     "bias_severity": bias_analysis.get("bias_assessment", {}).get("severity", "unknown"),
-                    "ranking_confidence": top_validation.get("overall_ranking_validity", {}).get("confidence", "unknown")
+                    "ranking_confidence": top_validation.get("overall_ranking_validity", {}).get("confidence", "unknown"),
+                    "call_timings": call_timings,
                 },
                 "status": "success",
                 "message": f"Critical validation completed for {len(ranked_providers)} providers"

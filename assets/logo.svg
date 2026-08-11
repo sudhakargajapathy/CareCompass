@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- CareCompass browser-tab mark: a compass rose on the Hearth palette
+       (bg/clay/accent tokens from utils/theme.py). Kept as hand-written SVG
+       so it ships as text — no LFS, no binary pre-receive hook risk. -->
+  <circle cx="32" cy="32" r="30" fill="#FBF7F1" stroke="#7D5A3F" stroke-width="3"/>
+  <circle cx="32" cy="32" r="23" fill="none" stroke="#E0D3BE" stroke-width="1.5"/>
+  <!-- needle: north in clay, south in accent -->
+  <path d="M32 10 L39 32 L32 30 L25 32 Z" fill="#B08968"/>
+  <path d="M32 54 L25 32 L32 34 L39 32 Z" fill="#C8A26C"/>
+  <circle cx="32" cy="32" r="4.5" fill="#7D5A3F"/>
+  <circle cx="32" cy="32" r="2" fill="#FBF7F1"/>
+</svg>

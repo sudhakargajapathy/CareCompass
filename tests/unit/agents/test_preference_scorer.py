@@ -675,6 +675,54 @@ def test_neutral_access_band_cannot_be_reached_with_a_citation(
     )
 
 
+def test_practical_access_citations_must_be_on_topic(
+    preference_scorer: PreferenceScorerAgent,
+):
+    """The converse hole of the De Lima case: she reached neutral WITH a
+    citation; the 2026-08-07 run's critic findings showed the judge reaching
+    non-neutral bands with citations that were not ABOUT access — bedside
+    manner and thoroughness quotes justifying an access score. Every band
+    says "quote them", but nothing said the quote had to be on-topic, so
+    any strong sentence could fund any band.
+
+    The discipline now sits above the bands, where it governs all of them: a
+    practical_access citation must itself be about the access subjects; an
+    off-topic quote belongs to review_substance and cannot move this score
+    off neutral; no on-topic quote → neutral band + "no evidence"; and the
+    MIXED band's two quoted sides must both be on-topic. Handed to the
+    critic VERBATIM via the shared JUDGE_RUBRIC import, so the auditor
+    enforces the same rule it audits against.
+    """
+    mock_response = MagicMock()
+    mock_response.choices[0].message.content = "[]"
+    preference_scorer.openai_client.chat.completions.create.return_value = mock_response
+    preference_scorer._generate_ai_rankings([{"name": "Dr. X"}], {})
+
+    prompt = str(
+        preference_scorer.openai_client.chat.completions.create.call_args.kwargs["messages"]
+    )
+    rubric_text = prompt.split("<rubric>")[1].split("</rubric>")[0].replace("\\n", "\n")
+    # Collapse the rubric's own line wrapping so the asserted phrases can't
+    # break on a reflow — the rule is the text, not its indentation.
+    section = " ".join(rubric_text[rubric_text.index("3. practical_access"):].split())
+
+    assert "CITATION DISCIPLINE" in section
+    assert "must itself be ABOUT those access subjects" in section
+    assert "cannot justify any non-neutral band" in section
+    assert "BOTH quoted sides must be on-topic" in section
+    # The binding, added after the discipline alone proved insufficient
+    # twice: run one scored the right band but QUOTED an off-topic
+    # communication sentence; run two scored 16 on that quote with no
+    # on-topic support at all. Choosing the band and choosing the quote
+    # must be ONE decision — the evidence field IS the quote that funded
+    # the band, so an off-topic-only summary can no longer fund a
+    # non-neutral score, and a right-band score cannot ship with a
+    # misleading citation.
+    assert "IS the on-topic quote that funded the band" in section
+    assert "never the strongest quote" in section
+    assert "ONE decision, not two" in section
+
+
 def test_mixed_access_evidence_has_a_band_of_its_own(
     preference_scorer: PreferenceScorerAgent,
 ):
@@ -736,3 +784,53 @@ def test_access_complaints_are_partitioned_out_of_red_flags(preference_scorer: P
     assert "belong to practical_access — do NOT" in prompt or \
            "belong to practical_access \\u2014 do NOT" in prompt
     assert "charged twice" in prompt
+
+
+class TestSeededJudgeShuffle:
+    """The anti-anchoring shuffle is seeded by the pool, not by the run.
+
+    `random.shuffle` drew from OS entropy, so the SAME pool was presented to
+    the judge in a different order — and scored differently — on every run:
+    the top five swapped between two runs of one search with no evidence
+    change (2026-08-06), ai_score being 30% of final. Anti-anchoring only
+    needs the order to be uncorrelated with core RANK; it does not need a
+    fresh permutation per run. Seeded via a PRIVATE Random instance, so the
+    global RNG's state neither influences the order nor is consumed by it.
+    """
+
+    def _order(self, scorer, summaries):
+        import re as _re
+        response = MagicMock()
+        response.choices[0].message.content = "[]"
+        scorer.openai_client.chat.completions.create.return_value = response
+        scorer._judge_shard(summaries)
+        prompt = scorer.openai_client.chat.completions.create.call_args.kwargs[
+            "messages"][1]["content"]
+        return _re.findall(r'"name": "(Dr\. [A-Za-z]+)"', prompt)
+
+    def _summaries(self):
+        return [
+            {"provider_index": i, "name": f"Dr. {surname}"}
+            for i, surname in enumerate(
+                ["Kumar", "Vandian", "Hagevik", "Arora", "Simpkins", "Capampangan"])
+        ]
+
+    def test_the_same_pool_presents_in_the_same_order_every_run(self, preference_scorer):
+        """Global RNG state deliberately DIFFERS between the two calls — under
+        the unseeded shuffle that guaranteed two different orders."""
+        import random as _random
+
+        _random.seed(1)
+        first = self._order(preference_scorer, self._summaries())
+        _random.seed(2)
+        second = self._order(preference_scorer, self._summaries())
+
+        assert first and first == second
+
+    def test_the_order_is_still_uncorrelated_with_core_rank(self, preference_scorer):
+        """Summaries arrive in core-rank order; the presented order must not
+        be that order, or position anchoring comes back."""
+        summaries = self._summaries()
+        order = self._order(preference_scorer, summaries)
+
+        assert order != [s["name"] for s in summaries]

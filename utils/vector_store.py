@@ -12,7 +12,12 @@ import json
 from .config import get_config
 from .cost_tracker import get_cost_tracker, safe_usage
 from .encryption import get_encryptor
-from .provider_key import provider_cache_key, resolve_cache_key
+from .provider_key import (
+    normalized_name,
+    normalized_place,
+    provider_cache_key,
+    resolve_cache_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +38,27 @@ CACHEABLE_FIELDS = (
     "insurance_source_url",
     "years_experience",
     "location",
+    # Provenance travels WITH the value it describes, or a warm hit lies:
+    # `provider.update(payload)` restores a cached address over a provider
+    # whose `location_source` still names this run's listing page — a wrong
+    # answer to the exact question the field exists to answer. Same for
+    # tenure, and for the address-conflict flag derived from the enrichment
+    # evidence being restored.
+    "location_source",
+    "experience_source",
+    "address_conflict",
 )
 
 # Evidence that only enrichment can produce. `location` is excluded on purpose:
 # discovery already supplies it, so it cannot serve as proof that a search
-# learned anything. See `cacheable_payload`.
-SUBSTANTIVE_CACHE_FIELDS = tuple(f for f in CACHEABLE_FIELDS if f != "location")
+# learned anything — and the PROVENANCE fields are excluded with it, or
+# `location_source` (which discovery writes on every parsed provider) would
+# make an empty enrichment look substantive and revive the exact
+# cache-a-failed-lookup bug the guard exists to catch. See `cacheable_payload`.
+_PROVENANCE_CACHE_FIELDS = ("location_source", "experience_source", "address_conflict")
+SUBSTANTIVE_CACHE_FIELDS = tuple(
+    f for f in CACHEABLE_FIELDS if f != "location" and f not in _PROVENANCE_CACHE_FIELDS
+)
 
 # Values the extractor writes when it found NOTHING. They are indistinguishable
 # from evidence by an emptiness test, which is how they defeated the guard.
@@ -451,6 +471,7 @@ class ProviderVectorStore:
         cutoff = ttl * 86400.0
         fresh: Dict[str, Dict[str, Any]] = {}
         stale: List[str] = []
+        undecryptable = 0
 
         for metadata in (result.get("metadatas") or []):
             if not metadata:
@@ -479,8 +500,111 @@ class ProviderVectorStore:
             if isinstance(payload, dict) and payload:
                 payload["cached_enriched_at"] = metadata.get("enriched_at_iso", "")
                 fresh[key] = payload
+            else:
+                # A row that decrypts to nothing used to VANISH here — not a
+                # hit, not in the stale list, no log — which is the one cache
+                # failure the plaintext inventory is structurally blind to
+                # (it never decrypts). A rotated/unset ENCRYPTION_KEY kills
+                # the whole store this way, invisibly. Count it, name it,
+                # and surface the keys as stale so the caller's log shows
+                # them ignored rather than nonexistent.
+                undecryptable += 1
+                stale.append(key)
+
+        if undecryptable:
+            logger.warning(
+                f"Cache: {undecryptable} row(s) undecryptable — was "
+                f"ENCRYPTION_KEY rotated or unset since they were written? "
+                f"They read as misses, and the inventory cannot see this."
+            )
+
+        # One line that answers "did the read even see the store?" — three
+        # days of debugging reconstructed exactly these numbers from
+        # screenshots of downstream surfaces. keys vs store-rows separates
+        # an empty store from key drift from a rejected row at a glance.
+        try:
+            store_rows = self.collection.count()
+        except Exception:
+            store_rows = -1
+        logger.info(
+            f"Cache read: {len(keys)} key(s) against {store_rows} stored row(s) "
+            f"-> {len(fresh)} fresh, {len(stale)} stale/undecryptable"
+        )
 
         return fresh, stale
+
+    def inventory(self, limit: int = 25) -> Dict[str, Any]:
+        """Plaintext catalogue of stored enrichment rows — metadata only.
+
+        Read-only diagnostic for the Data Gatherer panel: WHO the cache
+        holds, under which basis, and how old each row is. The identity
+        fields (name / specialty / location / timestamps / key) are stored
+        plaintext beside the encrypted payload, so this never decrypts,
+        never embeds, and never touches the network — one `collection.get`.
+
+        Rows come back newest-first, capped at `limit` (`total` reports the
+        uncapped count). Besides the stored fields, each row derives:
+
+          - `age_days` / `expired`: the row against PROVIDER_CACHE_TTL_DAYS.
+            An expired row explains a cache miss exactly as well as key
+            drift does, so hiding them would hide half the diagnosis.
+          - `schema_mismatch`: rows a read skips on CACHE_SCHEMA_VERSION.
+          - `stored_basis` / `key_matches_stored_fields`: the key's basis
+            recomputed from the stored name+location. False is NOT
+            corruption — the key is PINNED before enrichment rewrites
+            `location` with ZIP precision, so a ZIP-backfilled row's key
+            legitimately hashes a pre-enrichment location string. False
+            says "this key was minted from different inputs than the row
+            now displays", which is precisely the ambiguity the run-side
+            `cache_basis` diagnostic exists to name.
+
+        A store that cannot be read reports {"total": 0, "rows": [],
+        "error": ...} rather than raising — a diagnostic must never take
+        down the panel it diagnoses.
+        """
+        try:
+            result = self.collection.get(include=["metadatas"])
+        except Exception as e:
+            logger.warning(f"Cache inventory unavailable: {e}")
+            return {"total": 0, "rows": [], "error": str(e)}
+
+        now = time.time()
+        cutoff = self.config.PROVIDER_CACHE_TTL_DAYS * 86400.0
+        rows: List[Dict[str, Any]] = []
+        for metadata in (result.get("metadatas") or []):
+            if not metadata:
+                continue
+            name = str(metadata.get("name", ""))
+            location = str(metadata.get("location", ""))
+            key = metadata.get("provider_key", "")
+            try:
+                epoch = float(metadata.get("enriched_at_epoch", 0) or 0)
+            except (TypeError, ValueError):
+                epoch = 0.0
+            rows.append({
+                "provider_key": key,
+                "name": name,
+                "specialty": metadata.get("specialty", ""),
+                "location": location,
+                "enriched_at": metadata.get("enriched_at_iso", ""),
+                "age_days": round((now - epoch) / 86400.0, 1) if epoch else None,
+                # epoch 0 (missing/unparseable) ages out too: a read would
+                # mark that row stale, so the inventory must agree with it.
+                "expired": (now - epoch) >= cutoff,
+                "schema_mismatch": (
+                    str(metadata.get("schema_version", "")) != CACHE_SCHEMA_VERSION
+                ),
+                "stored_basis": f"{normalized_name(name)}|{normalized_place(location)}",
+                "key_matches_stored_fields": provider_cache_key(name, location) == key,
+                "_epoch": epoch,
+            })
+
+        rows.sort(key=lambda r: r["_epoch"], reverse=True)
+        total = len(rows)
+        rows = rows[: max(0, limit)]
+        for row in rows:
+            del row["_epoch"]
+        return {"total": total, "rows": rows}
 
     def upsert_enriched_providers(self, providers: List[Dict[str, Any]]) -> int:
         """Store enrichment results under deterministic keys. Returns count written.

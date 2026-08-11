@@ -579,24 +579,31 @@ def test_merge_backfills_insurance_and_source_without_overwriting(data_gatherer:
     assert kept["insurance_source_url"] == "https://x.com"
 
 def test_candidate_queries_span_phrasings(data_gatherer: DataGathererAgent):
-    """Discovery fans out several phrasings of one city — never the ZIP.
-    Exactly one spec is domain-restricted to the review platforms (and deep):
-    platform ratings must land at extraction time, not enrichment."""
-    from agents.data_gatherer import _REVIEW_PLATFORM_DOMAINS
+    """Discovery fans ONE query across the three parsable platforms, one domain
+    per call — never the ZIP.
+
+    This asserted three distinct PHRASINGS with exactly one domain-restricted
+    spec. That shape let whichever platform ranked best take every result slot
+    of the restricted call, which is why coverage swung run to run. Per-domain
+    calls guarantee each platform its own slots.
+
+    basic depth, not advanced: one domain per call holds at basic (measured, 5
+    results and 5 in-domain on all three), while all five domains in ONE basic
+    call did not hold at all — that request came back with bestbuy.com and
+    Cambridge Dictionary."""
+    from agents.data_gatherer import _LISTING_DOMAINS
 
     specs = data_gatherer._candidate_queries("Neurology", "Chandler, AZ")
-    queries = [s["query"] for s in specs]
-    assert len(queries) == 3
-    assert len(set(queries)) == 3  # all distinct
-    assert all("Chandler, AZ" in q for q in queries)
-    assert any("best" in q.lower() for q in queries)    # listicle variant
 
-    platform_specs = [s for s in specs if s.get("include_domains")]
-    assert len(platform_specs) == 1
-    assert set(platform_specs[0]["include_domains"]) == set(_REVIEW_PLATFORM_DOMAINS)
-    assert platform_specs[0]["search_depth"] == "advanced"
-    # Domain names no longer ride in the query text — the restriction targets
-    assert "healthgrades" not in platform_specs[0]["query"]
+    assert len(specs) == len(_LISTING_DOMAINS) == 3
+    assert all("Chandler, AZ" in s["query"] for s in specs)
+    assert all("85224" not in s["query"] for s in specs)
+    # every spec restricted, to exactly ONE domain
+    assert [s["include_domains"] for s in specs] == [[d] for d in _LISTING_DOMAINS]
+    assert all(s["search_depth"] == "basic" for s in specs)
+    # the restriction targets the domain; the name does not ride in the text
+    assert all("healthgrades" not in s["query"] for s in specs)
+
 
 def test_discover_candidates_merges_and_dedupes_by_url(data_gatherer: DataGathererAgent):
     """Parallel queries are merged with per-URL dedup; each query is issued."""
@@ -626,10 +633,12 @@ def test_discover_candidates_interleaves_queries_round_robin(data_gatherer: Data
     assert [r["url"] for r in merged[3:6]] == ["https://q1-1.com", "https://q2-1.com", "https://q3-1.com"]
 
 def test_discovery_platform_query_targets_domains(data_gatherer: DataGathererAgent):
-    """The platform spec's include_domains + advanced depth must reach the
-    search layer for exactly one of the three discovery calls — the other
-    phrasings stay unrestricted at the global depth."""
-    from agents.data_gatherer import _REVIEW_PLATFORM_DOMAINS
+    """Every discovery call reaches the search layer restricted to ONE domain.
+
+    Previously exactly one of three calls was restricted, to all five platforms
+    at once. A single combined restriction is what let one platform monopolise
+    the slots, and at basic depth it did not hold at all."""
+    from agents.data_gatherer import _LISTING_DOMAINS
 
     calls = []
 
@@ -642,14 +651,12 @@ def test_discovery_platform_query_targets_domains(data_gatherer: DataGathererAge
         data_gatherer._discover_candidates(specs, max_results=20)
 
     assert len(calls) == 3
-    restricted = [(q, k) for q, k in calls if k.get("include_domains")]
-    assert len(restricted) == 1
-    _, kwargs = restricted[0]
-    assert set(kwargs["include_domains"]) == set(_REVIEW_PLATFORM_DOMAINS)
-    assert kwargs["search_depth"] == "advanced"
-    for _, kwargs in calls:
-        if not kwargs.get("include_domains"):
-            assert kwargs.get("search_depth") is None  # global knob governs
+    restricted = [k["include_domains"] for _, k in calls if k.get("include_domains")]
+    assert len(restricted) == 3, "every call must be domain-restricted"
+    assert all(len(d) == 1 for d in restricted), "one domain per call"
+    assert {d[0] for d in restricted} == set(_LISTING_DOMAINS)
+    assert all(k.get("search_depth") == "basic" for _, k in calls)
+
 
 def test_search_depth_override_reaches_tavily_and_cost_tracker(data_gatherer: DataGathererAgent):
     """A per-call depth override must drive BOTH the Tavily request and the
@@ -683,21 +690,28 @@ def test_ring_expansion_fires_when_pool_thin(data_gatherer: DataGathererAgent):
     mock_nearby.assert_called_once()
     names = {p["name"] for p in result["providers"]}
     assert names == {"Dr. Home", "Dr. Ring"}
-    assert result["search_metadata"]["query_count"] == 4  # 3 home + 1 ring
+    assert result["search_metadata"]["query_count"] == 6  # 3 home + 3 ring
+    # (one ring city x one basic call per listing domain — the ring runs the
+    # SAME domain-restricted specs as the home city, not the old open query)
     # Recorded where it is KNOWN — the UI must not have to infer it by
     # hardcoding the home-phrasing count.
     assert result["search_metadata"]["ring_expanded"] is True
 
 def test_ring_expansion_rescues_empty_home_pool(data_gatherer: DataGathererAgent):
     """Zero extractable providers at home — the thinnest pool — must still
-    ring out, not short-circuit to no_results."""
+    ring out, not short-circuit to no_results.
+
+    The fixture city was "Sun Lakes, AZ" until round 28: a real place, but
+    its ZIPs file under Chandler in the postal dataset, so the location
+    allowlist now refuses it at the gate — which is the allowlist working,
+    not the ring breaking."""
     ring = [{"name": "Dr. Ring Only", "location": "Gilbert, AZ 85234"}]
 
     with patch.object(data_gatherer, "_search_providers", return_value=[{"url": "u", "title": "t"}]), \
          patch.object(data_gatherer, "_extract_provider_data", side_effect=[[], ring]), \
          patch("agents.data_gatherer.nearby_cities", return_value=["Gilbert, AZ"]) as mock_nearby:
         result = data_gatherer.gather_providers(
-            specialty="Neurology", location="Sun Lakes, AZ", enrich=False
+            specialty="Neurology", location="Chandler, AZ", enrich=False
         )
 
     mock_nearby.assert_called_once()
@@ -928,9 +942,9 @@ def test_select_review_observation_prefers_credible_pairs():
     # any single headline would mislead, so selection DECLINES (the card shows
     # "Across platforms" instead)
     khan = [
-        {"source_url": "https://www.zocdoc.com/x", "rating": "1.2/5", "review_count": None},
+        {"source_url": "https://www.vitals.com/z", "rating": "1.2/5", "review_count": None},
         {"source_url": "https://medicalnewstoday.com/x", "rating": 1.0, "review_count": 1},
-        {"source_url": "https://www.ratemds.com/x", "rating": 5.0, "review_count": None},
+        {"source_url": "https://doctor.webmd.com/r", "rating": 5.0, "review_count": None},
     ]
     headline, normalized = _select_review_observation(khan)
     assert headline is None                  # disagreement guard
@@ -966,10 +980,10 @@ def test_merge_declines_headline_on_conflicting_observations(data_gatherer: Data
     data_gatherer._merge_review_data(provider, {
         "review_summary": "Praised.", "review_sentiment": "positive",
         "review_count": None, "rating": "1.2/5",
-        "review_source_url": "https://www.zocdoc.com/x",
+        "review_source_url": "https://www.vitals.com/z",
         "review_observations": [
-            {"source_url": "https://www.zocdoc.com/x", "rating": 1.2, "review_count": None},
-            {"source_url": "https://www.ratemds.com/x", "rating": 5.0, "review_count": None},
+            {"source_url": "https://www.vitals.com/z", "rating": 1.2, "review_count": None},
+            {"source_url": "https://doctor.webmd.com/r", "rating": 5.0, "review_count": None},
         ],
     })
 
@@ -983,9 +997,9 @@ def test_merge_uses_observations_and_stores_them(data_gatherer: DataGathererAgen
     data_gatherer._merge_review_data(provider, {
         "review_summary": "Praised for attentiveness.", "review_sentiment": "positive",
         "review_count": None, "rating": "1.2/5",             # model's own (bad) pick
-        "review_source_url": "https://www.zocdoc.com/x",
+        "review_source_url": "https://www.vitals.com/z",
         "review_observations": [
-            {"source_url": "https://www.ratemds.com/x", "rating": 5.0, "review_count": None},
+            {"source_url": "https://doctor.webmd.com/r", "rating": 5.0, "review_count": None},
             {"source_url": "https://www.healthgrades.com/x", "rating": 4.0, "review_count": 31},
         ],
     })
@@ -1032,7 +1046,7 @@ def test_platform_observations_outrank_hospital_site_pairs():
     hashmi = [
         {"source_url": "https://doctors.bannerhealth.com/x", "rating": 4.7, "review_count": 486},
         {"source_url": "https://www.healthgrades.com/x", "rating": 2.8, "review_count": 16},
-        {"source_url": "https://www.ratemds.com/x", "rating": None, "review_count": 48},
+        {"source_url": "https://www.vitals.com/z", "rating": None, "review_count": 48},
     ]
     headline, normalized = _select_review_observation(hashmi)
     assert headline["source_url"] == "https://www.healthgrades.com/x"
@@ -1049,8 +1063,8 @@ def test_non_platform_observations_headline_only_by_forfeit():
 
     # Platform observations that DECLINE (disagreement) are not overridden
     conflicted = [
-        {"source_url": "https://www.zocdoc.com/x", "rating": 1.2, "review_count": None},
-        {"source_url": "https://www.ratemds.com/x", "rating": 5.0, "review_count": None},
+        {"source_url": "https://www.vitals.com/z", "rating": 1.2, "review_count": None},
+        {"source_url": "https://doctor.webmd.com/r", "rating": 5.0, "review_count": None},
         {"source_url": "https://doctors.bannerhealth.com/x", "rating": 4.7, "review_count": 486},
     ]
     headline, _ = _select_review_observation(conflicted)
@@ -1063,7 +1077,7 @@ def test_enrichment_is_one_platform_restricted_advanced_search(data_gatherer: Da
     crowd, no conditional rescue search)."""
 
     results = [
-        {"url": "https://www.zocdoc.com/doctor/yu", "title": "zocdoc"},
+        {"url": "https://www.vitals.com/doctors/yu", "title": "vitals"},
         {"url": "https://www.healthgrades.com/physician/yu", "title": "hg"},
     ]
     provider = {"name": "Dr. Kan Yu", "location": "Gilbert, AZ",
@@ -1131,9 +1145,16 @@ def test_merge_stores_blended_fields(data_gatherer: DataGathererAgent):
     assert provider["review_count"] == 16
 
 def test_blend_requires_two_pairs_and_agreement(data_gatherer: DataGathererAgent):
-    """One pair: nothing to blend. Extreme pair disagreement: the blend
-    declines (averaging a 1.2 against a 5.0 manufactures a number nobody
-    reported) even though a headline pair still shows."""
+    """One pair: nothing to blend. Wide disagreement: the blend COMPUTES anyway,
+    weighted by review volume, and records the spread.
+
+    The old gate declined past a 2.0-star span, borrowing its reasoning from the
+    headline ladder ("averaging 1.2 against 5.0 manufactures a number nobody
+    reported"). The ladder declines on RATING-ONLY observations, which have no
+    counts to weight with; here everything has a count, and the fallback when
+    the gate fired was `provider["rating"]` — the largest-count pair, i.e. ONE
+    of the two disagreeing sources at full strength. Cherry-picking, not
+    caution."""
     one_pair = {"name": "Dr. One"}
     data_gatherer._merge_review_data(one_pair, {
         "review_summary": "Praised.", "review_sentiment": "positive",
@@ -1150,10 +1171,14 @@ def test_blend_requires_two_pairs_and_agreement(data_gatherer: DataGathererAgent
         "review_count": None, "rating": None, "review_source_url": None,
         "review_observations": [
             {"source_url": "https://www.vitals.com/x", "rating": 5.0, "review_count": 40},
-            {"source_url": "https://www.zocdoc.com/x", "rating": 1.2, "review_count": 10},
+            {"source_url": "https://doctor.webmd.com/z", "rating": 1.2, "review_count": 10},
         ],
     })
-    assert "blended_rating" not in split
+    # (5.0*40 + 1.2*10) / 50 = 4.24 — essentially the high-volume platform,
+    # which is the honest answer, not a fabricated midpoint.
+    assert split["blended_rating"] == 4.2
+    assert split["blended_review_count"] == 50
+    assert split["blended_rating_spread"] == 3.8, "the disagreement must travel"
     assert split["rating"] == 5.0            # headline: largest credible pair still shows
 
 def test_enrichment_backfills_years_experience(data_gatherer: DataGathererAgent):
@@ -1359,7 +1384,7 @@ def test_profile_backed_pairs_counts_only_confirmed_profiles(
             {"source_url": "https://www.vitals.com/search?q=neurology",
              "rating": 4.0, "review_count": 30},
             # review platform, shape we have no pattern for
-            {"source_url": "https://www.ratemds.com/some-new-layout/dr-a-b/",
+            {"source_url": "https://doctor.webmd.com/some-new-layout/dr-a-b/",
              "rating": 5.0, "review_count": 8},
         ],
     }
@@ -1422,14 +1447,35 @@ class TestLocationEvidenceArtifact:
 
 def test_enrichment_backfills_address_and_never_clobbers(data_gatherer: DataGathererAgent):
     """A ZIP-resolvable address upgrades a city-only location; a location we
-    can already place to a ZIP is never overwritten."""
+    can already place to a ZIP is never overwritten.
+
+    The upgrade now requires `address_source_url` to identify the doctor —
+    the traceability guard refuses an address the model cannot attribute to a
+    page about them, because six blocks are in scope including group-practice
+    pages stating one address for several doctors. This test predates that
+    guard and asserted the upgrade WITHOUT attribution; it kept passing in
+    CI-shaped clones because `resolution_level` needs the LFS geo data and
+    reports city-only without it, so the backfill never ran and the assert
+    failed on the DATA, masking the guard regression the moment the data was
+    present. A red-for-the-wrong-reason test guards nothing.
+    """
     vague = {"name": "Dr. Vague", "location": "Chandler, AZ"}
     data_gatherer._merge_review_data(vague, {
         "review_summary": "No reviews available", "review_sentiment": "unknown",
         "review_count": None, "rating": None, "review_source_url": None,
         "review_observations": [], "address": "1234 W Frye Rd, Chandler, AZ 85224",
+        "address_source_url": "https://www.healthgrades.com/physician/dr-vague-x9",
     })
     assert "85224" in vague["location"]                  # gained ZIP precision
+
+    unattributed = {"name": "Dr. Vague", "location": "Chandler, AZ"}
+    data_gatherer._merge_review_data(unattributed, {
+        "review_summary": "No reviews available", "review_sentiment": "unknown",
+        "review_count": None, "rating": None, "review_source_url": None,
+        "review_observations": [], "address": "1234 W Frye Rd, Chandler, AZ 85224",
+    })
+    assert unattributed["location"] == "Chandler, AZ", \
+        "an address traceable to no page about this doctor is refused"
 
     precise = {"name": "Dr. Precise", "location": "Chandler, AZ 85224"}
     data_gatherer._merge_review_data(precise, {
@@ -1507,10 +1553,14 @@ def test_merge_unions_observations_across_passes(data_gatherer: DataGathererAgen
     assert provider["review_count"] == 40
     assert "vitals.com" in provider["review_source_url"]
 
-def test_stale_blend_cleared_when_disagreement_grows(data_gatherer: DataGathererAgent):
-    """A pair added by enrichment can push the set past the disagreement
-    span; the blend computed before that pair arrived is stale and must not
-    keep feeding the score."""
+def test_stale_blend_recomputed_when_a_conflicting_pair_arrives(data_gatherer: DataGathererAgent):
+    """A pair added by enrichment must RE-DERIVE the blend, not leave the old one.
+
+    This asserted that the blend was CLEARED, because a third pair could push
+    the set past the old disagreement gate. The gate is gone, so the correct
+    outcome is a recomputed blend that now hears all three platforms — but the
+    property under test is unchanged and still the important one: a blend
+    computed before the newest pair arrived must never keep feeding the score."""
     provider = {
         "name": "Dr. Split",
         "review_observations": [
@@ -1527,9 +1577,12 @@ def test_stale_blend_cleared_when_disagreement_grows(data_gatherer: DataGatherer
         ],
     })
     assert len(provider["review_observations"]) == 3
-    assert "blended_rating" not in provider
-    assert "blended_review_count" not in provider
-    assert "blended_platform_count" not in provider
+    # (4.6*33 + 4.2*25 + 1.0*50) / 108 = 2.84 — the 1.0 over 50 reviews is half
+    # the review mass and drags the blend down, which is the point.
+    assert provider["blended_rating"] == 2.8
+    assert provider["blended_review_count"] == 108
+    assert provider["blended_platform_count"] == 3
+    assert provider["blended_rating"] != 4.4, "the stale pre-enrichment blend"
 
 def test_domain_anchor_hints_extend_excerpt_anchors():
     """Platform URLs aim the excerpt window at score-feeding sections
@@ -1542,12 +1595,19 @@ def test_domain_anchor_hints_extend_excerpt_anchors():
     assert hg[:2] == base
     assert "years of experience" in hg and "insurance accepted" in hg
 
-    zoc = _anchors_for("https://www.zocdoc.com/doctor/x", base)
-    assert "in-network" in zoc
+    webmd = _anchors_for("https://doctor.webmd.com/doctor/x", base)
+    assert "conditions treated" in webmd
 
     other = _anchors_for("https://www.example.com/page", base)
     assert other == base
     assert base == ["neurology", "review"]    # input list never mutated
+
+    # Every hinted domain must be ON the roster — a hint for a dropped
+    # platform (zocdoc's "in-network" outlived the platform by one edit) is
+    # dead weight that reads as live targeting.
+    from agents.data_gatherer import _DOMAIN_ANCHOR_HINTS, _REVIEW_PLATFORM_DOMAINS
+    for hinted in _DOMAIN_ANCHOR_HINTS:
+        assert any(platform in hinted for platform in _REVIEW_PLATFORM_DOMAINS)
 
 
 class TestEnrichmentRecall:
@@ -2314,3 +2374,133 @@ def test_relevance_still_orders_pages_of_the_same_kind(
 
     prompt = data_gatherer.anthropic_client.messages.create.call_args.kwargs["messages"][0]["content"]
     assert prompt.index("FIRST") < prompt.index("SECOND")
+
+
+def test_enrichment_prompt_carries_no_dropped_platform(data_gatherer: DataGathererAgent):
+    """The prompt told the model to prefer zocdoc.com for insurance conflicts
+    for three weeks after zocdoc left the search's include_domains — an
+    instruction about a platform whose pages can no longer appear is dead
+    weight in every enrichment call, and a reader auditing costs counts it."""
+    from unittest.mock import patch as _patch, MagicMock
+    import json as _json
+    response = MagicMock()
+    response.content = [MagicMock(text=_json.dumps({}))]
+    response.stop_reason = "end_turn"
+    response.usage = MagicMock(input_tokens=0, output_tokens=0)
+    data_gatherer.anthropic_client = MagicMock()
+    data_gatherer.anthropic_client.messages.create.return_value = response
+
+    data_gatherer._extract_review_data_only(
+        [{"title": "t", "url": "https://www.vitals.com/doctors/x", "content": "",
+          "raw_content": "# Dr. X\n"}],
+        "Dr. X", "Neurology", "Mesa, AZ")
+
+    prompt = data_gatherer.anthropic_client.messages.create.call_args\
+        .kwargs["messages"][0]["content"]
+    assert "zocdoc" not in prompt.lower()
+    assert "ratemds" not in prompt.lower()
+
+
+# ---------------------------------------------------------------------------
+# Round 27 (the UI review's L1): discovery extraction survives its own
+# token ceiling. Two runs of the same search on 2026-07-28, 11 minutes
+# apart, overlapped on ~1 physician: run 1's response outgrew the flat
+# max_tokens=8000, the cut array had no closing bracket, repair failed, []
+# came back, the home pool read ZERO, and the ring rebuilt the pool from
+# Glendale/Tempe. Whether one response fit 8,000 tokens decided WHO got
+# recommended.
+
+def _shard_pages(count):
+    return [
+        {"title": f"Best Neurologists {i}", "url": f"https://example.com/{i}",
+         "content": "review content", "raw_content": "page body text"}
+        for i in range(count)
+    ]
+
+
+def _mock_extraction_response(data_gatherer, text, stop_reason="end_turn"):
+    mock_response = MagicMock()
+    mock_response.stop_reason = stop_reason
+    mock_response.content = [MagicMock(text=text)]
+    data_gatherer.anthropic_client.messages.create.return_value = mock_response
+
+
+def test_discovery_output_budget_scales_with_block_count(data_gatherer):
+    """The judge's and critic's ceilings have scaled with pool size since
+    round 9; discovery kept a flat 8000 although its truncation is the most
+    destructive in the system. The budget now follows the input — and FLOORS
+    at the old flat value, because a formula that could dip below it would
+    quietly reintroduce the failure at small block counts. The ceiling is
+    not a spend: unused headroom costs nothing."""
+    _mock_extraction_response(data_gatherer, "[]")
+
+    data_gatherer._extract_page_shard(_shard_pages(9), "Neurology", "Chandler, AZ")
+    call = data_gatherer.anthropic_client.messages.create.call_args
+    assert call.kwargs["max_tokens"] == 4000 + 600 * 9  # 9400 — a normal shard
+
+    data_gatherer._extract_page_shard(_shard_pages(30), "Neurology", "Chandler, AZ")
+    call = data_gatherer.anthropic_client.messages.create.call_args
+    assert call.kwargs["max_tokens"] == 16000  # capped
+
+    data_gatherer._extract_page_shard(_shard_pages(3), "Neurology", "Chandler, AZ")
+    call = data_gatherer.anthropic_client.messages.create.call_args
+    assert call.kwargs["max_tokens"] == 8000  # floored at the old flat value
+
+
+def test_truncated_discovery_response_salvages_complete_entries(data_gatherer):
+    """Run 1's exact failure shape: an array cut mid-object, no closing
+    bracket anywhere, so full parse AND the regex repair both fail. Before
+    round 27 that returned [] — every complete entry discarded with the cut
+    one. The walker now recovers the complete objects; only the entry the
+    ceiling actually cut is lost."""
+    truncated = (
+        '[{"name": "Dr. Alice Complete, MD", "specialty": "Neurology", '
+        '"location": "Chandler, AZ", "rating": 4.5}, '
+        '{"name": "Dr. Bob Whole, DO", "specialty": "Neurology", '
+        '"location": "Chandler, AZ", "rating": 4.2}, '
+        '{"name": "Dr. Cut Off, MD", "specialty": "Neuro'
+    )
+    _mock_extraction_response(data_gatherer, truncated, stop_reason="max_tokens")
+
+    providers = data_gatherer._extract_page_shard(
+        _shard_pages(9), "Neurology", "Chandler, AZ"
+    )
+
+    names = [p["name"] for p in providers]
+    assert names == ["Dr. Alice Complete, MD", "Dr. Bob Whole, DO"]
+    # The salvaged entries flow through the normal cleaning path.
+    assert providers[0]["rating"] == 4.5
+
+
+class TestQuerySpecDisplay:
+    """Round 29 (owner run, 2026-08-09): the dev panel rendered discovery's
+    three calls as "three identical queries" — the query string IS shared
+    by design, the differentiator being one listing domain per call riding
+    in include_domains, which no metadata surface showed. Three identical
+    rows photograph exactly like a triple-spend bug."""
+
+    def test_a_restricted_spec_shows_its_domain(self):
+        from agents.data_gatherer import _describe_query_spec
+
+        described = _describe_query_spec({
+            "query": "best Neurology near Chandler AZ",
+            "include_domains": ["healthgrades.com"],
+        })
+        assert described == "best Neurology near Chandler AZ  →  healthgrades.com"
+
+    def test_an_unrestricted_spec_keeps_the_bare_query(self):
+        from agents.data_gatherer import _describe_query_spec
+
+        assert _describe_query_spec({"query": "q"}) == "q"
+        assert _describe_query_spec({"query": "q", "include_domains": []}) == "q"
+
+    def test_both_discovery_paths_route_metadata_through_it(self):
+        """Wiring: home specs and ring specs both feed queries_run through
+        the helper — either call site alone leaves the other rendering
+        identical rows again."""
+        import inspect
+        import agents.data_gatherer as gatherer_module
+
+        src = inspect.getsource(gatherer_module.DataGathererAgent.gather_providers)
+        assert "_describe_query_spec(spec) for spec in home_specs" in src
+        assert "_describe_query_spec(spec) for spec in ring_specs" in src

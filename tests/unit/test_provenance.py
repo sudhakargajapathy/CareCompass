@@ -52,17 +52,28 @@ class TestPlatformRoster:
         """The roster is evidence-managed — membership changes must update
         this test so they can't happen as a side effect."""
         assert REVIEW_PLATFORM_DOMAINS == (
-            'healthgrades.com', 'vitals.com', 'zocdoc.com', 'webmd.com',
-            'ratemds.com',
+            'healthgrades.com', 'vitals.com', 'webmd.com',
         )
 
     def test_known_drops_stay_dropped(self):
         # google/yelp/usnews were each dropped on live evidence (unscrapeable
         # or zero-yield); healthline/sharecare are syndicated healthgrades
-        # data under the same owner and must never join.
+        # data under the same owner and must never join; zocdoc/ratemds were
+        # dropped 2026-08-04 on the round-20 field measurement (zocdoc: 10
+        # pages, a rating on none; ratemds: 2 pages, no pair — its probation
+        # exit criterion, met).
         for domain in ("google.com", "yelp.com", "health.usnews.com",
-                       "healthline.com", "sharecare.com"):
+                       "healthline.com", "sharecare.com",
+                       "zocdoc.com", "ratemds.com"):
             assert domain not in REVIEW_PLATFORM_DOMAINS
+
+    def test_the_roster_sizes_the_enrichment_payload(self):
+        """Every domain here bills Haiku input on every enriched provider —
+        the search asks 2x slots and the extractor reads len+1 blocks. Two
+        zero-yield platforms held ~a third of the block payload for three
+        weeks after the measurement that condemned them."""
+        from agents.data_gatherer import _MAX_REVIEW_BLOCKS
+        assert _MAX_REVIEW_BLOCKS == len(REVIEW_PLATFORM_DOMAINS) + 1 == 4
 
 
 class TestSourceDomain:

@@ -244,3 +244,263 @@ def test_a_cache_hit_unions_observations_instead_of_replacing_them(monkeypatch):
     urls = {o["source_url"] for o in provider["review_observations"]}
     assert len(urls) == 2, f"both platforms must survive the hit, got {urls}"
     assert provider["blended_platform_count"] == 2, "and the blend must see both"
+
+
+# ---- inventory (the Data Gatherer panel's cache catalogue) ----
+
+class TestInventory:
+    """`inventory()` — plaintext catalogue for the cache-miss diagnosis.
+
+    The open defect it services: a repeat search reused 1 of an expected ~5,
+    and diagnosing WHY required diffing two runs' coverage panels by hand.
+    The inventory shows the stored rows (name, basis, age, flags) so a drifted
+    key or an expired row is visible on one screen. Metadata only — a test
+    asserting decryption happened here would be asserting a defect.
+    """
+
+    def test_rows_come_back_newest_first_with_age_and_expiry(self, store, monkeypatch):
+        import utils.vector_store as vs
+
+        real_time = vs.time.time
+        # An 8-day-old row (past the 7-day TTL) written first...
+        monkeypatch.setattr(vs.time, "time", lambda: real_time() - 8 * 86400)
+        store.upsert_enriched_providers(
+            [_provider(name="Dr. Old Timer", location="Mesa, AZ")]
+        )
+        # ...then a fresh row, written now.
+        monkeypatch.setattr(vs.time, "time", real_time)
+        store.upsert_enriched_providers([_provider()])
+
+        inv = store.inventory()
+
+        assert inv["total"] == 2
+        assert [r["name"] for r in inv["rows"]] == [
+            "Dr. Andrea An, MD", "Dr. Old Timer",
+        ], "newest first — the reader is diagnosing the LAST run, not history"
+
+        fresh, old = inv["rows"]
+        assert fresh["expired"] is False
+        assert old["expired"] is True, "8 days > the 7-day TTL"
+        assert old["age_days"] == pytest.approx(8.0, abs=0.1)
+        assert fresh["stored_basis"] == "an andrea|chandler az"
+        # No pin drift on this path: the key was minted from the same fields
+        # the row stores.
+        assert fresh["key_matches_stored_fields"] is True
+        assert "raw_data_encrypted" not in fresh, "metadata catalogue, not payload"
+
+    def test_limit_caps_rows_but_total_reports_the_store(self, store):
+        store.upsert_enriched_providers([
+            _provider(name="Dr. A One", location="Chandler, AZ"),
+            _provider(name="Dr. B Two", location="Chandler, AZ"),
+            _provider(name="Dr. C Three", location="Chandler, AZ"),
+        ])
+
+        inv = store.inventory(limit=1)
+
+        assert inv["total"] == 3
+        assert len(inv["rows"]) == 1
+
+    def test_pinned_key_row_reports_the_mismatch_without_calling_it_corrupt(self, store):
+        """A ZIP-backfilled row's key legitimately hashes the PRE-enrichment
+        location (the pin is the fix for the orphan-row bug), so the stored
+        name+location no longer reproduce the key. The inventory must SAY so
+        — `key_matches_stored_fields` False — because that row is exactly the
+        shape a cache-miss investigation needs to see."""
+        from utils.provider_key import CACHE_KEY_FIELD, pin_cache_key
+
+        p = _provider(location="Phoenix, AZ")
+        pin_cache_key(p)  # pinned while discovery only knew the city
+        p["location"] = "2201 W Fairview St Ste 1, Chandler, AZ 85224"  # enrichment rewrote
+        store.upsert_enriched_providers([p])
+
+        inv = store.inventory()
+
+        assert inv["total"] == 1
+        row = inv["rows"][0]
+        assert row["provider_key"] == p[CACHE_KEY_FIELD]
+        assert row["key_matches_stored_fields"] is False
+
+    def test_schema_mismatch_rows_are_shown_and_flagged(self, store):
+        """A row a read would skip on CACHE_SCHEMA_VERSION still appears —
+        hiding it would make a schema-caused miss look like key drift."""
+        store.collection.upsert(
+            ids=["feedfacefeedface"],
+            documents=["legacy row"],
+            metadatas=[{
+                "provider_key": "feedfacefeedface",
+                "name": "Dr. Legacy Row",
+                "specialty": "Neurology",
+                "location": "Chandler, AZ",
+                "schema_version": "1",
+                "enriched_at_epoch": time.time(),
+                "enriched_at_iso": "2026-08-01T00:00:00Z",
+            }],
+            embeddings=[[0.1] * 8],
+        )
+
+        inv = store.inventory()
+
+        assert inv["total"] == 1
+        assert inv["rows"][0]["schema_mismatch"] is True
+
+    def test_unreadable_store_reports_instead_of_raising(self, store):
+        """A diagnostic must never take down the panel it diagnoses."""
+        store.collection = Mock()
+        store.collection.get.side_effect = RuntimeError("chroma unavailable")
+
+        inv = store.inventory()
+
+        assert inv == {"total": 0, "rows": [], "error": "chroma unavailable"}
+
+
+def test_two_hits_with_live_observations_both_restore(monkeypatch):
+    """The three-day cache outage in one test: the union branch's scratch list
+    was named `fresh`, SHADOWING the hits dict the loop iterates against. The
+    first hit that carried live discovery observations rebound the name; the
+    next iteration's `fresh.get(key)` raised AttributeError on a list; the
+    outer except — built for store outages — logged "Cache read failed,
+    continuing cold" and every provider after that point silently missed,
+    re-enriched, and re-billed, at most ONE such hit surviving per search
+    (live: always exactly Vandian, three runs straight, while the store
+    passed every durability test).
+
+    The seam is two CONSECUTIVE hits that both carry live observations —
+    a shape no single-provider test can walk, which is why three store-level
+    reproductions passed while every real run failed."""
+    from agents.data_gatherer import DataGathererAgent
+
+    with patch.object(DataGathererAgent, "_initialize_clients", return_value=None):
+        gatherer = DataGathererAgent()
+    gatherer.tavily_client = MagicMock()
+    gatherer.anthropic_client = MagicMock()
+
+    providers = [
+        {
+            "name": name,
+            "location": city,
+            "review_observations": [
+                {"source_url": f"https://www.vitals.com/doctors/{slug}",
+                 "rating": 4.0, "review_count": 20},
+            ],
+        }
+        for name, city, slug in [
+            ("Dr. Vardges Vandian, DO", "Gilbert, AZ", "vandian"),
+            ("Dr. Nicole Alyce Simpkins, MD", "Chandler, AZ", "simpkins"),
+        ]
+    ]
+    payloads = {
+        resolve_cache_key(p): {
+            "review_observations": [
+                {"source_url": f"https://www.healthgrades.com/physician/{i}",
+                 "rating": 4.5, "review_count": 100 + i},
+            ],
+            "review_summary": "Stored summary.",
+            "review_sentiment": "positive",
+        }
+        for i, p in enumerate(providers)
+    }
+
+    store = MagicMock()
+    store.get_cached_providers.return_value = (payloads, [])
+    monkeypatch.setattr("utils.vector_store.get_vector_store", lambda: store)
+
+    hits = gatherer._apply_cached_enrichment(providers)
+
+    assert hits == 2, "the SECOND hit is the one the shadowed name lost"
+    for p in providers:
+        assert p["enrichment_outcome"] == "cached", p["name"]
+        urls = {o["source_url"] for o in p["review_observations"]}
+        assert len(urls) == 2, f"union must keep both platforms for {p['name']}"
+
+
+def test_failure_outcomes_are_never_cached(monkeypatch):
+    """Dr. Raja, 2026-08-08: `outcome: no_profile_found` yet a freshly stamped
+    store row. The write filter was `!= "cached"`, and the store's
+    substantive-payload guard predates discovery emitting listing-parsed
+    observations — so a provider whose own profile was never found carried
+    enough discovery "substance" to be cached anyway. Next run the hit
+    relabels him `cached`, which passes the recommendation gate the failure
+    had correctly failed, and his profile search is not retried for the
+    whole TTL. Only `enriched` may be written: failures retry every run,
+    cache hits keep their timestamp, over_budget rows never masquerade as
+    researched."""
+    from agents.data_gatherer import DataGathererAgent
+
+    with patch.object(DataGathererAgent, "_initialize_clients", return_value=None):
+        gatherer = DataGathererAgent()
+
+    providers = [
+        {"name": "Dr. Kept, MD", "enrichment_outcome": "enriched",
+         "review_observations": [{"rating": 4.5, "review_count": 10,
+                                  "source_url": "https://vitals.com/doctors/kept"}]},
+        {"name": "Dr. Roshan Raja, DO", "enrichment_outcome": "no_profile_found",
+         "review_observations": [{"rating": 3.9, "review_count": 12,
+                                  "source_url": "https://doctor.webmd.com/listing"}]},
+        {"name": "Dr. Hit, MD", "enrichment_outcome": "cached"},
+        {"name": "Dr. Deferred, MD", "enrichment_outcome": "over_budget",
+         "review_observations": [{"rating": 4.0, "review_count": 8,
+                                  "source_url": "https://vitals.com/doctors/deferred"}]},
+        {"name": "Dr. Wrong Person", "enrichment_outcome": "identity_rejected"},
+        {"name": "Dr. Errored", "enrichment_outcome": "failed"},
+    ]
+
+    store = MagicMock()
+    store.upsert_enriched_providers.return_value = 1
+    monkeypatch.setattr("utils.vector_store.get_vector_store", lambda: store)
+
+    gatherer._store_enrichment(providers)
+
+    written = store.upsert_enriched_providers.call_args.args[0]
+    assert [p["name"] for p in written] == ["Dr. Kept, MD"]
+
+
+def test_undecryptable_rows_are_counted_and_named(store, caplog):
+    """A rotated or unset ENCRYPTION_KEY used to kill the whole cache
+    INVISIBLY: decrypt returned None, the row joined neither `fresh` nor
+    `stale`, nothing logged — and the plaintext inventory is structurally
+    blind to it because it never decrypts. The one cache failure with no
+    surface anywhere. Now it is counted, keyed into `stale` (so the caller's
+    log shows the rows ignored rather than nonexistent), and the warning
+    names the likely cause."""
+    import logging
+
+    from utils.encryption import DataEncryption
+
+    p = _provider()
+    store.upsert_enriched_providers([p])
+
+    # Simulate the key rotating between the write and the read.
+    store.encryptor = DataEncryption.__new__(DataEncryption)
+    from cryptography.fernet import Fernet
+    store.encryptor.cipher = Fernet(Fernet.generate_key())
+
+    with caplog.at_level(logging.WARNING, logger="utils.vector_store"):
+        fresh, stale = store.get_cached_providers(
+            [{"name": p["name"], "location": p["location"]}]
+        )
+
+    assert fresh == {}
+    assert stale == [provider_cache_key(p["name"], p["location"])]
+    assert any("undecryptable" in r.message and "ENCRYPTION_KEY" in r.message
+               for r in caplog.records)
+
+
+def test_every_read_logs_keys_against_store_rows(store, caplog):
+    """Fix D: one INFO line per read — keys asked vs rows in the store vs
+    fresh vs stale. Three days of debugging reconstructed exactly these
+    numbers from screenshots of downstream panels; the line separates an
+    empty store from key drift from rejected rows at a glance."""
+    import logging
+
+    store.upsert_enriched_providers([_provider()])
+
+    with caplog.at_level(logging.INFO, logger="utils.vector_store"):
+        store.get_cached_providers([
+            {"name": "Dr. Andrea An, MD", "location": "Chandler, AZ"},
+            {"name": "Dr. Nobody Stored, MD", "location": "Mesa, AZ"},
+        ])
+
+    read_lines = [r.message for r in caplog.records if r.message.startswith("Cache read:")]
+    assert read_lines, "the read must announce itself"
+    assert "2 key(s) against 1 stored row(s)" in read_lines[-1]
+    assert "1 fresh" in read_lines[-1]

@@ -20,6 +20,12 @@ logger = logging.getLogger(__name__)
 # through 2026-08-31; the list price is used here so estimates never
 # understate.
 PRICING_PER_MTOK: Dict[str, Dict[str, float]] = {
+    # Opus 5 ships at Opus 4.8's exact price. The row stays although the
+    # critic default reverted to 4.8 (2026-08-09, measured latency): the
+    # env knob can still select Opus 5, and an unlisted model records
+    # priced=False so the cost card silently under-reports the run total
+    # (the critic is ~54% of it).
+    "claude-opus-5": {"input": 5.00, "output": 25.00},
     "claude-opus-4-8": {"input": 5.00, "output": 25.00},
     "claude-sonnet-5": {"input": 3.00, "output": 15.00},
     "claude-haiku-4-5": {"input": 1.00, "output": 5.00},

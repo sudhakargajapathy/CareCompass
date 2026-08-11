@@ -4,7 +4,7 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from itertools import zip_longest
-from typing import Dict, List, Any, Optional, Union
+from typing import Callable, Dict, List, Any, Optional, Tuple, Union
 import json
 import re
 from tavily import TavilyClient
@@ -12,9 +12,17 @@ from anthropic import Anthropic
 
 from utils.config import get_config
 from utils.cost_tracker import get_cost_tracker, safe_usage
-from utils.excerpt import build_excerpt
+from utils.excerpt import build_excerpt, clip_words
+from utils.json_salvage import salvage_json_objects
+from utils.listing_parser import (
+    parse_listing, slug_agrees_with_name, slug_contradicts_name,
+)
+from utils.profile_parser import parse_profile, strip_data_uris
 from utils.geo import city_state_for_zip, distance_miles, location_tier, nearby_cities, parse_location, resolution_level, strip_zip
-from utils.provenance import REVIEW_PLATFORM_DOMAINS, is_profile_url, source_domain, url_page_kind
+from utils.provenance import (
+    REVIEW_PLATFORM_DOMAINS, canonical_profile_url, is_profile_url,
+    source_domain, url_page_kind, urls_contradict,
+)
 from utils.shard import contiguous_shards
 
 # Which discovery pass surfaced a candidate. `ring_expanded` in search_metadata
@@ -42,6 +50,8 @@ def _page_rank(url) -> int:
 from utils.provider_key import (
     CACHE_KEY_FIELD,
     normalize_name_tokens,
+    normalized_name,
+    normalized_place,
     pin_cache_key,
     resolve_cache_key,
 )
@@ -166,6 +176,39 @@ _DISCOVERY_MAX_BLOCKS = 18
 _DISCOVERY_EXCERPT_BUDGET = 6000
 _DISCOVERY_EXCERPT_WINDOWS = 8
 
+# Bound on Tavily's `content` per page block. `raw_content` has been budgeted
+# since round 12, but `content` was pasted WHOLE into the same block — one
+# field disciplined, the other not, in the same f-string. That asymmetry was
+# harmless only while `content` was small at the vendor's default of 3 chunks;
+# raising TAVILY_CHUNKS_PER_SOURCE to 5 grows it ~70% (2,169 -> 3,636 chars per
+# page measured over 20 pages), and an 18-block discovery pass multiplies that
+# by 18. A knob that silently scales an unbounded field is how a prompt doubles
+# without anyone deciding it should.
+#
+# 3000, not the excerpt's 6000: `content` and the excerpt are COMPLEMENTARY,
+# not redundant, and the split protects the excerpt's share. Measured over one
+# discovery pass, counting occurrences across the whole pass:
+#
+#                      content   excerpt
+#     provider entry      65        36     content wins the roster fields
+#     rating+count        55        20
+#     address w/ ZIP      97        37
+#     years of exp         5        11     excerpt wins the two that the
+#     insurance           26        47     per-domain anchors target
+#
+# Neither field can be dropped for the other: `content` is selected for
+# relevance to a query that asks about reviews and ratings, so it is dense in
+# exactly those and thin in tenure and payer lists, which is what
+# `_DOMAIN_ANCHOR_HINTS` aims the excerpt windows at. Clipping is word-safe
+# and leaves a visible "…", because a model handed a silent fragment reasons
+# about it as though it were the whole page.
+_CONTENT_MAX_CHARS = 3000
+
+# (ADDRESS_CONFLICT_MILES, the 20-mile conflict threshold, was retired with
+# the cluster vote: a multi-office group specialist's far-apart addresses are
+# a confirmed practice, not a conflict, and the member-facing note now keys
+# on "more than one location" rather than on any distance.)
+
 # How many concurrent extraction calls read those blocks, and the pool size
 # below which splitting stops paying. Two, not more: each shard re-sends the
 # whole ~1.5k-token instruction block, so the prompt cost grows linearly with
@@ -180,6 +223,24 @@ _DISCOVERY_EXCERPT_WINDOWS = 8
 _DISCOVERY_SHARDS = 2
 _MIN_PAGES_TO_SHARD = 6
 
+# Discovery extraction's OUTPUT budget scales with the blocks in the call —
+# the judge's and critic's ceilings have scaled with pool size since round 9,
+# while this call kept a flat 8000 although its truncation is the worst in
+# the system: a cut array has no closing bracket, repair cannot match, the
+# pool reads ZERO, and the ring rebuilds it from cities nobody asked about
+# (2026-07-28: two runs of one search, 11 minutes apart, overlapped on ~1
+# physician — the flat ceiling was the coin flip deciding WHO got
+# recommended). A block can name several providers on a directory page and a
+# full entry with a multi-sentence summary runs ~400-600 output tokens, so
+# 600/block; the base covers preamble-free small calls; the FLOOR is the old
+# flat value so no call gets less room than it had (at 9 blocks — a normal
+# shard — the formula gives 9400). max_tokens is a ceiling, not a spend:
+# unused headroom costs nothing, so the cap exists only to bound a
+# pathological block count, far under Haiku's 64k output limit.
+_DISCOVERY_TOKENS_BASE = 4000
+_DISCOVERY_TOKENS_PER_BLOCK = 600
+_DISCOVERY_TOKENS_MAX = 16000
+
 # Where to aim the excerpt window on each platform's pages, beyond the
 # generic review vocabulary: every platform has a known section whose
 # capture directly feeds a score input (years -> experience subscore,
@@ -193,7 +254,6 @@ _DOMAIN_ANCHOR_HINTS = {
     # `_anchor_pattern`, but a hint aimed at the exact phrase costs nothing and
     # does not depend on that fix holding.
     'healthgrades.com': ("years of experience", "insurance accepted", "patient rating"),
-    'zocdoc.com': ("in-network", "insurance"),
     'webmd.com': ("conditions treated", "procedures"),
     'vitals.com': ("insurance",),
 }
@@ -247,6 +307,168 @@ def _surname_anchors(surname: str) -> List[str]:
     return anchors
 
 
+# The three platforms whose directory pages parse deterministically. Discovery
+# fans one query across them, ONE DOMAIN PER CALL.
+#
+# One combined call is not equivalent, and not merely less balanced: with all
+# five platforms in a single basic-depth request, `include_domains` did not hold
+# and the search returned bestbuy.com, YouTube and Cambridge Dictionary — zero
+# in-domain results against advanced's twenty. One domain per call holds at
+# basic on all three (5 results, 5 in-domain, measured), which is also why
+# discovery costs 3 credits here rather than 6.
+#
+# zocdoc and ratemds are absent by measurement, not preference: zocdoc returned
+# ten pages with no rating on any of them and no URL our classifier could type,
+# and ratemds returned two pages and no rating+count pair while already on
+# probation for exactly that.
+_LISTING_DOMAINS = ("healthgrades.com", "doctor.webmd.com", "vitals.com")
+
+
+# The HEAD of a specialty label names the DISCIPLINE; the words in front of it
+# narrow it. "Vascular Neurology" is neurology. "Neurological Surgery" is
+# surgery — a different training path, a different kind of appointment — and no
+# amount of shared stem makes a neurosurgeon a neurologist.
+#
+# A stem rule alone cannot tell those apart, and did not: a Neurology search
+# returned "Neurological Surgery" at ranks 1 and 4 because "neurological"
+# starts with "neurol". The critic caught it in its own words on that run —
+# "the list blends brain/spine surgeons with general neurologists" — which is a
+# ranking caveat standing in for a filter that should have run first.
+#
+# Only heads that name a whole discipline belong here. "Medicine" deliberately
+# does NOT: "Sleep Medicine" is a neurology sub-specialty portals file
+# neurologists under, and treating its head as a discipline would reject them.
+# A label whose head is not listed falls through to the lenient check below,
+# which is the behaviour this list is narrowing, not replacing.
+_DISCIPLINE_HEADS = frozenset({
+    "surgery", "neurology", "psychiatry", "radiology", "pathology",
+    "anesthesiology", "dermatology", "oncology", "psychology", "dentistry",
+    "podiatry", "optometry", "chiropractic", "obstetrics", "gynecology",
+    "pediatrics", "cardiology", "urology", "ophthalmology", "otolaryngology",
+    "orthopedics", "orthopaedics", "endocrinology", "gastroenterology",
+    "rheumatology", "nephrology", "pulmonology", "immunology", "hematology",
+    "geriatrics", "neurosurgery",
+})
+
+
+def _discipline_head(label: str) -> Optional[str]:
+    """The discipline a specialty label resolves to, or None if unrecognised."""
+    words = re.findall(r"[a-z]+", str(label or "").lower())
+    for word in reversed(words):
+        if word in _DISCIPLINE_HEADS:
+            return "surgery" if word == "neurosurgery" else word
+    return None
+
+
+def _specialty_is_compatible(row_specialty: Any, target: str) -> bool:
+    """Does a listing row's own specialty label admit the searched specialty?
+
+    A directory scoped to one specialty still lists others — a vitals NEUROLOGY
+    page carries "Dr. Edgardo D Zavala-Alarcon, MD — Plastic Surgery" at 4.7
+    over 72 ratings, which would outrank most of the real neurologists. Beyond
+    that the check is DELIBERATELY LENIENT: portals file one doctor under
+    adjacent labels, and rejecting on a label mismatch alone is the failure that
+    made the enrichment query drop the specialty term in the first place. A
+    missing label admits the row.
+
+    The one place leniency is NOT allowed is a different DISCIPLINE. When both
+    labels name one, they must name the same one — that is what separates
+    "Vascular Neurology" (a neurologist) from "Neurological Surgery" (a
+    surgeon), which the stem rule below could not, because it only ever saw
+    that both words begin "neurol". Symmetric by construction: searching
+    "General Surgery" admits "Neurological Surgery" and rejects "Neurology".
+    """
+    label = str(row_specialty or "").strip().lower()
+    want = str(target or "").strip().lower()
+    if not label or not want:
+        return True
+
+    label_head, want_head = _discipline_head(label), _discipline_head(want)
+    if label_head and want_head:
+        return label_head == want_head
+
+    label_words = set(re.findall(r"[a-z]+", label))
+    want_words = set(re.findall(r"[a-z]+", want))
+    if label_words & want_words:
+        return True
+    # Spelling variants of ONE discipline ("Neurologic" / "Neurology"). This is
+    # all the stem rule was ever meant to do; the discipline check above is what
+    # stops it reaching across two.
+    return any(
+        w.startswith(v[:6]) or v.startswith(w[:6])
+        for w in label_words for v in want_words
+        if len(w) >= 6 and len(v) >= 6
+    )
+
+
+def _listing_row_to_provider(row: Dict[str, Any], specialty: str) -> Dict[str, Any]:
+    """A parsed listing row in the shape the rest of the pipeline expects.
+
+    The rating is emitted BOTH as the headline pair and as a
+    `review_observations` entry, because the blend, the same-domain collapse and
+    the platform-pair count all read observations — a row that set only
+    `rating`/`review_count` would score but contribute nothing to cross-platform
+    agreement, which is the whole reason for reading three platforms.
+
+    `profile_url` is carried through as the canonical identity key. It is
+    stronger evidence than name matching: two records sharing a platform's own
+    `/physician/dr-…` link are the same person, where `_name_token_overlap` at
+    0.5 would accept two different doctors sharing a surname.
+    """
+    provider: Dict[str, Any] = {
+        "name": row.get("name"),
+        "specialty": row.get("specialty") or specialty,
+        "location": row.get("location"),
+        # Where the address came from, carried from the first write. A card
+        # showed two different doctors at one street address and one distance,
+        # and no surface could say whether that came from a listing row, a
+        # parsed profile, or a model reading a group practice page.
+        "location_source": f"listing_parser:{row.get('review_source_url')}",
+        "years_experience": row.get("years_experience"),
+        # Same provenance discipline as the address: tenure decides real
+        # ranking points (a stated year vs the unknown imputation), so triage
+        # needs its producer named. None when the row stated no tenure —
+        # a later producer then labels its own write.
+        "experience_source": (
+            f"listing_parser:{row.get('review_source_url')}"
+            if row.get("years_experience") is not None else None
+        ),
+        "profile_url": row.get("profile_url"),
+        "rating": row.get("rating") or 0,
+        "review_count": row.get("review_count"),
+        "review_source_url": row.get("review_source_url"),
+        "review_summary": "No reviews available",
+        "review_sentiment": "unknown",
+        "insurance_accepted": [],
+        "extraction_source": "listing_parser",
+    }
+    if row.get("rating") is not None and (row.get("review_count") or 0) > 0:
+        # The observation points at the DOCTOR'S OWN PROFILE, not at the index
+        # we read it off — when the row carried one, which is the normal case
+        # because every platform links the profile from the entry heading.
+        #
+        # A directory row's numbers are PER ROW. `Rated 3.8 out of 5 … from 88
+        # ratings` sits inside Dr. Pandey's block and is his, so "listing page"
+        # describes where we read it and not whom it is about. Recording the
+        # index URL made the card say "doctor.webmd.com — listing page" and
+        # link forty doctors deep, while the link to the one doctor it is about
+        # sat unused in the same parsed row.
+        #
+        # `read_from_url` keeps the provenance rather than losing it: the pair
+        # was read off the directory, and a later enrichment pass reading the
+        # profile itself may state different numbers.
+        provider["review_observations"] = [{
+            "source_url": row.get("profile_url") or row.get("review_source_url"),
+            "read_from_url": row.get("review_source_url"),
+            "rating": row.get("rating"),
+            "review_count": row.get("review_count"),
+            "page_provider_name": row.get("name"),
+        }]
+    else:
+        provider["review_observations"] = []
+    return provider
+
+
 def _anchors_for(url: Any, base_anchors: List[str]) -> List[str]:
     """Base anchors + the hint anchors for the result's platform, if any."""
     lowered = str(url or "").lower()
@@ -254,6 +476,21 @@ def _anchors_for(url: Any, base_anchors: List[str]) -> List[str]:
         if domain in lowered:
             return list(base_anchors) + list(hints)
     return list(base_anchors)
+
+
+def _describe_query_spec(spec: Dict[str, Any]) -> str:
+    """One display string per search CALL, domain restriction included.
+
+    Discovery's three calls share one query string by design — the
+    differentiator is one listing domain per call, riding in
+    `include_domains` where no metadata surface showed it. The dev panel
+    therefore rendered "three identical queries", which photographs exactly
+    like a triple-spend bug. The arrow suffix makes the per-call restriction
+    visible; an unrestricted spec keeps the bare query.
+    """
+    query = str(spec.get("query", ""))
+    domains = spec.get("include_domains") or []
+    return f"{query}  →  {', '.join(domains)}" if domains else query
 
 
 def _is_review_platform_url(url: Any) -> bool:
@@ -366,8 +603,23 @@ def _run_observation_ladder(candidates):
     counted = [o for o in candidates if o["review_count"]]
 
     if credible_pairs:
-        # Volume is the tiebreaker between disagreeing sources
-        return max(credible_pairs, key=lambda o: o["review_count"])
+        # Volume is the tiebreaker between disagreeing sources — but only among
+        # sources that are ABOUT this doctor. A "Best Neurologists in Chandler"
+        # index states a number that is true of the page, not attributable to
+        # the person whose card it lands on, and volume alone let one win: a
+        # 2026-07-31 run carded "Best single source: healthgrades.com — listing
+        # page 4.6/5 (33 reviews)" for a provider whose own webmd profile stated
+        # 5.0 over 22. The listing had a bigger number, so it took the headline
+        # and the link.
+        #
+        # A listing pair still counts everywhere else — it stays in "Across
+        # platforms", it feeds the blend, it counts toward the platform pair
+        # count. It just cannot be the ONE source the card attributes to the
+        # doctor while an attributable one exists. That is the same distinction
+        # `profile_backed_platforms` was added to measure, applied at the point
+        # where it decides what a patient reads.
+        attributable = [o for o in credible_pairs if _page_rank(o["source_url"]) > 0]
+        return max(attributable or credible_pairs, key=lambda o: o["review_count"])
     if rated:
         ratings = [o["rating"] for o in rated]
         if max(ratings) - min(ratings) > _RATING_DISAGREEMENT_SPAN:
@@ -548,6 +800,11 @@ def _annotate_source_yields(
                                          before page kind is ever consulted
         {"rating": 4.1, "review_count": 70}     a full pair
 
+    Each row also carries `via` — "profile_parser" or "llm" — because the two
+    fail for different reasons and the fix differs: a parser gap is a markup
+    change to re-read off a fetched page, an LLM gap is an excerpt that missed
+    the header. Without it, coverage looks identical either way.
+
     Matching is on the URL string (case- and trailing-slash-insensitive). The
     extractor echoes the URL it was shown, so a mismatch is rare — but when one
     happens the row reads `None`, which is the honest statement of what this
@@ -571,9 +828,431 @@ def _annotate_source_yields(
         row["yielded"] = None if obs is None else {
             "rating": _parse_rating(obs.get("rating")),
             "review_count": _first_int(obs.get("review_count")),
+            "via": obs.get("extraction_source") or "llm",
         }
         annotated.append(row)
     return annotated
+
+
+def _split_by_radius(
+    providers: List[Dict[str, Any]], radius_miles: float
+) -> tuple:
+    """(near enough, too far) — by MEASURED distance only.
+
+    A platform's city page is a radius centre, not a filter: a Chandler search
+    returns Gilbert, Mesa and Phoenix entries. Nothing bounded that before, and
+    distance alone could not, because location's realized span across a real
+    pool is under one point — so a provider 40 miles out competed for a
+    research-budget slot with one 4 miles out and lost by a rounding error.
+
+    A radius, never a city match. On the 2026-07-31 run Gilbert at 4.5 mi was
+    nearer to the searched Chandler ZIP than two of that run's own Chandler
+    results at 8.0 mi, so "same city only" would have dropped the closest
+    provider on the page. The city someone types is where they are, not a
+    boundary they are asking to have enforced.
+
+    An UNKNOWN distance never drops anyone. That is our geocoding coverage, not
+    their location — the same rule the scorer follows when it declines to
+    penalise a provider for data we failed to gather.
+    """
+    near, far = [], []
+    for provider in providers or []:
+        distance = provider.get("computed_distance_miles")
+        if isinstance(distance, (int, float)) and not isinstance(distance, bool) \
+                and distance > radius_miles:
+            far.append(provider)
+        else:
+            near.append(provider)
+    return near, far
+
+
+def _parse_profile_pages(results: Optional[List[Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+    """Read every PROFILE page this search returned, deterministically.
+
+    PROFILE pages only. These patterns describe a profile's markup, a directory
+    index has its own parser, and running profile patterns over a page naming
+    forty doctors is how a neighbour's rating ends up on someone's card.
+
+    A page the parser cannot read is simply absent from the result, which is
+    what routes it to the model — and so is a page it reads PARTIALLY, because
+    the caller merges per field.
+    """
+    parsed: Dict[str, Dict[str, Any]] = {}
+    for result in results or []:
+        url = str(result.get("url") or "")
+        if not url or url_page_kind(url) != "profile":
+            continue
+        facts = _parse_both_texts(url, result)
+        if facts:
+            parsed[url] = facts
+    return parsed
+
+
+def _parse_both_texts(url: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    """Parse a page's `raw_content` AND Tavily's `content`, and merge them.
+
+    ONE page, TWO extractions. `raw_content` is the full-page markdown;
+    `content` is Tavily's own relevance-selected chunks of the same URL. They
+    are produced differently and they do not carry the same text — which the
+    round-17 sweep already measured (`content` carried 55 rating+count pairs
+    across a discovery pass against the anchored excerpt's 20) — and yet only
+    `raw_content` was ever parsed. The other text sat in the same result dict,
+    already paid for and already going to the model in the prompt, unread by
+    the deterministic path.
+
+    It is not a hypothetical gap. A healthgrades profile came back at 5,756
+    chars stating a rating and no total, while the page in a browser reads
+    "4.8 Star Rating / Based on 260 reviews" — so that provider's healthgrades
+    pair was dropped from the blend and the card said "2 platforms" beside
+    three named ones.
+
+    THE CHUNKS ARE THE WEAKER SOURCE and are treated as such. Chunk boundaries
+    lose the heading structure the per-platform parsers use to keep a
+    neighbour's numbers out, so `_parse_healthgrades`'s bound above
+    "## Compare Providers" cannot fire on text where that heading was not
+    selected. Two rules follow:
+
+      - The full-page parse WINS every field it produced. Chunks only fill gaps.
+      - Any field BOTH parses produced must agree, or the chunks are describing
+        something the full page did not and none of their extras are trusted.
+      - A COUNT from the chunks needs the full page to state a RATING. That
+        rating is what names the subject: it says the page we fetched is about
+        one doctor with one score, and the chunks are completing that pair
+        rather than introducing a number about nobody in particular.
+
+    That last rule USED to demand more — that the chunks RESTATE the rating and
+    that the two match. It was written as deliberately too tight, with a note
+    that loosening should follow a run showing it cost real coverage. The
+    2026-08-04 run is that evidence. Dr. Hagevik's healthgrades profile came
+    back as a thin 5,756-char body stating `4.8 Star Rating` and no total,
+    while the chunks for the SAME url carried `Based on 260 reviews` — the
+    exact text a browser shows. The chunks state a count and no rating, so the
+    old rule refused it, healthgrades went into the blend with a rating and no
+    weight, and the card read "2 platforms" beside three named ones.
+
+    Requiring the restatement was asking the weaker text to prove something the
+    stronger text had already established. Both texts are the SAME url, fetched
+    once: the full page's rating is a better subject anchor than a repetition
+    inside a relevance-selected excerpt. A conflicting rating in the chunks
+    still discards them whole, which is the check that actually protects the
+    count — a promo strip that carries someone else's total generally carries
+    their stars too.
+    """
+    primary = parse_profile(url, str(result.get("raw_content") or ""))
+    chunks = str(result.get("content") or "")
+    if not chunks:
+        return primary
+
+    secondary = parse_profile(url, chunks)
+    if not secondary:
+        return primary
+
+    # Any field both produced must agree, or the chunks are describing
+    # something the full page did not and none of their extras are trustworthy.
+    for field in ("rating", "review_count", "years_experience"):
+        if (primary.get(field) is not None and secondary.get(field) is not None
+                and primary[field] != secondary[field]):
+            logger.info(
+                "Ignoring chunk parse for %s: %s disagrees (%r vs %r)",
+                url, field, primary[field], secondary[field],
+            )
+            return primary
+
+    merged = dict(primary)
+    for field, value in secondary.items():
+        if field == "review_count" and primary.get("rating") is None:
+            # No rating on the full page means nothing here names the subject,
+            # so a bare count out of the chunks would be attached to whoever
+            # the page happens to be about. Refuse — and say so, because this
+            # is the branch that silently costs coverage.
+            logger.info(
+                "Chunk count %r refused for %s: the full page states no rating",
+                value, url,
+            )
+            continue
+        if field == "review_count" and primary.get("rating_pattern") == "likelihood":
+            # healthgrades template B states NO total anywhere in its payload —
+            # measured, and the reason the parser deliberately returns a rating
+            # with no count for it. A count appearing only in this page's
+            # chunks therefore cannot be the subject's; it is a neighbour's
+            # "Based on N reviews" whose stars the chunk boundary cut, which is
+            # exactly the shape the full-page-rating anchor cannot catch.
+            # Template A pages are untouched: their payload does carry the
+            # total, so a chunk count there is recovering a thin fetch's loss.
+            logger.info(
+                "Chunk count %r refused for %s: template-B page, its payload "
+                "carries no total", value, url,
+            )
+            continue
+        merged.setdefault(field, value)
+    return merged
+
+
+def _url_identifies_provider(url: Any, provider_name: str) -> bool:
+    """Does this URL show the page is about THIS doctor?
+
+    The slug must carry their name. That is the whole test, and it works the
+    same way on a platform profile (`/physician/dr-harvinder-kumar-x1`) and on
+    a practice site's own per-doctor page (`/physicians/harvinder-kumar/`).
+
+    POSITIVE identification, not the absence of a contradiction — the
+    distinction is the entire point here. A group practice page (`/physicians`,
+    `/neurology`, `/locations/mesa`) names nobody, so it contradicts nobody, so
+    `slug_contradicts_name` admits every one of them — and they are exactly the
+    pages that state one address for several doctors.
+
+    `url_page_kind` deliberately does NOT appear. It answers a different
+    question — is this a profile or a directory index, for labelling a source
+    on a card — and it returns "profile" for ANY url off the five review
+    platforms, because an unrecognised host is not a directory. Used as an
+    identity test it passes `barrowneuro.org/our-team/` and every other
+    doctor's profile besides.
+    """
+    return bool(url) and slug_agrees_with_name(url, provider_name)
+
+
+def _states_disagree(page_location: Any, known_location: Any) -> bool:
+    """Do two addresses name DIFFERENT states? False whenever either is unknown.
+
+    The one geography check that is safe to make on identity. Comparing cities
+    would reject a doctor whose profile lists the practice one suburb over, and
+    comparing distance needs a ZIP both sides. A state is coarse enough that
+    disagreement is real evidence and fine enough to separate Chandler, AZ from
+    San Antonio, TX.
+    """
+    page = parse_location(str(page_location or "")).get("state")
+    known = parse_location(str(known_location or "")).get("state")
+    return bool(page and known and page != known)
+
+
+# The deterministic readers. An observation carrying one of these was read off
+# page markup by a regex; anything else came from the model.
+_PARSER_SOURCES = frozenset({"listing_parser", "profile_parser"})
+
+
+def _merge_parser_numbers(obs: Dict[str, Any], facts: Dict[str, Any]) -> None:
+    """Apply a profile parse's rating/count over an existing observation.
+
+    The profile parse owns BOTH numbers against the MODEL, and that rule is
+    unchanged: splicing a parsed rating onto a model-read count manufactures a
+    pair neither source stated, on exactly the shapes where the parser withholds
+    a number deliberately (healthgrades template B, a vitals comparison column
+    that failed its cross-check).
+
+    The corroboration branch below fires only when `obs` was ITSELF written by
+    a parser — which, at this call site, means a second parsed page whose URL
+    canonicalises to one an earlier parsed page already claimed (http/https,
+    www, trailing-slash duplicates that Tavily returns as distinct results). A
+    thin duplicate must not erase what the fuller copy read.
+
+    SCOPE CORRECTION (2026-08-04, same day it shipped): this guard was written
+    against Dr. Hagevik's lost healthgrades count, narrated as "the profile
+    parse lands on the listing row's observation". It does not — the listing
+    observation lives on the PROVIDER and never enters `_apply_parsed_profiles`,
+    which receives only the enrichment pass's own (model-written) observations,
+    and the real listing observation carries no `extraction_source` besides.
+    The two parser reads meet in `_merge_review_data`'s union, and the fix for
+    the narrated failure is `_fill_corroborated_gaps` there. This stays as the
+    duplicate-page guard, with the rule it shares: a parser-established number
+    survives a read that is merely SILENT about it when every shared field
+    agrees; on disagreement the newer page wins outright.
+    """
+    incoming = {"rating": facts.get("rating"), "review_count": facts.get("review_count")}
+    shared = [
+        (obs.get(field), value)
+        for field, value in incoming.items()
+        if obs.get(field) is not None and value is not None
+    ]
+    corroborates = (
+        obs.get("extraction_source") in _PARSER_SOURCES
+        and bool(shared)
+        and all(existing == value for existing, value in shared)
+    )
+    for field, value in incoming.items():
+        if value is None and corroborates and obs.get(field) is not None:
+            # Keep the earlier parser's number; this page simply didn't state it.
+            continue
+        obs[field] = value
+
+
+def _fill_corroborated_gaps(kept: Dict[str, Any], dropped: Dict[str, Any]) -> None:
+    """Two reads of the SAME url collided in a union; fill what the kept one
+    is silent about, when everything they share agrees.
+
+    Every observation union here is "first URL wins", which answers the
+    question it was built for — the same page must not count twice — and
+    silently answers a second question it was never meant to decide: which
+    READ of that page survives. Since a parsed listing row's observation
+    started pointing at the doctor's own profile url, discovery and enrichment
+    collide on that url BY CONSTRUCTION, and first-wins keeps whichever pass
+    ran first, richer or not. Reproduced with Dr. Hagevik's shapes: discovery
+    holding `4.8/None` and enrichment recovering `4.8/260` kept the None — so
+    the count, lost once to a thin fetch and once to the chunk rule, was
+    recoverable a third time and still discarded.
+
+    The rule is the corroboration doctrine the chunk merge and the
+    duplicate-page guard already follow: agreement on every shared numeric
+    field says the two reads describe the same subject, and only then may one
+    complete the other. Strictly additive — this never overwrites a stated
+    number and never clears one, so on ANY disagreement the union's existing
+    behaviour (first wins, untouched) is preserved. A collision with no shared
+    field (rating-only meeting count-only) fills nothing: nothing establishes
+    the two reads agree, and manufacturing a pair from two half-reads is the
+    exact splice the parser rules refuse.
+    """
+    shared = []
+    for field, parse in (("rating", _parse_rating), ("review_count", _first_int)):
+        kept_value, dropped_value = parse(kept.get(field)), parse(dropped.get(field))
+        if kept_value is not None and dropped_value is not None:
+            shared.append((kept_value, dropped_value))
+    if not shared or any(a != b for a, b in shared):
+        return
+    for field, parse in (("rating", _parse_rating), ("review_count", _first_int)):
+        if parse(kept.get(field)) is None and parse(dropped.get(field)) is not None:
+            kept[field] = parse(dropped.get(field))
+
+
+def _apply_parsed_profiles(
+    review_data: Dict[str, Any],
+    parsed: Dict[str, Dict[str, Any]],
+    provider_name: str,
+    overlap: Callable[[str, str], float],
+    provider_location: str = "",
+) -> Dict[str, Any]:
+    """Let a deterministic profile parse override the model, PER FIELD.
+
+    The parser and the extractor read the SAME pages, and where the parser can
+    read one its answer is reproducible while the model's is not — a 3,000-char
+    anchor-window excerpt of a 15k page, scored by the cheapest model, moved a
+    provider four ranks between two runs of one search. So the parser wins where
+    it has an answer and the model fills the rest.
+
+    "Per field" is the whole contract, and a per-PAGE trigger is the bug it
+    replaces: a partial parse is the NORMAL case here — healthgrades template B
+    states a rating with no total, vitals keeps its count in a heading and its
+    rating in a link — so "the parser returned something, skip the model" would
+    have thrown away a whole rating pair on any page that yielded only tenure,
+    silently.
+
+    One exception, and it runs the other way: when the parser reads a page's
+    RATING or COUNT it owns BOTH for that page. Splicing a parsed rating onto a
+    model-read count manufactures a pair neither source stated, and on the two
+    shapes where the parser deliberately withholds a number — healthgrades
+    template B, whose count is genuinely absent from the payload, and a vitals
+    comparison table whose column failed its cross-check — letting the model
+    supply the missing half would undo the refusal that keeps a stranger's
+    stars off the card.
+
+    Tenure and address are taken only when the page's own H1 agrees with the
+    provider we asked about, at the same 0.5 threshold the observation identity
+    check uses. They are page-level facts with no `source_url` to be checked
+    downstream, so this is the only place that check can happen.
+    """
+    if not parsed:
+        return review_data
+
+    observations = [
+        o for o in (review_data.get("review_observations") or []) if isinstance(o, dict)
+    ]
+    by_url: Dict[str, Dict[str, Any]] = {}
+    for obs in observations:
+        key = canonical_profile_url(obs.get("source_url"))
+        if key:
+            by_url.setdefault(key, obs)
+
+    for url, facts in parsed.items():
+        # A page in a DIFFERENT STATE is a different doctor, whatever the name
+        # says. healthgrades holds a "Dr. Nicole Simpkins, MD" in San Antonio,
+        # TX — Clinical Neurophysiology, 5.0 over 12 reviews — and the provider
+        # on the card is Dr. Nicole Alyce Simpkins in Chandler, AZ. Every guard
+        # in place passes it: the names overlap, the slug agrees, and the
+        # enrichment query returns her because it searches the name. Nothing
+        # looked at where the page said she practises, so a stranger 870 miles
+        # away would have supplied a platform rating AND overwritten the
+        # address, which then re-scores the distance.
+        #
+        # State-level and only on positive disagreement — a doctor practising
+        # in two states is real, and a page that states no address must not be
+        # penalised for it. The failure modes are not symmetric: accepting puts
+        # someone else's stars on a card, rejecting costs one platform.
+        if _states_disagree(facts.get("location"), provider_location):
+            logger.info(
+                "Rejected profile page for %r: %s states an address in a "
+                "different state (%s vs %s)",
+                provider_name, url, facts.get("location"), provider_location,
+            )
+            continue
+
+        states_a_number = facts.get("rating") is not None or facts.get("review_count") is not None
+        if states_a_number:
+            obs = by_url.get(canonical_profile_url(url))
+            if obs is None:
+                obs = {"source_url": url}
+                observations.append(obs)
+                by_url[canonical_profile_url(url)] = obs
+            _merge_parser_numbers(obs, facts)
+            if facts.get("page_provider_name"):
+                obs["page_provider_name"] = facts["page_provider_name"]
+            obs["extraction_source"] = "profile_parser"
+
+        page_name = str(facts.get("page_provider_name") or "")
+        if page_name and overlap(page_name, provider_name) < 0.5:
+            continue
+        if facts.get("years_experience") is not None:
+            review_data["years_experience"] = facts["years_experience"]
+            # Every producer of a ranked number names itself — triage needs
+            # "where did 28 years come from" answerable per provider, the same
+            # question `location_source` answers for the address.
+            review_data["experience_source"] = f"profile_parser:{url}"
+        if facts.get("location"):
+            # EVERY gate-passing page's address, not last-wins: two platforms
+            # disagreeing about where a doctor practises (healthgrades: Sun
+            # City West · card: Mesa, ~40 mi apart, both AZ) is invisible to
+            # the state veto and undecidable in code — a satellite office and
+            # a stale profile look identical. The candidates feed a FLAG,
+            # never a rejection.
+            review_data.setdefault("address_candidates", []).append(
+                {"address": facts["location"], "source": f"profile_parser:{url}"}
+            )
+            review_data["address"] = facts["location"]
+            # Named so a wrong address is traceable to the page it came off.
+            # The model's address carries no URL at all, which is why the two
+            # are recorded differently rather than both as "enrichment".
+            review_data["address_source"] = f"profile_parser:{url}"
+            # ...and `address_source_url` is the field the BACKFILL GUARD reads.
+            # Both producers write `address` to one key, but only the model ever
+            # wrote the URL beside it, so the guard was checking a parser-read
+            # address against whichever page the MODEL had quoted — refusing a
+            # good address outright when the model supplied none, and validating
+            # it against an unrelated page when it did. Two providers came back
+            # sharing one street address and one distance.
+            #
+            # It also closes the hole above: the H1 check is skipped when a page
+            # states no H1 at all (`page_name` empty), and pointing the guard at
+            # this page makes the URL slug carry the identity test instead.
+            review_data["address_source_url"] = url
+
+        # The page's whole LOCATION SET, not just its first block. A group
+        # practice lists every office on each doctor's profile (the CORE
+        # Institute spans the Phoenix metro), so "the address" is a SET and
+        # forcing it into one field is what made a real office on a city
+        # listing look like a contradiction of the profile. Every member is a
+        # candidate under the SAME source URL — one page stays one vote in the
+        # conflict resolver; what the members add is REACH: an office near the
+        # listing's claim corroborates that AREA even when no two strings are
+        # equal. Phones ride with their own block, because Dr. Vandian's card
+        # showed the Gilbert address beside the Phoenix office's phone.
+        for member in facts.get("locations") or []:
+            member_address = str((member or {}).get("address") or "").strip()
+            if not member_address:
+                continue
+            entry = {"address": member_address, "source": f"profile_parser:{url}"}
+            if (member or {}).get("phone"):
+                entry["phone"] = str(member["phone"]).strip()
+            review_data.setdefault("address_candidates", []).append(entry)
+
+    review_data["review_observations"] = observations
+    return review_data
 
 
 def _blended_platform_rating(observations) -> Optional[Dict[str, Any]]:
@@ -583,21 +1262,51 @@ def _blended_platform_rating(observations) -> Optional[Dict[str, Any]]:
     clickable); the SCORE should hear every platform in proportion to its
     review mass — vitals 3.5 (16) alongside healthgrades 2.1 (13) is a
     ~2.9★ doctor, not a 3.5★ one. Honesty rules: platform pairs only (a
-    rating without a count has no weight), at least two pairs (one pair IS
-    the headline — nothing to blend), and a decline when the pair ratings
-    span more than _RATING_DISAGREEMENT_SPAN — averaging a 1.2 against a
-    5.0 would manufacture a middle number nobody reported, the same reason
-    the headline ladder declines.
+    rating without a count has no weight) and at least two pairs (one pair IS
+    the headline — nothing to blend).
+
+    It no longer declines when the pairs DISAGREE. That gate copied its
+    reasoning from the headline ladder — "averaging a 1.2 against a 5.0 would
+    manufacture a middle number nobody reported" — but the ladder declines on
+    RATING-ONLY observations, which carry no counts and therefore offer no
+    honest way to combine. Here every input has a count, and two things follow:
+
+      * the count weighting already resolves the case the gate feared.
+        1.2 (3 reviews) against 5.0 (200) blends to 4.94 — essentially the
+        high-volume platform, correctly, not a fabricated midpoint;
+      * when the gate DID fire, the fallback was worse than the blend. The
+        scorer drops to `provider["rating"]`, the single headline, which the
+        ladder picks as the largest-count pair — i.e. ONE of the disagreeing
+        sources, at full strength. Declining to average two sources because
+        they conflict, then adopting one of them, is not conservatism; it is
+        cherry-picking.
+
+    A third reason is structural: at three platforms with a two-pair minimum,
+    the gate fires MORE often as coverage improves, pushing a better-evidenced
+    provider back onto a single source.
+
+    The disagreement is not discarded — it is returned as `spread`, so the
+    caller can caveat a contested rating instead of hiding it. What is
+    deliberately NOT done is widening the Bayesian shrinkage when the spread is
+    large: that is the statistically right move and it needs a prior over
+    between-platform variance nobody here has measured.
     """
     pairs = _platform_rating_pairs(observations)
     if len(pairs) < 2:
         return None
     ratings = [o["rating"] for o in pairs]
-    if max(ratings) - min(ratings) > _RATING_DISAGREEMENT_SPAN:
-        return None
     total = sum(o["review_count"] for o in pairs)
     blended = sum(o["rating"] * o["review_count"] for o in pairs) / total
-    return {"rating": round(blended, 1), "review_count": total, "platforms": len(pairs)}
+    return {
+        "rating": round(blended, 1),
+        "review_count": total,
+        "platforms": len(pairs),
+        # How far apart the platforms actually were. The blend no longer
+        # declines on disagreement, so the disagreement has to travel WITH the
+        # number instead of suppressing it — the scorer records it, and a wide
+        # spread becomes a data caveat rather than a silent average.
+        "spread": round(max(ratings) - min(ratings), 1),
+    }
 
 # Filler words stripped when distilling the user's free-text requirements
 # into search keywords for the per-provider enrichment query
@@ -611,6 +1320,10 @@ class DataGathererAgent:
         self.anthropic_client = None
         self.fhir_client = None
         self._fhir_transformer = None
+        # Per-SEARCH, not per-agent: the orchestrator reuses one gatherer, so
+        # without the reset in `gather_providers` a contradiction from an
+        # earlier search would be reported against the current one.
+        self._identity_contradictions: List[Dict[str, Any]] = []
         self._initialize_clients()
 
     def _initialize_clients(self) -> None:
@@ -683,13 +1396,17 @@ class DataGathererAgent:
         extraction pool itself. Payer/ZIP deliberately absent.
         """
         return [
-            {"query": self._build_search_query(specialty, location)},         # professional/directory
-            {"query": f"best {specialty} specialists in {location}"},         # listicle / "top N"
-            {                                                                 # platform listing/profile pages
-                "query": f"best {specialty} near {location} patient reviews ratings",
-                "include_domains": list(_REVIEW_PLATFORM_DOMAINS),
-                "search_depth": "advanced",
-            },
+            {
+                "query": f"best {specialty} listing near {location} patient reviews ratings",
+                "include_domains": [domain],
+                # basic, not advanced: one domain per call holds at basic depth
+                # (measured — 5 results, 5 in-domain, on all three), and the
+                # pages that come back are directory listings whose entries the
+                # listing parsers read deterministically. Half the credits of the
+                # three advanced queries this replaces.
+                "search_depth": "basic",
+            }
+            for domain in _LISTING_DOMAINS
         ]
 
     def _discover_candidates(self, queries: List[Union[str, Dict[str, Any]]], max_results: int) -> List[Dict[str, Any]]:
@@ -801,6 +1518,22 @@ class DataGathererAgent:
         }
         if include_domains:
             search_kwargs["include_domains"] = list(include_domains)
+        # `content` is relevance-selected by Tavily and has always been part of
+        # both extraction prompts, so this knob steers what the extractor reads.
+        #
+        # Sent at BOTH depths. The parameter is widely documented as advanced-
+        # only, and this line was first written to withhold it on basic so the
+        # (since-removed) fast-demo toggle could not trip an API rejection.
+        # Measured instead of assumed, on one query over the review platforms:
+        #
+        #     basic     cps=1  4,724 chars  ->  cps=5  37,298 chars
+        #     advanced  cps=1  7,300 chars  ->  cps=5  37,298 chars
+        #
+        # Basic accepts it, honours it, and lands on the identical content
+        # payload. So the guard would have cost any basic-depth deployment an
+        # 8x richer extraction input to prevent a rejection that does not
+        # happen — still live via the TAVILY_SEARCH_DEPTH env knob.
+        search_kwargs["chunks_per_source"] = self.config.TAVILY_CHUNKS_PER_SOURCE
 
         # One retry on transient failures — a single network blip should not
         # become "Search failed" for the user (the whole workflow dies on []).
@@ -897,12 +1630,42 @@ class DataGathererAgent:
                 len(review_heavy), len(other_results), _DISCOVERY_EXCERPT_BUDGET,
             )
 
+            # PARSER FIRST. A directory page's entries are highly structured and
+            # repetitive, which is what a regex is for; reading them with an LLM
+            # over a 3,000-char anchored excerpt recovered a handful per page and
+            # a different handful on each run. On one live search 4 of 8 fetched
+            # pages yielded nothing and a provider was marked `no_profile_found`
+            # while 81,000 characters of her pages sat in memory.
+            #
+            # The LLM is the FALLBACK, not the replacement: `parse_listing`
+            # covers three platforms' current markup, and a site redesign must
+            # degrade to the previous behaviour rather than empty the pool. So a
+            # page the parser could not read still goes to a shard.
+            parsed: List[Dict[str, Any]] = []
+            unparsed: List[Dict[str, Any]] = []
+            for result in prioritized_results:
+                rows = parse_listing(result.get("url"), result.get("raw_content") or "")
+                rows = [r for r in rows if _specialty_is_compatible(r.get("specialty"), specialty)]
+                if rows:
+                    parsed.extend(_listing_row_to_provider(r, specialty) for r in rows)
+                else:
+                    unparsed.append(result)
+            if parsed:
+                logger.info(
+                    "Listing parsers read %d providers from %d of %d pages; "
+                    "%d page(s) fall back to extraction",
+                    len(parsed), len(prioritized_results) - len(unparsed),
+                    len(prioritized_results), len(unparsed),
+                )
+            if not unparsed:
+                return parsed
+
             shards = contiguous_shards(
-                prioritized_results,
-                _DISCOVERY_SHARDS if len(prioritized_results) >= _MIN_PAGES_TO_SHARD else 1,
+                unparsed,
+                _DISCOVERY_SHARDS if len(unparsed) >= _MIN_PAGES_TO_SHARD else 1,
             )
             if len(shards) <= 1:
-                return self._extract_page_shard(prioritized_results, specialty, location)
+                return parsed + (self._extract_page_shard(unparsed, specialty, location) or [])
 
             logger.info(
                 "Discovery extraction split across %d concurrent calls (%s pages each)",
@@ -913,13 +1676,13 @@ class DataGathererAgent:
                     executor.submit(self._extract_page_shard, shard, specialty, location)
                     for shard in shards
                 ]
-                merged: List[Dict[str, Any]] = []
+                merged: List[Dict[str, Any]] = list(parsed)
                 for future in futures:
                     merged.extend(future.result() or [])
             logger.info(
-                "Discovery extraction merged %d providers from %d shards "
-                "(duplicates across shards are resolved by _dedupe_providers)",
-                len(merged), len(shards),
+                "Discovery extraction merged %d providers (%d parsed, rest from "
+                "%d shards; duplicates are resolved by _dedupe_providers)",
+                len(merged), len(parsed), len(shards),
             )
             return merged
 
@@ -956,7 +1719,7 @@ class DataGathererAgent:
                 block = (
                     f"Title: {result.get('title', '')}\n"
                     f"URL: {result.get('url', '')}\n"
-                    f"Content: {result.get('content', '')}"
+                    f"Content: {clip_words(result.get('content', ''), _CONTENT_MAX_CHARS)}"
                 )
                 # Content-aware excerpt: boilerplate-stripped windows centered
                 # where the specialty/review vocabulary actually hits, instead
@@ -1049,13 +1812,18 @@ OPTIONAL FIELDS:
 Response (JSON array only):"""
 
             llm_started = time.perf_counter()
-            # 8000, not 4000: with page bodies in the prompt the model can
-            # legitimately extract 15+ providers with multi-sentence review
-            # summaries, and a truncated array has no closing "]" — the JSON
-            # repair below cannot recover it, so the whole extraction is lost.
+            # Scaled, floored at the old flat 8000 — see the constants'
+            # comment. The floor is load-bearing: round 12's ceiling raise
+            # existed because truncation is fatal here, and a formula that
+            # could dip below it would quietly reintroduce the exact
+            # failure at small block counts.
+            output_budget = max(8000, min(
+                _DISCOVERY_TOKENS_BASE + _DISCOVERY_TOKENS_PER_BLOCK * len(pages),
+                _DISCOVERY_TOKENS_MAX,
+            ))
             response = self.anthropic_client.messages.create(
                 model=self.config.GATHERER_MODEL,
-                max_tokens=8000,
+                max_tokens=output_budget,
                 messages=[{"role": "user", "content": prompt}]
             )
 
@@ -1067,9 +1835,9 @@ Response (JSON array only):"""
             # and the ring expands on a bug rather than on thin coverage.
             if getattr(response, "stop_reason", None) == "max_tokens":
                 logger.warning(
-                    "Discovery extraction hit max_tokens — the response is truncated "
-                    "and will likely fail to parse; providers named on these pages "
-                    "may be lost and the candidate pool will read as thin"
+                    "Discovery extraction hit max_tokens at %d — the response is "
+                    "truncated; complete entries will be salvaged and only the "
+                    "cut entry lost", output_budget
                 )
 
             in_tokens, out_tokens = safe_usage(response)
@@ -1110,12 +1878,35 @@ Response (JSON array only):"""
                         providers = json.loads(fixed_json)
                         logger.info("Successfully parsed after fixing JSON syntax")
                     except json.JSONDecodeError as second_error:
-                        # If still fails, log more details and return empty
-                        logger.error(f"Could not recover from JSON error after fixing: {second_error}")
-                        logger.debug(f"Original error: {parse_error}")
-                        logger.debug(f"Response preview: {response_text[:1000]}...")
-                        logger.debug(f"Fixed JSON preview: {fixed_json[:1000]}...")
-                        return []
+                        # LAST RESORT, deliberately after full parse and regex
+                        # repair: salvage keeps only complete objects, so it
+                        # loses the cut entry and must never outrank a
+                        # successful whole-array parse. Before this existed a
+                        # truncated response returned [] here, the home pool
+                        # read ZERO, and the ring rebuilt it from other
+                        # cities — total loss where tail loss was available.
+                        # Walking the raw text as the fallback matters: on
+                        # truncation _extract_json_from_response finds no
+                        # closing bracket and hands back the whole response,
+                        # but a fenced-and-truncated reply can differ, and
+                        # the walker is indifferent to surrounding prose.
+                        salvaged = (salvage_json_objects(json_str)
+                                    or salvage_json_objects(response_text))
+                        if salvaged:
+                            logger.warning(
+                                "Salvaged %d complete provider object(s) from an "
+                                "unparseable extraction response (stop_reason=%s); "
+                                "entries after the cut are lost",
+                                len(salvaged),
+                                getattr(response, "stop_reason", None),
+                            )
+                            providers = salvaged
+                        else:
+                            logger.error(f"Could not recover from JSON error after fixing: {second_error}")
+                            logger.debug(f"Original error: {parse_error}")
+                            logger.debug(f"Response preview: {response_text[:1000]}...")
+                            logger.debug(f"Fixed JSON preview: {fixed_json[:1000]}...")
+                            return []
 
                 # Validate that it's a list
                 if not isinstance(providers, list):
@@ -1237,6 +2028,58 @@ Response (JSON array only):"""
         empty = (None, "", [], 0, 0.0, "No reviews available", "unknown")
         return sum(1 for value in provider.values() if value not in empty)
 
+    def _record_identity_contradiction(
+        self, provider: Dict[str, Any], kept: Dict[str, Any], overlap: float
+    ) -> None:
+        """Two same-named records the profile URLs prove are different people.
+
+        This is the ONE rule in dedupe that can CREATE a duplicate rather than
+        remove one. If a platform ever publishes two URLs for a single doctor,
+        the veto splits that person in two and it surfaces as a mystery
+        duplicate on the results page with no visible cause. Nobody has checked
+        whether healthgrades does this, so the record is how it gets FOUND
+        rather than guessed at weeks later.
+
+        Recorded only when DECISIVE — the caller consults the veto after the
+        names already cleared the merge threshold, so every entry here is a
+        pair that name-matching alone would have merged. It used to record
+        every same-platform URL difference "so the ordinary case confirms the
+        rule is working": on a parsed-listing pool of ~100 candidates that was
+        3,363 pairs of obviously-different doctors, which buried the decisive
+        rows and put a 3,363-row JSON dump on the developer panel. The
+        `names_agreed` key stays (computed, not hardcoded) because three
+        surfaces filter on it and the audit log's schema should read the same
+        across the change.
+        """
+        entry = {
+            "name": provider.get("name", "Unknown"),
+            "other_name": kept.get("name", "Unknown"),
+            "url": provider.get("profile_url"),
+            "other_url": kept.get("profile_url"),
+            "domain": source_domain(provider.get("profile_url")),
+            "name_overlap": round(overlap, 2),
+            # The interesting half. Below the threshold this is just two
+            # different doctors on one platform; at or above it, the names
+            # agreed and only the URL kept them apart.
+            "names_agreed": overlap >= _DEDUP_NAME_THRESHOLD,
+        }
+        self._identity_contradictions.append(entry)
+        if entry["names_agreed"]:
+            logger.warning(
+                "Identity contradiction: %r and %r share a name (overlap %.2f) but hold "
+                "DIFFERENT %s profile URLs (%s vs %s) — kept as separate providers. If "
+                "this platform publishes two URLs for one doctor, this is where that "
+                "shows up as a duplicate.",
+                entry["name"], entry["other_name"], overlap, entry["domain"] or "platform",
+                entry["url"], entry["other_url"],
+            )
+        else:
+            logger.info(
+                "Identity contradiction: %r vs %r on %s — different profile URLs, "
+                "names also differ (overlap %.2f)",
+                entry["name"], entry["other_name"], entry["domain"] or "platform", overlap,
+            )
+
     def _dedupe_providers(self, providers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Merge same-person entries extracted from different pages.
 
@@ -1248,10 +2091,48 @@ Response (JSON array only):"""
         deduped: List[Dict[str, Any]] = []
 
         for provider in providers:
-            match_idx = None
-            for i, kept in enumerate(deduped):
-                overlap = self._name_token_overlap(provider.get("name", ""), kept.get("name", ""))
-                if overlap >= _DEDUP_NAME_THRESHOLD:
+            # PASS 1 — certainty. Two records sharing a platform's own profile
+            # link are the same person; names are not consulted at all.
+            #
+            # A separate pass, not a condition inside the loop below: the order
+            # entries were appended is arbitrary, so a single loop that breaks
+            # on the first hit lets a weak NAME match found early beat an exact
+            # URL match found later. Pass 1 must see the whole list first.
+            match_idx = next(
+                (
+                    i for i, kept in enumerate(deduped)
+                    if canonical_profile_url(provider.get("profile_url"))
+                    and canonical_profile_url(provider.get("profile_url"))
+                    == canonical_profile_url(kept.get("profile_url"))
+                ),
+                None,
+            )
+
+            # PASS 2 — inference, with a VETO. Same name threshold as before,
+            # but an entry whose URL CONTRADICTS this one must not merge even
+            # when the names agree: a different path on the same platform
+            # proves two different physician records, and no name similarity
+            # can outvote that. "Dr. J Kim" and "Dr. Jane Kim" overlap 1.0.
+            #
+            # The name is scored FIRST and the veto consulted only when it
+            # would merge. The veto used to run first and record every firing,
+            # which recorded the ORDINARY case at full fidelity: on a
+            # parsed-listing pool of ~100 candidates that was 3,363 pairs of
+            # obviously-different doctors ("Dr. Medaa" vs "Dr. Pillai",
+            # overlap 0) — pool-size arithmetic, not discovery — burying the
+            # 0-3 decisive rows the record exists to surface and rendering a
+            # 3,363-row JSON dump in the developer panel. The truth table is
+            # unchanged by the reorder: below the threshold neither order
+            # merges, above it the veto still blocks — so every recorded
+            # contradiction is now DECISIVE by construction.
+            if match_idx is None:
+                for i, kept in enumerate(deduped):
+                    overlap = self._name_token_overlap(provider.get("name", ""), kept.get("name", ""))
+                    if overlap < _DEDUP_NAME_THRESHOLD:
+                        continue
+                    if urls_contradict(provider.get("profile_url"), kept.get("profile_url")):
+                        self._record_identity_contradiction(provider, kept, overlap)
+                        continue
                     match_idx = i
                     break
 
@@ -1325,6 +2206,12 @@ Response (JSON array only):"""
         Returns:
             Dictionary with review_summary, review_sentiment, and review_count
         """
+        # Deterministic read of the profile pages, BEFORE the model runs and
+        # outside the try — so a failed or unparseable Anthropic response still
+        # returns whatever the parsers could establish. Previously an API error
+        # here cost the provider every number on every page that was fetched.
+        parsed_profiles = _parse_profile_pages(search_results)
+
         try:
             # Prepare content for Claude: the search snippet plus an excerpt
             # of the actual page text when available — snippets alone are one
@@ -1402,10 +2289,17 @@ Response (JSON array only):"""
                 block = (
                     f"Title: {result.get('title', '')}\n"
                     f"URL: {result.get('url', '')}\n"
-                    f"Content: {result.get('content', '')}"
+                    f"Content: {clip_words(result.get('content', ''), _CONTENT_MAX_CHARS)}"
                 )
                 raw_content = build_excerpt(
-                    str(result.get("raw_content") or ""),
+                    # Inlined image payloads first: one percent-encoded SVG (a
+                    # Zocdoc logo) was 8,345 of a healthgrades profile's 15,750
+                    # characters, and it starts at character 651 — so 46% of the
+                    # 1,200-char head reservation meant to capture the rating
+                    # header was spent on a logo. `strip_boilerplate` inside
+                    # build_excerpt cannot catch it: its nav filters only apply
+                    # to lines under 80 chars and this is one line of 8,345.
+                    strip_data_uris(result.get("raw_content")),
                     anchors=_anchors_for(result.get("url"), vocab_anchors),
                     budget=_ENRICHMENT_EXCERPT_BUDGET,
                     max_windows=_ENRICHMENT_EXCERPT_WINDOWS,
@@ -1472,11 +2366,12 @@ Return a JSON object with these fields ONLY:
 - review_count: Your best single candidate from review_observations (the code makes the final pick). null if no platform states a total. NEVER the number of review snippets you happened to read
 - rating: Your best single candidate rating as a bare JSON number (e.g. 4.7, not "4.7/5"); null if none stated — never estimate one
 - review_source_url: The URL of the result block the rating/count came from (or, if none, the block the summary came from) — copy it exactly from that block's URL line (null if no review data)
-- insurance_accepted: List of insurance plans/payers the pages explicitly state this provider accepts — directory profiles (Healthgrades, Vitals, WebMD) often have an "insurance accepted" section; empty array [] if none stated. If sources conflict, prefer zocdoc.com (patients book through it, so its list is verified), then healthgrades profiles
+- insurance_accepted: List of insurance plans/payers the pages explicitly state this provider accepts — directory profiles (Healthgrades, Vitals, WebMD) often have an "insurance accepted" section; empty array [] if none stated. If sources conflict, prefer the doctor's own profile page over a directory index
 - insurance_source_url: The URL of the result block the insurance list came from (null if none)
 - years_experience: Years in practice as a bare JSON number, ONLY if a page explicitly states it (e.g. "26 years of experience"); null otherwise — never estimate from graduation dates
 - phone: The provider's office phone number if a profile page states one, formatted XXX-XXX-XXXX; null otherwise
-- address: The provider's practice street address if a profile page states one, including city, state, and ZIP when shown (e.g. "1234 W Frye Rd, Chandler, AZ 85224"); null otherwise. A full address with ZIP sharpens distance ranking
+- address: The provider's practice street address, taken ONLY from a page that is about THIS PROVIDER — their own profile on a review platform, or a practice page whose URL names them. NEVER from a group or clinic page that lists several doctors: those state one address for all of them, and it is not evidence about this one. Include city, state and ZIP when shown (e.g. "1234 W Frye Rd, Chandler, AZ 85224"); null otherwise. A full address with ZIP sharpens distance ranking
+- address_source_url: The URL of the result block the address came from — copy it exactly from that block's URL line (null if no address). Required whenever address is non-null: an address that cannot be traced to a page is discarded
 
 IMPORTANT REVIEW EXTRACTION RULES:
 1. ONLY extract if you find ACTUAL PATIENT FEEDBACK (quotes, comments, testimonials) or a platform-stated rating/count
@@ -1539,7 +2434,7 @@ Response (JSON object only):"""
             if isinstance(review_data, dict):
                 insurance_accepted = review_data.get("insurance_accepted")
                 observations = review_data.get("review_observations")
-                return {
+                return _apply_parsed_profiles({
                     "review_summary": str(review_data.get("review_summary", "No reviews available")),
                     "review_sentiment": str(review_data.get("review_sentiment", "unknown")),
                     "review_count": review_data.get("review_count"),
@@ -1551,12 +2446,13 @@ Response (JSON object only):"""
                     "years_experience": review_data.get("years_experience"),
                     "phone": review_data.get("phone"),
                     "address": review_data.get("address"),
-                }
+                    "address_source_url": review_data.get("address_source_url"),
+                }, parsed_profiles, provider_name, self._name_token_overlap, provider_location)
 
         except Exception as e:
             logger.warning(f"Failed to extract review data for {provider_name}: {e}")
 
-        return {
+        return _apply_parsed_profiles({
             "review_summary": "No reviews available",
             "review_sentiment": "unknown",
             "review_count": None,
@@ -1568,9 +2464,48 @@ Response (JSON object only):"""
             "years_experience": None,
             "phone": None,
             "address": None,
-        }
+            "address_source_url": None,
+        }, parsed_profiles, provider_name, self._name_token_overlap, provider_location)
 
-    def _observation_is_same_person(self, obs: Dict[str, Any], provider_name: str) -> bool:
+    def _harvest_profile_urls(
+        self, provider: Dict[str, Any], results: List[Dict[str, Any]]
+    ) -> None:
+        """Record this provider's profile URL on each platform the search reached.
+
+        Every candidate is checked with `slug_agrees_with_name` before it is
+        stored. The search is name + city and platform-restricted, so it returns
+        OTHER doctors' profiles too — a page coming back for a query is not
+        evidence that it is about the person queried, which is the same reason
+        `_observation_is_same_person` exists.
+
+        Never overwrites a URL discovery already established: that one came off
+        a listing entry whose heading carried the name, which is stronger
+        evidence than "this ranked for the query".
+        """
+        known = dict(provider.get("platform_profile_urls") or {})
+        seeded = provider.get("profile_url")
+        if seeded and source_domain(seeded) and source_domain(seeded) not in known:
+            known[source_domain(seeded)] = seeded
+
+        name = provider.get("name", "")
+        for result in results or []:
+            url = result.get("url")
+            domain = source_domain(url)
+            if not domain or domain in known:
+                continue
+            if not any(d in domain for d in _REVIEW_PLATFORM_DOMAINS):
+                continue
+            if url_page_kind(url) != "profile" or not slug_agrees_with_name(url, name):
+                continue
+            known[domain] = url
+            logger.info("Harvested %s profile URL for %r: %s", domain, name, url)
+
+        if known:
+            provider["platform_profile_urls"] = known
+            provider.setdefault("profile_url", next(iter(known.values())))
+
+    def _observation_is_same_person(self, obs: Dict[str, Any], provider_name: str,
+                                    provider: Optional[Dict[str, Any]] = None) -> bool:
         """Does this observation's page actually name our provider?
 
         The enrichment query is name + city with no specialty term, so the
@@ -1582,7 +2517,52 @@ Response (JSON object only):"""
         Silent when the model omits page_provider_name: a response that does
         not transcribe it degrades to the previous behavior rather than
         discarding every observation it found.
+
+        STEP 4 of URL-primary identity runs FIRST, when it can. An enrichment
+        observation's `source_url` IS a profile page, so where we already know
+        this provider's URL on that platform the two must be equal — a
+        different path on the same platform is a different physician record.
+        No new field is needed and, unlike the name check below, it does not
+        depend on the cheapest model transcribing anything: the URL is the
+        vendor's, not the extractor's. The name check remains for observations
+        whose platform URL we do not know, which is most of them until
+        enrichment has run.
         """
+        known = (provider or {}).get("platform_profile_urls") or {}
+        source_url = obs.get("source_url")
+        expected = known.get(source_domain(source_url))
+        if expected and url_page_kind(source_url) == "profile" and urls_contradict(
+            source_url, expected
+        ):
+            logger.info(
+                "Rejected review observation for %r: %s is a different %s profile "
+                "than the one we hold (%s)",
+                provider_name, source_url, source_domain(source_url) or "platform", expected,
+            )
+            return False
+
+        # The URL's own SLUG, checked before the name — because the slug is the
+        # vendor's and the page name is whatever a model transcribed, and the
+        # name check below degrades to ACCEPT when nothing was transcribed.
+        #
+        # That degrade is what let two neurosurgeons at neighbouring addresses
+        # on the same street share numbers on a 2026-07-31 run: both cards read
+        # "doctor.webmd.com 5.0/5 (45 reviews)" and "vitals.com (46 reviews)".
+        # The enrichment query is name + city, so a colleague at the same
+        # practice ranks for it, and one profile's figures were attached to the
+        # other. `slug_agrees_with_name` settles it with no model in the loop —
+        # every platform writes the name into the profile slug.
+        #
+        # PROFILE URLs only. A directory index names forty doctors and its slug
+        # is a city, so it agrees with nobody and would be rejected wholesale.
+        if (url_page_kind(source_url) == "profile"
+                and slug_contradicts_name(source_url, provider_name)):
+            logger.info(
+                "Rejected review observation for %r: the profile slug in %s names "
+                "someone else", provider_name, source_url,
+            )
+            return False
+
         page_name = str(obs.get("page_provider_name") or "").strip()
         if not page_name or not provider_name:
             return True
@@ -1621,15 +2601,21 @@ Response (JSON object only):"""
             provider["blended_rating"] = blend["rating"]
             provider["blended_review_count"] = blend["review_count"]
             provider["blended_platform_count"] = blend["platforms"]
+            # Travels with the number so a contested rating can be CAVEATED
+            # rather than suppressed — see `_blended_platform_rating` for why
+            # the old disagreement gate was worse than blending.
+            provider["blended_rating_spread"] = blend["spread"]
             logger.info(
                 f"Blend {blend['rating']}/5 over {blend['review_count']} reviews "
-                f"({blend['platforms']} platforms) for {provider.get('name')}"
+                f"({blend['platforms']} platforms, spread {blend['spread']}) "
+                f"for {provider.get('name')}"
             )
         else:
-            # A newly-added pair can push the set past the disagreement
-            # span — a blend computed before that pair arrived is stale
+            # Fewer than two platform pairs — a blend computed when the set was
+            # larger is stale. This used to fire on DISAGREEMENT too; it no
+            # longer does, so reaching here means the pair count genuinely fell.
             for key in ("blended_rating", "blended_review_count",
-                        "blended_platform_count"):
+                        "blended_platform_count", "blended_rating_spread"):
                 provider.pop(key, None)
 
     def _apply_source_quality(
@@ -1712,12 +2698,18 @@ Response (JSON object only):"""
         if headline:
             self._apply_headline(provider, headline)
 
-    def _merge_review_data(self, provider: Dict[str, Any], review_data: Dict[str, Any]) -> None:
+    def _merge_review_data(
+        self, provider: Dict[str, Any], review_data: Dict[str, Any],
+        user_location: str = "",
+    ) -> None:
         """Merge secondary review data into provider object only if actual reviews found.
 
         Args:
             provider: Provider dictionary to update (modified in place)
             review_data: Review data extracted from secondary search
+            user_location: The searching member's location — the practice-
+                location selection is member-relative (nearest trusted
+                office), so it needs who is asking, not just what was found
         """
         # Only merge if we found actual review content
         if review_data.get("review_summary") and review_data["review_summary"] != "No reviews available":
@@ -1738,9 +2730,15 @@ Response (JSON object only):"""
         # candidate pass found — a name-query result set that happens not to
         # re-include the original page must not erase its numbers.
         merged_obs = list(provider.get("review_observations") or [])
-        seen_urls = {
-            u for u in (
-                str(o.get("source_url") or "").strip().lower()
+        # A dict, not a set: on a collision the KEPT observation has to be
+        # reachable, because "first URL wins" decides which ENTRY survives and
+        # must not also decide which READ does — a parsed listing row and the
+        # enrichment pass now collide on the doctor's own profile url by
+        # construction, and skipping the newcomer outright kept `4.8/None`
+        # over a recovered `4.8/260`.
+        kept_by_url = {
+            u: o for u, o in (
+                (str(o.get("source_url") or "").strip().lower(), o)
                 for o in merged_obs if isinstance(o, dict)
             ) if u
         }
@@ -1748,14 +2746,15 @@ Response (JSON object only):"""
         for obs in review_data.get("review_observations") or []:
             if not isinstance(obs, dict):
                 continue
-            if not self._observation_is_same_person(obs, provider.get("name", "")):
+            if not self._observation_is_same_person(obs, provider.get("name", ""), provider):
                 identity_rejected = True
                 continue
             url = str(obs.get("source_url") or "").strip().lower()
-            if url and url in seen_urls:
+            if url and url in kept_by_url:
+                _fill_corroborated_gaps(kept_by_url[url], obs)
                 continue
             if url:
-                seen_urls.add(url)
+                kept_by_url[url] = obs
             merged_obs.append(obs)
         headline, observations = _select_review_observation(merged_obs)
         if observations:
@@ -1826,6 +2825,12 @@ Response (JSON object only):"""
             years = _first_int(enriched_years)
             if years is not None and 0 <= years <= 80:
                 provider["years_experience"] = years
+                # The parser labelled its own write; a surviving unlabelled
+                # value is the model's, which reads tenure off any of six
+                # blocks and carries no URL — precisely why the label matters.
+                provider["experience_source"] = (
+                    review_data.get("experience_source") or "enrichment_model"
+                )
                 logger.info(f"Backfilled {years} years experience for {provider.get('name')}")
 
         # Platform profiles show the office phone prominently, but most
@@ -1844,12 +2849,275 @@ Response (JSON object only):"""
         # nothing — a ZIP-resolvable address upgrades the provider to real
         # distance scoring. Never clobber a location we can already place to
         # a ZIP. The caller recomputes distance/tier after this returns.
+        #
+        # The state check that guards the PARSER's address applies here too,
+        # and the asymmetry it closes was the bug: `_apply_parsed_profiles`
+        # rejects a page in the wrong state, while this path — the one the
+        # MODEL feeds — accepted whatever it read off any of six blocks with no
+        # identity check at all. Those blocks include practice and group pages
+        # that name several doctors, so one address could land on all of them.
+        # Two providers on the 2026-08-01 run carried an identical street
+        # address AND an identical distance.
+        #
+        # State-level, positive disagreement only, for the reasons at
+        # `_states_disagree`. It cannot separate two cities in one metro, which
+        # is exactly the case that prompted it — so `location_source` records
+        # where the address came from, because the question "where did this
+        # address come from" had no answer on any surface.
         enriched_address = str(review_data.get("address") or "").strip()
+        address_url = review_data.get("address_source_url")
         if (enriched_address
                 and resolution_level(enriched_address) == "zip"
                 and resolution_level(provider.get("location")) != "zip"):
-            provider["location"] = enriched_address
-            logger.info(f"Backfilled address for {provider.get('name')}")
+            # An address the model cannot attribute to a page ABOUT this doctor
+            # is discarded. The prompt asks it to read only such pages, but the
+            # prompt is not the guard — a code predicate is (the same reasoning
+            # that put `_observation_is_same_person` behind the extractor's own
+            # identity check). Without this, six blocks are in scope including
+            # group practice pages that state one address for several doctors,
+            # and two providers came back carrying the same street and the same
+            # distance.
+            if not _url_identifies_provider(address_url, provider.get("name", "")):
+                logger.info(
+                    "Refused address backfill for %r: %r is not traceable to a "
+                    "page about them (source %r)",
+                    provider.get("name"), enriched_address, address_url,
+                )
+            elif _states_disagree(enriched_address, provider.get("location")):
+                logger.info(
+                    "Refused address backfill for %r: %r is in a different state "
+                    "than %r", provider.get("name"), enriched_address,
+                    provider.get("location"),
+                )
+            else:
+                previous = provider.get("location")
+                provider["location"] = enriched_address
+                provider["location_source"] = (
+                    review_data.get("address_source")
+                    or f"enrichment_model:{address_url}"
+                )
+                logger.info(
+                    "Backfilled address for %s: %r -> %r (via %s)",
+                    provider.get("name"), previous, enriched_address,
+                    provider["location_source"],
+                )
+
+        self._record_practice_locations(provider, review_data)
+        # Selection AFTER the record: the record is the complete inventory of
+        # believable addresses, and the caller re-runs
+        # `_attach_location_evidence` right after this merge returns, so a
+        # relocation here re-scores distance with no extra wiring.
+        self._select_nearest_trusted_location(provider, user_location)
+
+    def _record_practice_locations(
+        self, provider: Dict[str, Any], review_data: Dict[str, Any]
+    ) -> None:
+        """Record every believable address as the provider's LOCATION SET.
+
+        The predecessor of this method FLAGGED addresses more than 20 miles
+        apart as a "conflict" to adjudicate. Field evidence retired that
+        framing: the doctors who trip it are multi-office group specialists
+        (the CORE Institute lists offices across the metro on every doctor's
+        own profile), so several far-apart addresses are the NORMAL state of
+        a confirmed practice, not a dispute. The record is now unconditional
+        on distance — every distinct believable address, with its source —
+        and `_select_nearest_trusted_location` chooses which one this member
+        sees. The distance threshold went with the framing: a member deserves
+        the "closest of N locations" note whether the offices are 3 miles
+        apart or 30, and a gate at 20 made a doctor with offices 19 miles
+        apart the indefensible edge case.
+
+        Candidates are the addresses we would actually believe: the provider's
+        current location (whatever producer wrote it) plus every parsed-profile
+        address that survived the state and H1 gates. The record keeps the key
+        `address_conflict` for cache-schema and panel stability — renaming a
+        CACHEABLE_FIELDS entry would orphan every stored row for the TTL.
+        """
+        candidates: List[Dict[str, str]] = []
+        current = str(provider.get("location") or "").strip()
+        if current:
+            candidates.append({
+                "address": current,
+                "source": str(provider.get("location_source") or "discovery"),
+            })
+        for cand in review_data.get("address_candidates") or []:
+            if isinstance(cand, dict) and str(cand.get("address") or "").strip():
+                entry = {"address": str(cand["address"]).strip(),
+                         "source": str(cand.get("source") or "profile_parser")}
+                if cand.get("phone"):
+                    entry["phone"] = str(cand["phone"]).strip()
+                candidates.append(entry)
+
+        # Dedupe by (address, SOURCE) — not by address alone. The same address
+        # claimed by two distinct sources is CORROBORATION — it is exactly
+        # what the trust check's exact-twin rule counts — and collapsing to
+        # the first source would silently discard the second claimant.
+        # Identical (address, source) pairs still collapse: one page restating
+        # one office is one voice.
+        unique: Dict[Tuple[str, str], Dict[str, str]] = {}
+        for cand in candidates:
+            unique.setdefault(
+                (" ".join(cand["address"].split()).lower(), cand["source"]), cand
+            )
+        distinct = list(unique.values())
+        addresses = {" ".join(c["address"].split()).lower() for c in distinct}
+        if len(addresses) < 2:
+            # One address (however many sources confirm it) is not a location
+            # SET — nothing to select, nothing to tell the member.
+            provider.pop("address_conflict", None)
+            return
+
+        provider["address_conflict"] = {
+            "addresses": distinct,
+            "distinct_count": len(addresses),
+        }
+        logger.info(
+            "Practice locations for %s: %d distinct addresses from %d claims",
+            provider.get("name"), len(addresses), len(distinct),
+        )
+
+    @staticmethod
+    def _address_source_class(source: str) -> int:
+        """Rank an address source's class for the WITHIN-cluster pick only.
+
+        profile_parser (the doctor's own gate-checked page) beats
+        listing_parser (one row on a many-doctor page — the class that gave
+        two doctors one Mesa suite) beats everything else (the model's
+        address carries no URL; "discovery" carries no page at all).
+        """
+        prefix = str(source or "").split(":", 1)[0]
+        return {"profile_parser": 0, "listing_parser": 1}.get(prefix, 2)
+
+    def _select_nearest_trusted_location(
+        self, provider: Dict[str, Any], user_location: str
+    ) -> None:
+        """Show this member the nearest office we can TRUST the doctor is at.
+
+        Supersedes the cluster-corroboration vote (and its banned
+        nearest-to-searcher tie-break). The vote answered "which single
+        address is true?", but the doctors who trip this are confirmed
+        multi-office specialists — SEVERAL addresses are true — and picking
+        any fixed one made the answer depend on which pages that run's fetch
+        happened to foreground: Dr. Vandian carried the pool's strongest
+        review record and oscillated between rank 5 at his 6.4-mile Gilbert
+        office and rank 7 at a 40-mile office across two same-criteria runs.
+        Finding a good specialist is hard; losing one to our own address
+        pick — or to the radius bound acting on a far office — is the worse
+        failure by every measure. Worst case under THIS rule is one phone
+        call the card already tells the member to make.
+
+        TRUST, then MIN — the order is load-bearing. A bare min over every
+        candidate would hand the card to the single worst datapoint whenever
+        it happens to be near the member (a same-named doctor's office that
+        slipped the gates, a listing row's group office he never sits at),
+        and gathering MORE pages would make results WORSE — each new page
+        another lottery ticket for a bogus-but-near address. An address is
+        trusted when the doctor's OWN profile page lists it, or when two
+        distinct sources state exactly the same address. Exact, not
+        same-area: the retired 20-mile "area corroboration" let two
+        independently wrong addresses in one metro vouch for each other,
+        and profile-listed addresses never needed a twin. The known trade —
+        formatting variants ("Ste"/"Suite") fail the exact match — errs
+        toward the fallback, which keeps the address we already have.
+
+        Member-relative by design (the retired ban's reason to exist — "a
+        fact about the doctor depends on who is asking" — is the point: the
+        nearest of his REAL offices is precisely the member-relevant fact),
+        so this runs on the warm path too and is never baked into a cached
+        row. Nothing here deletes an address: the full set stays in the
+        record, and the card's closest-of-N note survives selection because
+        a selection is not a certification.
+        """
+        conflict = provider.get("address_conflict")
+        if not conflict or not user_location:
+            return
+        entries = [
+            e for e in conflict.get("addresses") or []
+            if isinstance(e, dict) and str(e.get("address") or "").strip()
+        ]
+        if len(entries) < 2:
+            return
+
+        def norm(addr: str) -> str:
+            return " ".join(str(addr).split()).lower()
+
+        # Group claims per distinct address; the representative claim (for
+        # location_source and the phone that travels with its office) is the
+        # best source class, then first-seen.
+        by_address: Dict[str, List[Dict[str, str]]] = {}
+        order: List[str] = []
+        for entry in entries:
+            key = norm(entry["address"])
+            if key not in by_address:
+                order.append(key)
+            by_address.setdefault(key, []).append(entry)
+
+        def is_trusted(claims: List[Dict[str, str]]) -> bool:
+            if any(
+                self._address_source_class(c.get("source", "")) == 0
+                for c in claims
+            ):
+                return True  # the doctor's own profile lists this office
+            return len({str(c.get("source") or "") for c in claims}) >= 2
+
+        selection: Dict[str, Any] = {"method": "nearest_trusted"}
+        trusted_keys = [k for k in order if is_trusted(by_address[k])]
+        selection["trusted_addresses"] = len(trusted_keys)
+        if not trusted_keys:
+            # Only uncorroborated singletons — the old satellite-vs-stale
+            # dead end. Keep the address we already have; the closest-of-N
+            # note still reaches the member because the record stands.
+            selection.update({"resolved": False, "reason": "no_trusted_address"})
+            conflict["selection"] = selection
+            return
+
+        scored: List[Tuple[float, int, int, str]] = []
+        for index, key in enumerate(trusted_keys):
+            claims = by_address[key]
+            representative = min(
+                range(len(claims)),
+                key=lambda i: (
+                    self._address_source_class(claims[i].get("source", "")), i
+                ),
+            )
+            distance = distance_miles(
+                user_location, claims[representative]["address"]
+            )
+            if isinstance(distance, (int, float)):
+                scored.append((float(distance), index, representative, key))
+        if not scored:
+            # Trusted offices exist but none geocodes against the member —
+            # our coverage, not their locations. Keep what we have.
+            selection.update({"resolved": False, "reason": "no_resolvable_distance"})
+            conflict["selection"] = selection
+            return
+
+        distance, _, representative, key = min(scored)
+        chosen_entry = by_address[key][representative]
+        selection.update({
+            "resolved": True,
+            "chosen": chosen_entry["address"],
+            "chosen_source": chosen_entry.get("source"),
+            "distance_miles": round(distance, 1),
+        })
+        conflict["selection"] = selection
+
+        if key == norm(str(provider.get("location") or "")):
+            return  # already showing the nearest trusted office
+
+        previous = provider.get("location")
+        provider["location"] = chosen_entry["address"]
+        provider["location_source"] = chosen_entry.get("source") or "profile_parser"
+        # The phone travels with its own office block or not at all — never
+        # leave the OLD address's number beside the new address.
+        if chosen_entry.get("phone"):
+            provider["phone"] = chosen_entry["phone"]
+        logger.info(
+            "Nearest trusted office for %s: %r (%s, %.1f mi) replaces %r — "
+            "distance will be recomputed",
+            provider.get("name"), chosen_entry["address"],
+            chosen_entry.get("source"), distance, previous,
+        )
 
     def _attach_location_evidence(self, provider: Dict[str, Any], user_location: str) -> None:
         """Compute a provider's distance + tier from the user's location, in
@@ -1911,8 +3179,21 @@ Response (JSON object only):"""
             # (a profile's street address gaining ZIP precision) and would
             # otherwise store the row under a key the next read never asks
             # for. See `utils.provider_key.resolve_cache_key`.
+            #
+            # `cache_basis` is the key's two inputs, human-readable, rendered
+            # per provider in the coverage panel. A same-criteria repeat
+            # search missed 7 of 8 and nothing recorded WHICH half moved
+            # between the runs — the surviving name variant (middle initials
+            # are kept by design, and the dedupe survivor is picked by field
+            # richness) or the discovery city (a multi-site group's listing
+            # shows a different office per city page). Diffing two runs'
+            # bases names the moving component per provider.
             for provider in providers:
                 pin_cache_key(provider)
+                provider["cache_basis"] = "{}|{}".format(
+                    normalized_name(provider.get("name")),
+                    normalized_place(provider.get("location")),
+                )
 
             self._apply_cached_enrichment(providers, user_location=location or "")
 
@@ -1965,18 +3246,45 @@ Response (JSON object only):"""
                 live_observations = list(provider.get("review_observations") or [])
                 provider.update(payload)
                 if live_observations:
-                    seen = {
-                        str(o.get("source_url") or "").strip().lower()
-                        for o in provider.get("review_observations") or []
-                        if isinstance(o, dict)
-                    }
-                    provider["review_observations"] = (
-                        list(provider.get("review_observations") or [])
-                        + [
-                            o for o in live_observations
+                    # Same union, same rule as `_merge_review_data`: the stored
+                    # entry survives a collision, but a fresher discovery read
+                    # of the SAME url may complete it when they agree. A stored
+                    # rating-only row otherwise suppresses a listing pair for
+                    # the whole TTL — the cache freezing exactly the gap the
+                    # live pass just closed.
+                    kept_by_url = {
+                        u: o for u, o in (
+                            (str(o.get("source_url") or "").strip().lower(), o)
+                            for o in provider.get("review_observations") or []
                             if isinstance(o, dict)
-                            and str(o.get("source_url") or "").strip().lower() not in seen
-                        ]
+                        ) if u
+                    }
+                    # `new_observations`, NEVER `fresh`: this scratch list was
+                    # first named `fresh`, shadowing the HITS DICT the loop is
+                    # iterating against. The first cache hit that carried live
+                    # discovery observations rebound the name, the next
+                    # iteration's `fresh.get(key)` raised AttributeError on a
+                    # list, and the outer except — built for store outages —
+                    # reported "Cache read failed, continuing cold". Every
+                    # provider after that point was silently re-enriched and
+                    # re-billed on every search for three days, at most ONE
+                    # union-branch hit ever surviving per run, while the store
+                    # underneath passed every durability test. The disguise
+                    # was total: the crash wore the outage message, and the
+                    # rewritten rows made the store look like it was losing
+                    # data. A safety net that catches a code bug converts it
+                    # into weather.
+                    new_observations = []
+                    for o in live_observations:
+                        if not isinstance(o, dict):
+                            continue
+                        url = str(o.get("source_url") or "").strip().lower()
+                        if url and url in kept_by_url:
+                            _fill_corroborated_gaps(kept_by_url[url], o)
+                            continue
+                        new_observations.append(o)
+                    provider["review_observations"] = (
+                        list(provider.get("review_observations") or []) + new_observations
                     )
                 provider["enrichment_outcome"] = "cached"
                 hits += 1
@@ -1991,8 +3299,14 @@ Response (JSON object only):"""
                 # CURRENT user's location. A stored Chandler distance restored
                 # into a Phoenix search would be wrong and would read as
                 # measured. The cached `location` may be a sharper address than
-                # discovery found, so recompute from it every time.
+                # discovery found, so recompute from it every time. The
+                # nearest-trusted-office selection re-runs first for the same
+                # reason: it is member-relative (a Glendale searcher and a
+                # Chandler searcher get different offices of the same group
+                # doctor), so the stored row carries the location SET and the
+                # choice is made fresh per search, never served from storage.
                 if user_location:
+                    self._select_nearest_trusted_location(provider, user_location)
                     self._attach_location_evidence(provider, user_location)
 
             logger.info(f"Cache: {hits} hit(s), {len(providers) - hits} miss(es)")
@@ -2008,9 +3322,23 @@ Response (JSON object only):"""
         try:
             from utils.vector_store import get_vector_store
 
-            # Re-storing a cache hit unchanged would refresh its timestamp and
-            # let one entry live forever without ever being re-verified.
-            newly = [p for p in providers if p.get("enrichment_outcome") != "cached"]
+            # ONLY `enriched` is written. The filter used to be `!= "cached"`
+            # (re-storing a hit unchanged would refresh its timestamp and let
+            # one entry live forever unverified — still true, still excluded),
+            # which let every FAILURE outcome through: the store's
+            # substantive-payload guard was designed for the era when a failed
+            # enrichment produced an empty payload, but discovery now supplies
+            # listing-parsed observations, so a `no_profile_found` provider
+            # carries "substance" and was cached anyway. On the next run the
+            # hit relabelled him `cached`, which passes the recommendation
+            # gate his failure had correctly failed — a withheld provider
+            # laundered into recommendable on identical evidence — and his
+            # profile search was never retried for the whole TTL. Failures
+            # now stay uncached, so every run retries them until one
+            # succeeds; `over_budget` is excluded with them (nothing was
+            # learned beyond discovery, and caching discovery-grade rows
+            # under enrichment pretenses is the same defect at pool scale).
+            newly = [p for p in providers if p.get("enrichment_outcome") == "enriched"]
             return get_vector_store().upsert_enriched_providers(newly)
         except Exception as e:
             logger.warning(f"Cache write failed: {e}")
@@ -2021,8 +3349,8 @@ Response (JSON object only):"""
 
         No tiering. The previous version rationed the budget across a "second
         opinion" tier and a "misranked gem" tier, but at the observed pool size
-        it never actually rationed anything: MAX_PROVIDERS_TO_ENRICH is 10 and
-        the 2026-07-25 field run produced a pool of exactly 10, so every
+        it never actually rationed anything: MAX_PROVIDERS_TO_ENRICH was 10 at
+        the time and the 2026-07-25 field run produced a pool of exactly 10, so every
         provider was already being enriched. Rank 6 arrived with no blended
         rating not because he was skipped but because his search found nothing
         usable — selection was never the problem, SUCCESS was. The tiers cost
@@ -2146,6 +3474,19 @@ Response (JSON object only):"""
                 search_depth="advanced",
             )
 
+            # STEP 3 of URL-primary identity: the profile URLs this provider
+            # has on every platform, taken from the search we ALREADY ran.
+            #
+            # Discovery only learns the URL of whichever platform's listing
+            # surfaced the provider — often one, and on vitals often none at
+            # all. The obvious fix is a per-domain search per provider; it
+            # would buy URLs already paid for. This search is platform-
+            # restricted and returns the profiles: a real run for one provider
+            # came back with the webmd, vitals AND healthgrades profile links
+            # alongside the directory pages. Harvesting is 0 credits where
+            # searching is ~10-36c a run.
+            self._harvest_profile_urls(provider, results)
+
             # What this search actually reached, before extraction gets a say.
             # Three failures are indistinguishable on a finished card — the
             # platform's profile was never returned; it was returned but no
@@ -2197,7 +3538,9 @@ Response (JSON object only):"""
                 review_data.get("review_observations"),
             )
             location_before = provider.get("location")
-            self._merge_review_data(provider, review_data)
+            self._merge_review_data(
+                provider, review_data, user_location=user_location or location
+            )
             # An address backfill can sharpen where the provider is —
             # recompute distance/tier from the original user location so
             # the re-score (score_providers) sees the improved evidence.
@@ -2205,7 +3548,7 @@ Response (JSON object only):"""
                 self._attach_location_evidence(provider, user_location or location)
 
             provider["enrichment_outcome"] = self._classify_enrichment(
-                provider_name, review_data
+                provider_name, review_data, provider
             )
 
         except Exception as e:
@@ -2213,7 +3556,8 @@ Response (JSON object only):"""
             logger.warning(f"Could not enrich reviews for {provider.get('name')}: {e}")
 
     def _classify_enrichment(
-        self, provider_name: str, review_data: Dict[str, Any]
+        self, provider_name: str, review_data: Dict[str, Any],
+        provider: Optional[Dict[str, Any]] = None
     ) -> str:
         """What this provider's enrichment pass actually achieved.
 
@@ -2233,7 +3577,7 @@ Response (JSON object only):"""
         ]
         accepted = [
             o for o in extracted
-            if self._observation_is_same_person(o, provider_name)
+            if self._observation_is_same_person(o, provider_name, provider)
         ]
 
         summary = review_data.get("review_summary") or ""
@@ -2399,7 +3743,8 @@ Response (JSON object only):"""
         )
         return merged
 
-    def gather_providers(self, specialty: str, location: str, insurance: Optional[str] = None, enrich: bool = True) -> Dict[str, Any]:
+    def gather_providers(self, specialty: str, location: str, insurance: Optional[str] = None,
+                         enrich: bool = True, radius_miles: Optional[float] = None) -> Dict[str, Any]:
         """Main method to gather healthcare provider data.
 
         Args:
@@ -2416,6 +3761,7 @@ Response (JSON object only):"""
         Returns:
             Dictionary containing providers list, search metadata, and status
         """
+        self._identity_contradictions = []
         try:
             # Validate and sanitize inputs first
             validation_result = validate_search_params(specialty, location, insurance)
@@ -2463,8 +3809,14 @@ Response (JSON object only):"""
                 search_results = self._discover_candidates(
                     home_specs, self.config.MAX_PROVIDERS_PER_SEARCH
                 )
-                # Metadata carries plain query strings, not spec dicts
-                home_queries = [spec["query"] for spec in home_specs]
+                # Metadata carries one display string per CALL, with its
+                # domain restriction visible. The three discovery calls share
+                # one query string on purpose (one listing domain per call —
+                # the restriction rides in include_domains, not the text),
+                # and rendering the bare strings showed "three identical
+                # queries" in the dev panel — which photographs exactly like
+                # a triple-spend bug (owner run, 2026-08-09).
+                home_queries = [_describe_query_spec(spec) for spec in home_specs]
             else:
                 home_queries = [self._build_search_query(safe_specialty, query_location, safe_insurance)]
                 search_results = self._search_providers(
@@ -2514,17 +3866,42 @@ Response (JSON object only):"""
                 if (self.config.MULTI_QUERY_ENABLED
                         and len(providers) < self.config.MIN_CANDIDATE_POOL):
                     ring = nearby_cities(
-                        query_location, self.config.DEFAULT_SEARCH_RADIUS, self.config.MAX_RING_CITIES
+                        # The ring reaches exactly as far as the user allowed.
+                        # Reaching further would import cities the radius bound
+                        # then deletes — two searches and an extraction spent on
+                        # rows that cannot survive.
+                        query_location,
+                        radius_miles or self.config.DEFAULT_SEARCH_RADIUS,
+                        self.config.MAX_RING_CITIES
                     )
                     if ring:
                         logger.info(
                             f"Home pool thin ({len(providers)} providers, "
                             f"below {self.config.MIN_CANDIDATE_POOL}); ringing out to {ring}"
                         )
-                        ring_queries = [self._build_search_query(safe_specialty, city) for city in ring]
-                        queries_run.extend(ring_queries)
+                        # The SAME specs the home city uses — one basic call
+                        # per listing domain — not `_build_search_query`. The
+                        # ring ran the old unrestricted advanced query long
+                        # after home discovery moved to domain-restricted
+                        # calls, so exactly the searches that fire on THIN
+                        # pools returned listicles and practice sites the
+                        # listing parsers cannot read, and every ring page
+                        # went to the model. A combined one-call restriction
+                        # is not the answer either: at basic depth
+                        # include_domains measurably fails multi-domain, and
+                        # at advanced one platform takes every slot — the
+                        # run-to-run coverage swing round 20 killed. Costs
+                        # 3 basic vs 1 advanced per ring city (+1 credit,
+                        # only when the ring fires); buys parser-readable
+                        # in-domain pages.
+                        ring_specs = [
+                            spec
+                            for city in ring
+                            for spec in self._candidate_queries(safe_specialty, city)
+                        ]
+                        queries_run.extend(_describe_query_spec(spec) for spec in ring_specs)
                         ring_results = self._discover_candidates(
-                            ring_queries, self.config.MAX_PROVIDERS_PER_SEARCH
+                            ring_specs, self.config.MAX_PROVIDERS_PER_SEARCH
                         )
                         if ring_results:
                             ring_providers = self._extract_provider_data(
@@ -2573,16 +3950,65 @@ Response (JSON object only):"""
             for provider in providers:
                 self._attach_location_evidence(provider, safe_location)
 
+            # ...and then drop anyone who is not actually near the location the
+            # user typed. A platform's city page is a RADIUS CENTRE, not a
+            # filter — a Chandler search returns Gilbert, Mesa and Phoenix
+            # entries — and until now nothing bounded that: distance was scored
+            # and never used to exclude, so a provider 40 miles out competed for
+            # a research-budget slot with one 4 miles out and lost by ~1 point,
+            # because location's realized span across a pool is under a point.
+            #
+            # Deliberately a RADIUS, not a city match. Gilbert at 4.5 mi is
+            # nearer to Chandler 85249 than two of that run's own Chandler
+            # results at 8.0 mi, so "same city only" would have dropped the
+            # closest provider on the page. The city the user typed is where
+            # they are, not a boundary they want enforced.
+            #
+            # An UNKNOWN distance is never a reason to drop — that is our
+            # geocoding coverage, not their location, and the same rule the
+            # scorer follows when it declines to penalise missing data.
+            # The user's chosen radius, falling back to the configured default.
+            # This is the only lever that reliably keeps the research budget on
+            # nearby providers: location's realized span across a pool is under
+            # one point, so the WEIGHT cannot do it — the critic said as much on
+            # a live run ("providers 8 miles away and providers under 4 miles
+            # are separated by only a small amount in the final ordering").
+            # Radius bounds the pool; weight orders it.
+            radius = radius_miles or self.config.DEFAULT_SEARCH_RADIUS
+            in_radius, out_of_radius = _split_by_radius(providers, radius)
+            if out_of_radius:
+                logger.info(
+                    "Dropped %d provider(s) beyond the %d-mile search radius: %s",
+                    len(out_of_radius), radius,
+                    ", ".join(
+                        f"{p.get('name')} ({p.get('computed_distance_miles'):.0f} mi)"
+                        for p in out_of_radius[:5]
+                    ),
+                )
+                providers = in_radius
+
             result = {
                 "providers": providers,
                 "search_metadata": {
                     "query": query,
                     "queries": queries_run,
                     "query_count": len(queries_run),
+                    # Same-platform profile URLs that proved two records are
+                    # different people. Surfaced rather than only logged: this
+                    # is the one dedupe rule that can CREATE a duplicate, so a
+                    # reader who sees the same doctor twice needs a way to find
+                    # out why without reading a log file.
+                    "identity_contradictions": list(self._identity_contradictions),
                     # Whether the ring fired, recorded where it is KNOWN rather
                     # than inferred downstream from a query count the UI would
                     # have to hardcode the home-phrasing total to interpret.
                     "ring_expanded": len(queries_run) > len(home_queries),
+                    # How many candidates the radius bound removed, and what it
+                    # was. Recorded because a filter that silently shrinks the
+                    # pool is indistinguishable from a discovery failure — the
+                    # symptom of both is "fewer providers than last time".
+                    "radius_miles": radius,
+                    "radius_dropped": len(out_of_radius),
                     # What it BOUGHT, which the boolean above never said. The
                     # ring's cost is two searches, an extraction, and — because
                     # it fills the research budget — enrichment, judge and

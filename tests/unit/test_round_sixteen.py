@@ -147,7 +147,7 @@ class TestRedFlagsAbsenceBand:
 
     def test_every_red_flag_score_lands_on_exactly_one_band(self):
         """The tiling invariant, restated for the re-banded criterion. A score
-        no anchor describes is one the model improvises (§10.25)."""
+        no anchor describes is one the model improvises."""
         bands = self._bands("red_flags")
         for score in range(31):
             hits = [b for b in bands if b[0] <= score <= b[1]]

@@ -50,6 +50,21 @@ def _run(gatherer, store, providers, **kwargs):
         return gatherer.enrich_providers(providers, location="Chandler, AZ 85249", **kwargs)
 
 
+def test_the_pinned_key_basis_is_recorded_for_triage(gatherer, store):
+    """A same-criteria repeat search missed 7 of 8, and no surface could say
+    WHICH half of the key had moved between the runs — the surviving name
+    variant (middle initials kept by design, survivor picked by field
+    richness) or the discovery city (a multi-site group's listing shows a
+    different office per city page). `cache_basis` is the key's two inputs,
+    human-readable; diffing two runs' coverage panels names the moving
+    component per provider."""
+    p = {"name": "Dr. Andrea An, MD", "location": "Chandler, AZ"}
+
+    _run(gatherer, store, [p])
+
+    assert p["cache_basis"] == "an andrea|chandler az"
+
+
 def test_cache_hit_skips_the_live_enrichment_search(gatherer, store):
     """The entire point: a hit must remove that provider from the live pass.
 
@@ -101,6 +116,14 @@ def test_a_cache_hit_is_not_written_back(gatherer, store):
 
 
 def test_freshly_enriched_providers_are_written_back(gatherer, store):
+    """The mock must SET the outcome the real _enrich_one sets: the write
+    gate keys on `enrichment_outcome == "enriched"` (an outcome-less or
+    failed provider is exactly the Raja shape that must never be written),
+    so a bare MagicMock here stopped representing a successful enrichment
+    the day the gate shipped."""
+    gatherer._enrich_one.side_effect = (
+        lambda provider, *a, **k: provider.__setitem__("enrichment_outcome", "enriched")
+    )
     p = {"name": "Dr. New Person, MD", "location": "Chandler, AZ"}
     _run(gatherer, store, [p])
 
@@ -144,3 +167,75 @@ def test_hits_and_misses_reach_the_cost_tracker(gatherer, store):
 
     cache = get_cost_tracker().summary()["cache"]
     assert cache == {"hits": 1, "misses": 1, "lookups": 2}
+
+
+def test_a_stored_rating_only_row_is_completed_by_a_fresh_listing_pair(gatherer, store):
+    """The cache must not freeze a gap the live pass just closed.
+
+    Same union, same defect as `_merge_review_data`: the stored entry won a
+    URL collision outright, so a stored rating-only observation suppressed a
+    fresh discovery listing pair for the SAME url for the whole TTL. The fill
+    is corroborated (shared fields must agree) and strictly additive — a
+    disagreeing fresh read still changes nothing.
+    """
+    url = "https://healthgrades.com/physician/dr-a"
+    provider = {
+        "name": "Dr. A", "location": "Chandler, AZ",
+        "review_observations": [
+            {"source_url": url, "rating": 4.2, "review_count": 175,
+             "page_provider_name": "Dr. A"},
+        ],
+    }
+    payload = dict(_cached_payload())
+    payload["review_observations"] = [
+        {"platform": "healthgrades", "rating": 4.2, "review_count": None,
+         "source_url": url},
+    ]
+    store.get_cached_providers.return_value = (
+        {provider_cache_key(provider["name"], provider["location"]): payload}, [])
+
+    result = _run(gatherer, store, [provider])
+
+    obs = result[0]["review_observations"]
+    pairs = [(o.get("rating"), o.get("review_count")) for o in obs]
+    assert (4.2, 175) in pairs, "the stored rating-only row froze out the fresh pair"
+    assert len(obs) == 1, "the same url must still not count twice"
+
+
+def test_warm_hits_reselect_the_nearest_trusted_office(gatherer, store):
+    """The nearest-trusted selection is MEMBER-relative, so a cached row must
+    never freeze one member's office choice for the next: the stored row
+    carries the location SET (under the legacy-named address_conflict key),
+    and the choice re-runs on every hit. Without this, a row cached during a
+    Glendale member's search would show a Chandler member the far office —
+    the Vandian oscillation, laundered through the cache."""
+    p = {"name": "Dr. Harvinder Kumar", "location": "Chandler, AZ", "rating": 4.2}
+    key = provider_cache_key(p["name"], p["location"])
+    payload = dict(_cached_payload())
+    mesa = "1450 S Dobson Rd Ste B122, Mesa, AZ 85202"
+    phoenix = "9321 W Thomas Rd Ste 205, Phoenix, AZ 85037"
+    payload["location"] = phoenix
+    payload["location_source"] = "profile_parser:https://doctor.webmd.com/doctor/hk-overview"
+    payload["address_conflict"] = {
+        "distinct_count": 2,
+        "addresses": [
+            {"address": phoenix,
+             "source": "profile_parser:https://doctor.webmd.com/doctor/hk-overview"},
+            {"address": mesa,
+             "source": "profile_parser:https://doctor.webmd.com/doctor/hk-overview"},
+        ],
+    }
+    store.get_cached_providers.return_value = ({key: payload}, [])
+
+    distances = {
+        frozenset({"Chandler, AZ 85249", mesa}): 6.5,
+        frozenset({"Chandler, AZ 85249", phoenix}): 25.0,
+    }
+    from unittest.mock import patch as _patch
+    with _patch("agents.data_gatherer.distance_miles",
+                side_effect=lambda a, b: distances.get(frozenset({str(a), str(b)}))):
+        _run(gatherer, store, [p])
+
+    assert p["enrichment_outcome"] == "cached"
+    assert p["location"] == mesa, "the cached far office must not stick to this member"
+    assert p["address_conflict"]["selection"]["resolved"] is True

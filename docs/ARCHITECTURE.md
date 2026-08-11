@@ -45,19 +45,41 @@ enriches each one with verifiable evidence.
 
 ### Discovery
 
-- **Multi-query search.** Three differently-phrased Tavily queries (professional
-  directory, "top N" listicle, review-site-targeted) are fanned out for the
-  user's city, merged, and deduplicated by URL. A single phrasing finds fewer
-  distinct providers than three.
+- **Per-domain search.** One query is fanned across three review platforms —
+  healthgrades, webmd and vitals — **one domain per call**, then merged and
+  deduplicated by URL. A single combined call restricted to several platforms
+  lets whichever one ranks best take every result slot, which is what made
+  coverage swing between runs. Per-domain calls guarantee each platform its own
+  share, and the restriction holds at the cheaper `basic` search depth when only
+  one domain is named.
 - **Adaptive ring expansion.** If the deduplicated home-city pool can't fill the
   research budget, the search expands to the nearest cities (computed from
   vendored geo data, never guessed). The expansion is recorded — how many
   candidates it added, how many were researched, and how many reached the
   final recommendations — so its cost/benefit is measurable, not just its
   firing.
-- **Extraction.** Claude Haiku 4.5 extracts structured provider records from
-  page excerpts. Pages are independent, so extraction runs as two concurrent
-  calls over a partition of the pages when the page count justifies it.
+- **Deterministic parsing, with the model as the fallback.** Directory pages are
+  highly structured and repetitive, so each platform has its own parser
+  (`utils/listing_parser.py`) that reads every entry's name, rating, review
+  count, tenure, address and canonical profile link. The markup differs per
+  platform and none of it is guessable, so the parsers are written against each
+  site's own wording rather than a shared pattern. Pages a parser cannot read
+  still go to Claude Haiku 4.5, so a site redesign degrades to the previous
+  behaviour instead of emptying the candidate pool. Profile pages parse the same
+  way (`utils/profile_parser.py`), and an empty parse means "unreadable", never
+  "no data".
+- **Sponsored entries are excluded.** Platform directories open with a paid
+  "Featured Results" block whose entries repeat across unrelated cities and
+  frequently are not the searched specialty — or not physicians at all. Two of
+  the three platforms share that inventory, so one advertiser appearing on both
+  would otherwise look like independent cross-platform agreement.
+- **Distance is computed, never read.** A directory states each provider's
+  distance from *the page's* city, which is not the user's. That figure is
+  discarded and distance is recomputed from the user's location against the
+  address the parser extracted.
+- **Extraction concurrency.** Where the model is used, pages are independent, so
+  extraction runs as two concurrent calls over a partition of the pages when the
+  page count justifies it.
 
 ### Excerpting
 
@@ -75,8 +97,9 @@ which real platform pages use for exactly the numbers the scorer needs.
 ### Enrichment
 
 After core scoring, every provider inside the research budget that the cache
-didn't serve gets **one platform-restricted search** across five independent
-patient-review platforms (Healthgrades, Vitals, Zocdoc, WebMD, RateMDs).
+didn't serve gets **one platform-restricted search** across three independent
+patient-review platforms (Healthgrades, WebMD, Vitals — Zocdoc and RateMDs
+were dropped after a field measurement found no usable rating data on either).
 Result slots are spent round-robin so every platform contributes a page before
 any contributes a second, and each platform's slot prefers the provider's own
 **profile page** over directory listings.
@@ -159,7 +182,8 @@ Robustness mechanics:
 
 ## 3. Critic Validator Agent
 
-`agents/critic_validator.py` — Claude Opus 4.8, two parallel calls per search.
+`agents/critic_validator.py` — Claude Opus 4.8: one whole-ordering bias call
+plus deep validation dealt across three concurrent shards.
 
 - **Bias analysis** reads the whole ordering plus each dimension's weighted
   contribution to it, so causal claims ("X is ranked first because…") must
@@ -168,8 +192,8 @@ Robustness mechanics:
 - **Deep validation** reviews each provider against fixed verdict criteria
   (approve / conditional / reject, with cited evidence and a confidence tied
   to how much platform evidence exists). Verdicts are per-provider, so the
-  pool is split across two concurrent calls, dealt so each call still sees a
-  representative spread.
+  pool is split across three concurrent calls, dealt so each call still sees
+  a representative spread.
 - **The critic audits the judge.** It receives the judge's rubric verbatim
   (imported from the scorer module, so the two can't drift) plus the judge's
   scores and citations, and reports citations the evidence doesn't support.
@@ -260,6 +284,7 @@ knobs that shape a run:
 | `ENRICHMENT_MAX_WORKERS` | 8 | Enrichment concurrency (sets the number of waves, not the amount of work) |
 | `JUDGE_PARALLEL_ENABLED` | true | Whether the judge scores the pool in two concurrent calls |
 | `MULTI_QUERY_ENABLED` / `MIN_CANDIDATE_POOL` / `MAX_RING_CITIES` | true / 8 / 2 | Discovery breadth and when ring expansion fires |
+| `TAVILY_CHUNKS_PER_SOURCE` | 5 | How many relevance-selected chunks the search returns per page. Both extraction prompts already read that field, so this steers what the extractor sees; raising it from the vendor default of 3 roughly doubled the providers recovered with a rating *and* a review count, at no extra credit cost |
 | `PROVIDER_CACHE_TTL_DAYS` | 7 | Cache freshness window (0 disables reuse without discarding data) |
 | `TAVILY_SEARCH_DEPTH` | basic | Search depth; platform-targeted searches always run advanced |
 

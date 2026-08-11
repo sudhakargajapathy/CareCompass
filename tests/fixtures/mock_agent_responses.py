@@ -122,17 +122,8 @@ MOCK_BIAS_ANALYSIS_RESPONSE = """
     "explanation": "The ranking slightly favors closer providers."
   },
   "blind_spots": {
-      "missing_factors": ["Telehealth options"],
-      "impact": "Could be important for some users.",
-      "recommendations": ["Consider telehealth availability."]
-  },
-  "alternative_scenarios": [],
-  "validity_concerns": {
-      "ranking_issues": [],
-      "misleading_aspects": [],
-      "confidence_level": "high"
-  },
-  "overall_assessment": "The ranking is solid, with minor proximity bias."
+      "missing_factors": ["Telehealth options"]
+  }
 }
 """
 
@@ -221,17 +212,8 @@ MOCK_VALIDATION_RESULT = {
                 "explanation": "The ranking slightly favors closer providers."
             },
             "blind_spots": {
-                "missing_factors": ["Telehealth options"],
-                "impact": "Could be important for some users.",
-                "recommendations": ["Consider telehealth availability."]
-            },
-            "alternative_scenarios": [],
-            "validity_concerns": {
-                "ranking_issues": [],
-                "misleading_aspects": [],
-                "confidence_level": "high"
-            },
-            "overall_assessment": "The ranking is solid, with minor proximity bias."
+                "missing_factors": ["Telehealth options"]
+            }
         },
         "alternative_rankings": [],
         "top_provider_validation": {

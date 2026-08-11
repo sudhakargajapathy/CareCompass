@@ -83,14 +83,14 @@ html, body, .stApp, [data-testid="stAppViewContainer"] {{
 }}
 
 /* ---- Buttons ---- */
-.stButton > button, [data-testid="stFormSubmitButton"] > button,
+.stButton > button,
 [data-testid="stBaseButton-primary"], [data-testid="stBaseButton-secondary"] {{
     border-radius: 999px;
     font-family: 'Inter', sans-serif;
     font-weight: 500;
     transition: transform 0.05s ease;
 }}
-.stButton > button:active, [data-testid="stFormSubmitButton"] > button:active {{
+.stButton > button:active {{
     transform: scale(0.98);
 }}
 [data-testid="stBaseButton-primary"] {{
@@ -105,8 +105,16 @@ html, body, .stApp, [data-testid="stAppViewContainer"] {{
     border: 1px solid {HEARTH["bone_300"]};
 }}
 
-/* ---- Search form card ---- */
-[data-testid="stForm"] {{
+/* ---- Search card ----
+   Targeted the form testid until round 29 retired st.form (dependent
+   state → city → ZIP selectboxes can't react inside a form's batched
+   state); the card is now st.container(border=True, key="search_card").
+   Measured against the running 1.59 DOM: the st-key class lands on the
+   stVerticalBlock div itself, which is ALSO where border=True draws (no
+   border-wrapper testid exists in this version), so one selector
+   restyles the same element. Element+class beats the emotion class it
+   ties with on specificity. */
+div.stVerticalBlock.st-key-search_card {{
     background: {HEARTH["bone_50"]};
     border: 1px solid {HEARTH["bone_200"]};
     border-radius: 24px;
@@ -392,6 +400,75 @@ button[data-variant="segmented_control"][aria-checked="true"]:hover {{
     line-height: 1.5;
 }}
 .cc-footer a {{ color: {HEARTH["clay_600"]}; }}
+
+/* ---- Motion (rounds 29-33) ----
+   Round 33 RETIRED the expander open animation. Three rounds tried to
+   make it behave: round 29 shipped it (alongside the smooth-scroll rule
+   kept below); round 30 cut it to height-only after Chrome repainted an
+   opening expander's text garbled mid-flip; round 31 disabled scroll
+   anchoring on the measured scroll container to stop a 1-2px
+   dip-and-spring on every open — and on 2026-08-11 the owner reported
+   BOTH symptoms still alive on the deployed build. The mechanism was
+   never fully ours to fix: animating an element's layout height
+   re-rasterizes the text under it on every frame (the flicker) while
+   the browser re-derives the scroll position mid-flight (the bounce),
+   and each patch moved the fight rather than ending it. The animation
+   was comfort; the defects were function. Expanders now open instantly
+   — the browser default nobody files bugs against — the height-auto
+   interpolation opt-in is gone with it, and scroll anchoring returns
+   to its default, which is USEFUL again once nothing animates layout.
+   A guard test bans the animation's tokens from this whole sheet,
+   comments included, so it cannot quietly return.
+   The smooth-scroll rule STAYS: it eases the programmatic/anchor
+   scrolls Streamlit issues on reruns (round 29's stepped-scroll
+   complaint), moves only the viewport, never layout, and predates the
+   defects above. Reduced-motion users keep instant everything. */
+@media (prefers-reduced-motion: no-preference) {{
+    html {{ scroll-behavior: smooth; }}
+}}
+
+/* ---- Rendering containment (round 30) ----
+   A results page is HEAVY — five cards, the Responsible-AI panel, the
+   other-providers list, agent analysis, logs — and without containment a
+   hover lift on one card or an expander mid-transition invalidates layout
+   and paint across that whole tree, which is the scroll jitter the owner
+   reported. Containment scopes each card's and each expander's layout and
+   paint to itself. layout+paint only, deliberately NOT size: these boxes
+   grow with their content. Safe here because nothing inside a cc-card or
+   an expander body intentionally overflows it (Streamlit tooltips and
+   dropdown menus render in a body-level portal, so clipping at the border
+   box cannot cut them off). */
+.cc-card, .cc-cost-card {{
+    contain: layout paint;
+}}
+[data-testid="stExpander"] details {{
+    contain: layout paint;
+}}
+
+/* ---- Layout stability (round 34) ----
+   The jitter that SURVIVED round 33's animation retirement, with the
+   owner's own diagnosis pointing at the mechanism: opening an expander
+   "causes some words to move to the next line". Opening an expander
+   changes the PAGE HEIGHT; when that crosses the viewport threshold on
+   a platform with classic (non-overlay) scrollbars, the browser inserts
+   the vertical scrollbar into the scroll container — stealing ~15px of
+   inline width — and every text line on the page rewraps at the new
+   width. Closing reverses it. No animation involved, which is why three
+   rounds of animation fixes never touched it, and short pages (the
+   zero-card page, the pre-search page) cross the threshold on almost
+   every expander open. Reserving the gutter permanently makes scrollbar
+   arrival width-neutral: no rewrap, no reflow, no jitter. Applied to
+   the measured scroll container (section stMain, the only
+   overflow-y:auto ancestor in the running 1.59 DOM — the round-31
+   measurement) plus html for the document-scroller fallback.
+   Unconditional on purpose — this is layout stability, not motion, so
+   it does not belong under the reduced-motion gate. On overlay-
+   scrollbar platforms (macOS default) the declaration reserves nothing,
+   which is also correct: overlay scrollbars take no width and never
+   caused the reflow. */
+html, [data-testid="stMain"] {{
+    scrollbar-gutter: stable;
+}}
 """
 
 
