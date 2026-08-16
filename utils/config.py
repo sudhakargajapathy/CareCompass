@@ -23,6 +23,16 @@ class Config:
         self.ENV: str = os.getenv("ENV", "development")
         self.DEBUG: bool = os.getenv("DEBUG", "false").lower() == "true"
 
+        # Demo video (optional, display-only). A Loom share/embed link; when
+        # set, app.py renders a "Watch the demo" expander above "How it
+        # works". Unset means that expander does not EXIST — no placeholder,
+        # no empty player — so the video can be added to or pulled from a
+        # deployment by editing one Space variable, without a code change.
+        # Stored verbatim: app._demo_video_embed_url is the single owner of
+        # normalization (share -> embed) and the loom.com host allowlist, so
+        # a second cleanup pass here could only disagree with it.
+        self.DEMO_VIDEO_URL: str = os.getenv("DEMO_VIDEO_URL", "")
+
         # Authentication Settings
         self.AUTH_DATABASE_URL: Optional[str] = os.getenv("AUTH_DATABASE_URL") or os.getenv("DATABASE_URL")
         self.AUTH_BOOTSTRAP_ADMIN: bool = os.getenv("AUTH_BOOTSTRAP_ADMIN", "true").lower() == "true"
