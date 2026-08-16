@@ -13,7 +13,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import streamlit as st
+import streamlit.components.v1 as components
 from typing import Dict, List, Any, Optional, Tuple
+from urllib.parse import urlparse
 import logging
 
 # Configure logging
@@ -363,6 +365,90 @@ def _pipeline_strip_html() -> str:
         """
 
 
+# The demo expander's iframe-src allowlist. Only Loom may be framed here: the
+# value arrives from an env var (owner-controlled, not user input), but a
+# hand-set variable is exactly where a pasted-wrong link lands, and the failure
+# mode of framing an arbitrary URL is a page that quietly embeds anything.
+# Exact hostname match — "www.loom.com.evil.com" is a different hostname, not
+# a subdomain of an allowed one.
+_LOOM_HOSTS = {"loom.com", "www.loom.com"}
+# Loom's two public link shapes: /share/<id> (what the Share button copies)
+# and /embed/<id> (what the player iframe actually loads). Anything else on
+# loom.com — a folder, a workspace page — is not a single video and won't
+# render in an iframe.
+_LOOM_PATH_RE = re.compile(r"^/(?:share|embed)/([A-Za-z0-9_-]+)/?$")
+
+
+def _demo_video_embed_url(raw: Optional[str]) -> Optional[str]:
+    """Normalize a Loom link to its /embed/ form, or None if not embeddable.
+
+    st.video cannot play a Loom share link (it special-cases YouTube and raw
+    media files only); Loom's supported embed is an iframe at /embed/<id>.
+    The owner pastes whatever the Share button copied — /share/<id>, usually
+    with a ?sid= suffix, sometimes without the scheme — so this accepts share
+    or embed form, tolerates a missing scheme, keeps the query string (Loom
+    reads player options like t= and hide_owner= from it), and rebuilds the
+    URL on the canonical https://www.loom.com host. None means "render
+    nothing": the demo expander must be ABSENT when there is no playable
+    video — never an empty player — and a non-Loom value is logged and
+    skipped rather than framed.
+    """
+    candidate = (raw or "").strip()
+    if not candidate:
+        return None
+    # A schemeless paste ("www.loom.com/share/x") parses as all-path with an
+    # empty hostname; give it the scheme back before judging the host.
+    if "://" not in candidate:
+        candidate = f"https://{candidate}"
+    parsed = urlparse(candidate)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in ("http", "https") or host not in _LOOM_HOSTS:
+        logger.warning(
+            "DEMO_VIDEO_URL is not a Loom link (host %r) — demo expander skipped",
+            host,
+        )
+        return None
+    match = _LOOM_PATH_RE.match(parsed.path or "")
+    if not match:
+        logger.warning(
+            "DEMO_VIDEO_URL path %r is not /share/<id> or /embed/<id> — "
+            "demo expander skipped",
+            parsed.path,
+        )
+        return None
+    embed_url = f"https://www.loom.com/embed/{match.group(1)}"
+    if parsed.query:
+        embed_url = f"{embed_url}?{parsed.query}"
+    return embed_url
+
+
+def _render_demo_video() -> None:
+    """The "Watch the demo" expander — or nothing at all.
+
+    Its own expander ABOVE "How it works", deliberately not a block inside
+    it: a collapsed expander's title is its only advertisement, and a title
+    that promises the video outperforms any caption planted beside "How it
+    works" — while that section's copy (guard-tested, resume-aligned) stays
+    byte-identical whether or not a video is configured. Collapsed by
+    default so the search card, the page's primary action, keeps its place
+    above the fold. Absent-when-unset is the contract: unset or non-Loom
+    values render nothing, not a placeholder.
+    """
+    embed_url = _demo_video_embed_url(get_config().DEMO_VIDEO_URL)
+    if not embed_url:
+        return
+    # The play glyph lives in the icon SLOT, not the label: a literal "▶"
+    # in the label sat directly beside Streamlit's own expander chevron and
+    # read as two arrows (seen on the first screenshot of this feature).
+    with st.expander("Watch the demo (3 min)", icon=":material/play_circle:"):
+        # components.iframe keeps the embed out of unsafe_allow_html; the
+        # fixed height letterboxes the 16:9 player slightly at the main
+        # column's usual width. The iframe loads eagerly even while the
+        # expander is collapsed — Streamlit renders expander children up
+        # front — which is an accepted cost for one third-party player.
+        components.iframe(embed_url, height=410)
+
+
 def render_header():
     """Render the application header."""
     st.set_page_config(
@@ -384,6 +470,10 @@ def render_header():
         </div>
         """
     )
+
+    # The demo leads when one is configured; the helper renders nothing when
+    # DEMO_VIDEO_URL is unset, so this line is inert on undecorated deploys.
+    _render_demo_video()
 
     # How the multi-agent pipeline works (also the architecture story for
     # anyone reviewing the project)

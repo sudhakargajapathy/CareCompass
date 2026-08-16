@@ -142,9 +142,10 @@ preferences normalized to weights:
 
 - **Rating** — Bayesian-shrunk by review volume toward a prior, so a 5.0 from
   three reviews doesn't beat a 4.7 from four hundred. When two or more
-  platforms agree, a count-weighted cross-platform blend replaces the single
-  headline number. Unrated providers score the prior itself — unknown is
-  *unknown*, not bad.
+  platforms supply a rating+count pair, a count-weighted cross-platform blend
+  replaces the single headline number — disagreement between platforms travels
+  as a visible spread rather than suppressing the blend. Unrated providers
+  score the prior itself — unknown is *unknown*, not bad.
 - **Location** — precedence: code-computed distance → page-stated distance →
   tier fallback. Tier values sit at the pessimistic edge of their band so a
   measured provider is never out-scored by an imputed one.
@@ -258,19 +259,28 @@ a first-class output:
 - **Other providers considered** — everything below the shortlist, grouped by
   why: ranked below the cut, researched but not recommendable (with the
   reason), or past the research budget (scores labeled provisional).
-- **Agent Decision Process** — names every withheld provider and the stage
-  that didn't complete, with the system's own failures listed first.
-- **Responsible-AI panel** — bias check and red-flag tiles, the bias
-  explanation (labeled with the ordering it describes), a judge-consistency
-  note (count only — internal rubric vocabulary stays off patient surfaces),
-  and "What this ranking doesn't capture".
+- **Agent Decision Process** — names the withheld providers whose reason is a
+  failure (the system's own failures listed first) and counts the
+  research-budget cut, pointing at the full list instead of duplicating it.
+- **Responsible-AI panel** — bias check and red-flag tiles (the red-flag count
+  scoped to the cards actually shown), the independent critic's read rendered
+  on **every** run — headed "Bias check" when something was flagged and
+  "Independent critic's read" when clean — and "What this ranking doesn't
+  capture". Every position the panel names is one the reader can actually see.
+- **Honest empty results** — a run that can recommend nobody explains itself:
+  system-side failures get retry framing ("not a problem with your search"),
+  coverage gaps get advice to widen the search, and the cost card still
+  renders — the run happened.
 - **Cost card & timeline** — per-search token/credit estimates and a
   step-by-step timing table attributed to the agent that actually did the
   work.
 - **FHIR network check** (`fhir/verify.py`) — an optional sidebar
-  verification of insurance-network membership against a FHIR directory
-  (sandbox by default). It never affects scores; insurance data from
-  directories is displayed as unverified and never rides in a search query.
+  verification of insurance-network membership against a FHIR directory. In
+  demo mode the answers come from a deterministic **simulated** directory and
+  every chip and caption says so; a real Plan-Net endpoint plugs in via
+  `FHIR_USE_MOCK=false` and runs the same check live. It never affects scores;
+  insurance data from directories is displayed as unverified and never rides
+  in a search query.
 
 ## Configuration
 
@@ -286,7 +296,7 @@ knobs that shape a run:
 | `MULTI_QUERY_ENABLED` / `MIN_CANDIDATE_POOL` / `MAX_RING_CITIES` | true / 8 / 2 | Discovery breadth and when ring expansion fires |
 | `TAVILY_CHUNKS_PER_SOURCE` | 5 | How many relevance-selected chunks the search returns per page. Both extraction prompts already read that field, so this steers what the extractor sees; raising it from the vendor default of 3 roughly doubled the providers recovered with a rating *and* a review count, at no extra credit cost |
 | `PROVIDER_CACHE_TTL_DAYS` | 7 | Cache freshness window (0 disables reuse without discarding data) |
-| `TAVILY_SEARCH_DEPTH` | basic | Search depth; platform-targeted searches always run advanced |
+| `TAVILY_SEARCH_DEPTH` | advanced | Reaches only the single-query fallback (`MULTI_QUERY_ENABLED=false`) — standard searches pin their own depths in code (discovery basic, enrichment advanced) |
 
 See [`.env.example`](../.env.example) for the full list, including auth,
 encryption, rate limiting, and TLS settings.
@@ -310,3 +320,7 @@ encryption, rate limiting, and TLS settings.
 6. **The checker must be independent.** The critic reads the same evidence as
    the judge (a tested payload-parity contract) but runs in a different model
    family, and its findings about the judge never move provider scores.
+7. **Free text never reaches a prompt.** Every search field is selection-only,
+   allowlisted against the same vendored GeoNames dataset that computes
+   distances — specialty and city from fixed lists, ZIP verified against the
+   chosen city — and re-checked server-side for every non-UI path.
