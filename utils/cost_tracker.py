@@ -121,6 +121,23 @@ class CostTracker:
         with self._lock:
             self._tavily_searches.append({"depth": depth, "agent": agent, "credits": credits})
 
+    def record_tavily_extract(self, url_count: int, agent: str = "") -> None:
+        """Record one Tavily /extract batch.
+
+        Extract bills per URL, not per call: 1 credit per 5 URLs at basic
+        extract depth (the depth the gatherer pins), rounded up. Recorded into
+        the same ledger as searches so the cost card's credit total needs no
+        second sum; the "extract" depth label is what tells the rows apart.
+        """
+        count = max(0, int(url_count))
+        if count == 0:
+            return
+        credits = -(-count // 5)  # ceil(count / 5)
+        with self._lock:
+            self._tavily_searches.append(
+                {"depth": "extract", "agent": agent, "credits": credits, "urls": count}
+            )
+
     def record_embeddings(self, tokens: int, model: str = "text-embedding-3-small") -> None:
         """Record embedding usage (token count is the input size)."""
         with self._lock:

@@ -14,7 +14,10 @@ import re
 import pytest
 
 from utils.geo import parse_location
+from utils.platform_urls import healthgrades_page_urls, listing_page_urls
 from utils.listing_parser import (
+    healthgrades_result_count,
+    listing_result_count,
     clean_address,
     is_physician,
     parse_listing,
@@ -2771,3 +2774,180 @@ class TestNearestTrustedSelection:
 
         assert provider["location"] == self.MESA
         assert "selection" not in provider["address_conflict"]
+
+
+class TestWebmdCompareTableFallback:
+    """A fetched webmd profile (Dr. Kan Yu, 2026-09-02, via /extract) carried
+    no header card and no FAQ restatement — `## Ratings & Reviews` read
+    "No data" — while `## Compare with Similar Doctors` stated the subject's
+    `4.5 (151 Ratings)` and `40 Years Experience`. Same widget vitals ships;
+    the webmd parser never read it, so the page yielded nothing."""
+
+    URL = "https://doctor.webmd.com/doctor/kan-yu-cc7025da-33bd-df11-a4b4-001f29e3eb44-overview"
+
+    def _page(self, h1="Dr. Kan Yu, MD", subject_col=0):
+        names = ["Dr. Kan Yu, MD", "Dr. David Paul Brown, MD", "Dr. Ramzy G Medaa, MD", "Dr. Cinthi Pillai, MD"]
+        pairs = ["4.5     (151 Ratings)", "3.5     (7 Ratings)", "5.0     (1 Rating)", "5.0     (20 Ratings)"]
+        years = ["40 Years Experience", "39 Years Experience", "27 Years Experience", "20 Years Experience"]
+        last = ["[View Profile](https://doctor.webmd.com/doctor/x-overview)"] * 4
+        last[subject_col] = "Current Profile"
+        if subject_col != 0:  # the subject's name moves with the marker
+            names[0], names[subject_col] = names[subject_col], names[0]
+            pairs[0], pairs[subject_col] = pairs[subject_col], pairs[0]
+            years[0], years[subject_col] = years[subject_col], years[0]
+        row = lambda cells: "| " + " | ".join(cells) + " |"
+        return "\n".join([
+            f"# {h1}", "", "## Overview", "Dr. Kan Yu, MD, is a Neurologist practicing in Gilbert, AZ.", "",
+            "## Ratings & Reviews for Dr. Yu", "", "#### Patients’ Perspective", "", "No data", "",
+            "## Compare with Similar Doctors", "",
+            "|  |  |  |  |", "| --- | --- | --- | --- |",
+            row(names), row(["Neurology"] * 4), row(pairs), row(years),
+            row(["Gilbert, AZ", "Tempe, AZ", "Scottsdale, AZ", "New York, NY"]), row(last),
+            "", "## Specialties", "Neurology",
+        ])
+
+    def test_reads_the_subjects_pair_and_tenure_from_the_table(self):
+        parsed = parse_profile(self.URL, self._page())
+        assert (parsed.get("rating"), parsed.get("review_count")) == (4.5, 151)
+        assert parsed.get("years_experience") == 40
+
+    def test_subject_column_is_structural_not_positional(self):
+        """The marker, not the first column, names the subject."""
+        parsed = parse_profile(self.URL, self._page(subject_col=2))
+        assert (parsed.get("rating"), parsed.get("review_count")) == (4.5, 151)
+
+    def test_column_name_must_agree_with_the_page_h1(self):
+        """A `Current Profile` under a stranger's name is not this doctor's
+        pair — a neighbour's stars on a card is the failure every identity
+        rule exists to prevent."""
+        parsed = parse_profile(self.URL, self._page(h1="Dr. Someone Else, MD"))
+        assert parsed.get("rating") is None
+        assert parsed.get("review_count") is None
+
+
+class TestHealthgradesLaterPagesAndStateDirectory:
+    """healthgrades writes page 1 of a city directory with absolute profile
+    links and pages 2+ (and the state directory) with host-relative ones —
+    `/physician/dr-kan-yu-2b5bc` — which the heading regex rejected outright:
+    0 rows from a 25 KB `chandler_2` that lists Dr. Kan Yu. The state page
+    also glues its echoed rating to its neighbours (`out of 54.7from 48`)."""
+
+    PAGE2 = "https://www.healthgrades.com/neurology-directory/az-arizona/chandler_2"
+    STATE = "https://www.healthgrades.com/neurology-directory/az-arizona"
+
+    def test_page_two_entries_yield_name_and_absolute_profile_url(self):
+        text = "\n".join([
+            "# 20 Best Neurologists Near Chandler, AZ",
+            '## We found 81 results within 10 miles for "Neurologists near Chandler, AZ"',
+            "### [Dr. Brandon Woods, MD](/physician/dr-brandon-woods-3mjyy)", "",
+            "![](https://dims.healthgrades.com/a.jpg)", "",
+            "### [Dr. Kan Yu, MD](/physician/dr-kan-yu-2b5bc)", "",
+            "![](https://dims.healthgrades.com/b.jpg)", "",
+        ])
+        rows = parse_listing(self.PAGE2, text)
+        assert [r["name"] for r in rows] == ["Dr. Brandon Woods, MD", "Dr. Kan Yu, MD"]
+        assert rows[1]["profile_url"] == "https://www.healthgrades.com/physician/dr-kan-yu-2b5bc"
+        # No pair rendered on these pages — the row still exists, rating-less,
+        # exactly like every webmd listing row.
+        assert rows[1]["rating"] is None and rows[1]["review_count"] is None
+        assert healthgrades_result_count(text) == 81
+
+    def test_state_directory_entry_reads_glued_pair_specialty_and_address(self):
+        text = "\n".join([
+            "# 20 Best Neurologists In Arizona",
+            '## We found584 results for "Neurologists in Arizona"',
+            "### [Dr. Peter Struck, MD](/physician/dr-peter-struck-3pp3q)", "",
+            "Specialty: Neurology", "",
+            "Rated 4.7 out of 54.7from 48 ratings•[31 written reviews](/physician/dr-peter-struck-3pp3q#ratings)", "",
+            "[7242 E Osborn Rd Ste 400Scottsdale, AZ 85251](/physician/dr-peter-struck-3pp3q#locations)", "",
+            "[View Profile](/physician/dr-peter-struck-3pp3q)",
+        ])
+        rows = parse_listing(self.STATE, text)
+        assert len(rows) == 1
+        row = rows[0]
+        assert (row["rating"], row["review_count"]) == (4.7, 48)
+        assert row["specialty"] == "Neurology"
+        assert "85251" in (row["location"] or "") and "Scottsdale" in (row["location"] or "")
+        assert row["profile_url"] == "https://www.healthgrades.com/physician/dr-peter-struck-3pp3q"
+        assert healthgrades_result_count(text) == 584
+
+    def test_page_one_absolute_links_still_parse(self):
+        text = "\n".join([
+            "### [Dr. Hemant Pandey, MD](https://www.healthgrades.com/physician/dr-hemant-pandey-xsjwm)",
+            "Rated 3.8 out of 5 3.8 from 88 ratings Neurology [4045 W Chandler Blvd Bldg F, Chandler, AZ 85226]",
+        ])
+        rows = parse_listing("https://www.healthgrades.com/neurology-directory/az-arizona/chandler", text)
+        assert (rows[0]["rating"], rows[0]["review_count"]) == (3.8, 88)
+        assert rows[0]["profile_url"].startswith("https://www.healthgrades.com/physician/")
+
+    @pytest.mark.parametrize("count, expected", [
+        (81, ["_2", "_3", "_4", "_5"]),
+        (20, []),
+        (21, ["_2"]),
+        (200, ["_2", "_3", "_4", "_5"]),   # capped at five pages
+        (None, []),
+    ])
+    def test_page_urls_follow_the_stated_count(self, count, expected):
+        base = "https://www.healthgrades.com/neurology-directory/az-arizona/chandler"
+        assert healthgrades_page_urls(base, count) == [base + s for s in expected]
+
+    def test_a_later_page_never_paginates_again(self):
+        assert healthgrades_page_urls(self.PAGE2, 81) == []
+
+
+class TestListingPaginationAllPlatforms:
+    """Every platform paginates its city listing behind its own parameter
+    (2026-09-02, read off the pages' own "Page 2" links): healthgrades
+    `<city>_N`, webmd `?pagenumber=N`, vitals `?page=N`. Page 1 alone read 20
+    of healthgrades' 81, 46 of webmd's 142 and 45 of vitals' 142."""
+
+    HG = "https://www.healthgrades.com/neurology-directory/az-arizona/chandler"
+    WM = "https://doctor.webmd.com/providers/specialty/neurology/arizona/chandler"
+    VI = "https://www.vitals.com/neurology/az/chandler"
+
+    def test_webmd_total_is_the_largest_stated_number(self):
+        text = ("# Best **Neurologists** in **Chandler, AZ** Chandler, AZ has **142 Neurologist** "
+                "results with an average of **31 years of experience** and **a total of 2088 reviews**. "
+                "Showing 85 providers")
+        assert listing_result_count(self.WM, text) == 142
+
+    def test_vitals_total_is_the_largest_stated_number(self):
+        text = "# 142 Neurologists in Chandler, AZ\n\n85 Neurologists accepting new patients"
+        assert listing_result_count(self.VI, text) == 142
+
+    def test_healthgrades_total_unchanged(self):
+        assert listing_result_count(self.HG, 'We found 81 results within 10 miles') == 81
+
+    def test_no_phrase_or_unknown_platform_is_none(self):
+        assert listing_result_count(self.WM, "no totals here") is None
+        assert listing_result_count("https://example.com/list", "142 Neurologists") is None
+
+    def test_each_platform_uses_its_own_parameter(self):
+        """THE TRAP, pinned: webmd's `?page=2` and vitals' `?pagenumber=2` both
+        silently return page 1 again (0 new names) — each platform ignores the
+        other's parameter and the wrong one looks like success."""
+        webmd = listing_page_urls(self.WM, 142)
+        vitals = listing_page_urls(self.VI, 142)
+        assert webmd == [self.WM + "?pagenumber=2", self.WM + "?pagenumber=3"]
+        assert vitals == [self.VI + "?page=2", self.VI + "?page=3"]
+        assert all("?page=" not in u for u in webmd)
+        assert all("pagenumber" not in u for u in vitals)
+
+    def test_healthgrades_shape_unchanged(self):
+        assert listing_page_urls(self.HG, 81) == [self.HG + f"_{n}" for n in (2, 3, 4, 5)]
+
+    @pytest.mark.parametrize("count", [None, 0, 50])
+    def test_one_page_or_unknown_total_fetches_nothing(self, count):
+        assert listing_page_urls(self.WM, count) == []
+        assert listing_page_urls(self.VI, count) == []
+
+    def test_cap_is_five_pages(self):
+        assert len(listing_page_urls(self.VI, 100_000)) == 4   # pages 2..5
+
+    def test_a_later_page_never_paginates_again(self):
+        assert listing_page_urls(self.WM + "?pagenumber=2", 142) == []
+        assert listing_page_urls(self.VI + "?page=3", 142) == []
+        assert listing_page_urls(self.HG + "_2", 81) == []
+
+    def test_non_platform_url_fetches_nothing(self):
+        assert listing_page_urls("https://example.com/doctors", 500) == []

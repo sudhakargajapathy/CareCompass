@@ -15,10 +15,12 @@ from utils.cost_tracker import get_cost_tracker, safe_usage
 from utils.excerpt import build_excerpt, clip_words
 from utils.json_salvage import salvage_json_objects
 from utils.listing_parser import (
+    listing_result_count,
     parse_listing, slug_agrees_with_name, slug_contradicts_name,
 )
 from utils.profile_parser import parse_profile, strip_data_uris
 from utils.geo import city_state_for_zip, distance_miles, location_tier, nearby_cities, parse_location, resolution_level, strip_zip
+from utils.platform_urls import discovery_listing_urls, listing_page_urls
 from utils.provenance import (
     REVIEW_PLATFORM_DOMAINS, canonical_profile_url, is_profile_url,
     source_domain, url_page_kind, urls_contradict,
@@ -514,6 +516,48 @@ _MIN_CREDIBLE_COUNT = 3
 # picking a winner. (`_select_review_observation` collapses observations to one
 # voice per platform downstream, so a union here cannot double-count.)
 _UNION_ON_DEDUPE = ("review_observations", "insurance_accepted")
+
+
+def _union_platform_profile_urls(*records: Dict[str, Any]) -> Dict[str, str]:
+    """Every review-platform PROFILE URL the given records hold, one per domain.
+
+    First write per domain wins, in record order — the survivor's own URLs
+    first, then the duplicate's — matching _harvest_profile_urls' rule that
+    an established URL is never overwritten by a later, weaker one.
+
+    Exists because the dedupe merge used to DROP a platform. webmd's city
+    listing rows carry a profile URL but NO rating pair (49 rows, 0 pairs on
+    the Chandler neurology page, 2026-09-02), so a webmd row creates no
+    observation and its URL lives only in the scalar `profile_url`. When a
+    richer vitals or healthgrades row wins the merge, that scalar is
+    fill-if-empty and the webmd URL is gone — and with it the one place
+    extract-mode enrichment could learn the doctor's webmd profile. Search
+    mode masked the loss for months: the enrichment name search re-found the
+    webmd profile and the harvest re-attributed it for free. Extract mode
+    fetches only what it can NAME, so the first extract-mode Space run showed
+    every card on two platforms, webmd on none.
+
+    Profile-kind pages on the review platforms only — the same filter
+    _known_profile_urls applies, so a listing/index URL can never be stored
+    as a doctor's own page.
+    """
+    known: Dict[str, str] = {}
+
+    def consider(url: Any) -> None:
+        domain = source_domain(url)
+        if not url or not domain or domain in known:
+            return
+        if not any(d in domain for d in _REVIEW_PLATFORM_DOMAINS):
+            return
+        if url_page_kind(url) != "profile":
+            return
+        known[domain] = url
+
+    for record in records:
+        for stored in (record.get("platform_profile_urls") or {}).values():
+            consider(stored)
+        consider(record.get("profile_url"))
+    return known
 
 
 def _union_evidence(current: Any, incoming: Any) -> Optional[List[Any]]:
@@ -1559,6 +1603,189 @@ class DataGathererAgent:
                     logger.error(f"Tavily search failed after retry: {e}")
         return []
 
+    def _tavily_mode(self) -> str:
+        """How pages are fetched: "extract" (constructed URLs via /extract)
+        or "search" (the original search-driven pipeline).
+
+        Normalized here rather than trusted from config so a typo'd env value
+        lands on the DEFAULT loudly instead of silently selecting a pipeline
+        by accident of string comparison.
+        """
+        mode = (getattr(self.config, "TAVILY_MODE", "") or "").strip().lower()
+        if mode in ("extract", "search"):
+            return mode
+        if mode:
+            logger.warning("Unknown TAVILY_MODE %r; using 'extract'", mode)
+        return "extract"
+
+    # Tavily /extract's documented per-request URL cap. The batching below
+    # chunks to it, so nothing else depends on the exact number.
+    _EXTRACT_URL_BATCH = 20
+
+    def _extract_pages(self, urls: Optional[List[str]], purpose: str = "") -> List[Dict[str, Any]]:
+        """Fetch page bodies via Tavily /extract, shaped like search results.
+
+        The extract-mode fetch primitive (August 2026 overhaul workaround):
+        /search serves whatever its index remembers — which for the
+        bot-protected review platforms was often NOTHING (results ranking
+        0.98+ arrived with raw_content of 0 chars) — while /extract fetches
+        the page live, so a URL we can NAME cannot be emptied by index rot.
+
+        Depth and format are PINNED, both measured 2026-09-02 on the same two
+        profile pages:
+
+          * extract_depth "basic" vs "advanced": byte-identical bodies
+            (43,928 and 18,303 chars) on healthgrades AND vitals, at half the
+            credits — advanced buys nothing here;
+          * format "markdown" vs "text": text STRIPS LINKS, which cost vitals
+            its rating outright (the pair lives in a `[4.2 30](#rating-overview)`
+            link — the anchor is all that separates it from any other
+            bracketed numbers) and would empty every listing row's
+            profile_url. Every parser in this repo was built against
+            markdown-shaped text.
+
+        Pinned explicitly rather than left to the vendor defaults they happen
+        to equal today — TAVILY_CHUNKS_PER_SOURCE sat on an unset vendor
+        default steering extraction for weeks, and a default flip here would
+        silently swap the parsers' input dialect.
+
+        Returned dicts carry the keys every downstream consumer reads
+        (url / title / content / raw_content / score). `content` is empty —
+        extract has no relevance-chunk sidecar; the excerpt path reads
+        raw_content. `score` is 1.0: a constructed URL is on-topic by
+        construction, and the relevance drop-floor must not touch it. Results
+        whose body came back empty are DROPPED (logged): downstream they
+        could only ever produce the "returned thin" failure a missing entry
+        states more honestly. Per-URL failures are logged and cost nothing
+        downstream but that page.
+        """
+        if not self.tavily_client:
+            return []
+        deduped: List[str] = []
+        seen = set()
+        for url in urls or []:
+            if url and url not in seen:
+                seen.add(url)
+                deduped.append(url)
+        shaped: List[Dict[str, Any]] = []
+        for start in range(0, len(deduped), self._EXTRACT_URL_BATCH):
+            chunk = deduped[start:start + self._EXTRACT_URL_BATCH]
+            for attempt in (1, 2):
+                try:
+                    response = self.tavily_client.extract(
+                        urls=chunk, extract_depth="basic", format="markdown"
+                    )
+                    get_cost_tracker().record_tavily_extract(
+                        len(chunk), agent="data_gatherer"
+                    )
+                    for item in response.get("results", []) or []:
+                        url = item.get("url", "")
+                        raw = item.get("raw_content") or ""
+                        if not url:
+                            continue
+                        if not raw:
+                            logger.warning(
+                                "Extract returned an empty body for %s%s",
+                                url, f" ({purpose})" if purpose else "",
+                            )
+                            continue
+                        shaped.append({
+                            "url": url,
+                            "title": url,
+                            "content": "",
+                            "raw_content": raw,
+                            "score": 1.0,
+                        })
+                    for failed in response.get("failed_results", []) or []:
+                        logger.warning(
+                            "Extract failed for %s: %s%s",
+                            failed.get("url"), failed.get("error"),
+                            f" ({purpose})" if purpose else "",
+                        )
+                    break
+                except Exception as e:
+                    if attempt == 1:
+                        logger.warning(
+                            f"Tavily extract failed (attempt 1), retrying: {e}"
+                        )
+                        time.sleep(2)
+                    else:
+                        logger.error(f"Tavily extract failed after retry: {e}")
+        logger.info(
+            "Extract fetched %d/%d page(s)%s",
+            len(shaped), len(deduped), f" ({purpose})" if purpose else "",
+        )
+        return shaped
+
+    def _extract_discovery_pages(
+        self, urls: List[str], purpose: str
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Fetch constructed listing pages, then every platform's later pages.
+
+        All three platforms serve 20-50 entries per page and the rest behind
+        their own page parameter (utils.platform_urls.listing_page_urls has
+        the measured shapes and the wrong-parameter trap). The first
+        extract-mode Space run fetched page 1 only: 20 of healthgrades' 81,
+        46 of webmd's 142, 45 of vitals' 142 for Chandler neurology — and
+        healthgrades' page 1 overlapped the webmd/vitals pool by four, so
+        nearly every card showed vitals + webmd and no healthgrades link,
+        with Dr. Kan Yu (on healthgrades page 2) carrying none at all.
+
+        Each page's own stated total decides how many more to fetch; nothing
+        is fetched speculatively, and all later pages ride in ONE extra
+        batch. Returns the pages and the extra URLs so the dev panel can list
+        what ran. Downstream, `_extract_provider_data` caps the merged page
+        list at 20 — three platforms × five pages sits under it; a ring city
+        on top can exceed it, in which case the cap drops the tail (the ring
+        fires only on a thin home pool, which pagination makes rare).
+        """
+        results = self._extract_pages(urls, purpose=purpose)
+        extra: List[str] = []
+        for result in results:
+            url = result.get("url", "")
+            count = listing_result_count(url, result.get("raw_content") or "")
+            extra.extend(listing_page_urls(url, count))
+        if extra:
+            results = results + self._extract_pages(
+                extra, purpose=f"{purpose}: later listing pages"
+            )
+        return results, extra
+
+    def _known_profile_urls(self, provider: Dict[str, Any]) -> List[str]:
+        """Every profile URL already ATTRIBUTED to this provider, one per platform.
+
+        Extract-mode enrichment fetches pages we can name instead of searching
+        for pages we hope rank. Sources, strongest first (first write per
+        domain wins, matching _harvest_profile_urls' never-overwrite rule):
+        `platform_profile_urls` (discovery-established + harvested), the
+        listing row's own `profile_url`, then observation `source_url`s — a
+        provider merged from rows on two city listings carries both platforms'
+        links in its observations even though `profile_url` holds only one.
+
+        PROFILE-kind pages on the review platforms only: a listing/index URL
+        names forty doctors, so fetching it here would hand the extractor a
+        directory under one provider's name — the exact page the
+        profile-over-listing rules exist to keep out of this pass.
+        """
+        known: Dict[str, str] = {}
+
+        def consider(url: Any) -> None:
+            domain = source_domain(url)
+            if not url or not domain or domain in known:
+                return
+            if not any(d in domain for d in _REVIEW_PLATFORM_DOMAINS):
+                return
+            if url_page_kind(url) != "profile":
+                return
+            known[domain] = url
+
+        for stored in (provider.get("platform_profile_urls") or {}).values():
+            consider(stored)
+        consider(provider.get("profile_url"))
+        for obs in provider.get("review_observations") or []:
+            consider(obs.get("source_url"))
+        return list(known.values())
+
     def _extract_provider_data(self, search_results: List[Dict[str, Any]], specialty: str, location: str) -> List[Dict[str, Any]]:
         """Extract structured provider data using Claude Haiku.
 
@@ -2163,6 +2390,15 @@ Response (JSON array only):"""
                 )
                 if placeholder and value not in empty:
                     survivor[key] = value
+
+            # Per-platform profile URLs UNION across the merge, because the
+            # scalar `profile_url` above is fill-if-empty and the survivor
+            # always has one — so the duplicate's platform (webmd, whose
+            # listing rows carry a URL but no pair) was silently lost. See
+            # _union_platform_profile_urls for the failure this fixed.
+            merged_urls = _union_platform_profile_urls(survivor, duplicate)
+            if merged_urls:
+                survivor["platform_profile_urls"] = merged_urls
 
             # `discovery_source` is the one field where the SURVIVOR's value is
             # the wrong answer. The survivor is chosen by field richness, not by
@@ -3438,41 +3674,63 @@ Response (JSON object only):"""
                 provider["enrichment_outcome"] = "failed"
                 return
 
-            # Query with the provider's OWN city when known — a Gilbert
-            # doctor surfaced by a Chandler search has Gilbert profile pages
-            provider_parts = parse_location(provider.get("location"))
-            if provider_parts.get("city") and provider_parts.get("state"):
-                query_location = f"{provider_parts['city']}, {provider_parts['state']}"
+            if self._tavily_mode() == "extract":
+                # Extract-mode enrichment: fetch the profile pages we can
+                # already NAME instead of searching for pages we hope rank.
+                # The August 2026 overhaul served this provider search's
+                # results at 0.98 relevance with EMPTY bodies, and for some
+                # names returned only platform homepages — 7 of 8 researched
+                # providers on the 2026-09-02 live Space run ended
+                # `no_profile_found` while their profiles sat fetchable via
+                # /extract. The URLs come off listing rows and the harvest,
+                # both already identity-checked, so no new trust enters. A
+                # provider with NO attributed URL gets an empty result set
+                # and the honest `no_profile_found` below — extract mode
+                # never falls back to a name search, because that is the
+                # broken path.
+                profile_urls = self._known_profile_urls(provider)
+                results = (
+                    self._extract_pages(
+                        profile_urls, purpose=f"enrichment: {provider_name}"
+                    )
+                    if profile_urls else []
+                )
             else:
-                query_location = location
+                # Query with the provider's OWN city when known — a Gilbert
+                # doctor surfaced by a Chandler search has Gilbert profile pages
+                provider_parts = parse_location(provider.get("location"))
+                if provider_parts.get("city") and provider_parts.get("state"):
+                    query_location = f"{provider_parts['city']}, {provider_parts['state']}"
+                else:
+                    query_location = location
 
-            # Name + city only. The specialty is deliberately NOT a retrieval
-            # term: portals file one doctor under adjacent labels, so asserting
-            # "Neurology" made healthgrades' Neurology DIRECTORY pages (other
-            # doctors) outrank the target's own Sleep-Medicine-labeled profile,
-            # which then fell under the relevance floor and vanished. It also
-            # pulled toward listing pages generally, fighting the
-            # profile-over-listing preference. Identity is still enforced —
-            # the specialty rides in the extraction prompt's IDENTITY CHECK,
-            # where "adjacent label" and "unrelated field" can be told apart,
-            # and _merge_review_data name-checks every observation in code.
-            query = f"{provider_name} reviews {query_location}"
-            logger.debug(f"Review enrichment search: {query}")
+                # Name + city only. The specialty is deliberately NOT a retrieval
+                # term: portals file one doctor under adjacent labels, so asserting
+                # "Neurology" made healthgrades' Neurology DIRECTORY pages (other
+                # doctors) outrank the target's own Sleep-Medicine-labeled profile,
+                # which then fell under the relevance floor and vanished. It also
+                # pulled toward listing pages generally, fighting the
+                # profile-over-listing preference. Identity is still enforced —
+                # the specialty rides in the extraction prompt's IDENTITY CHECK,
+                # where "adjacent label" and "unrelated field" can be told apart,
+                # and _merge_review_data name-checks every observation in code.
+                query = f"{provider_name} reviews {query_location}"
+                logger.debug(f"Review enrichment search: {query}")
 
-            # ONE platform-restricted advanced search. rating/review_count
-            # may only come from the independent platforms anyway, so the
-            # credits buy exactly those result slots — an open name query let
-            # SEO aggregators and practice sites crowd the extraction input,
-            # then needed a conditional rescue search when platforms didn't
-            # rank (two searches for less signal). Slots are 2x the platform
-            # count: at 5 the five domains contested five slots and a doctor
-            # present on three of them still came back single-sourced.
-            results = self._search_providers(
-                query, max_results=2 * len(_REVIEW_PLATFORM_DOMAINS),
-                include_raw_content=True,
-                include_domains=list(_REVIEW_PLATFORM_DOMAINS),
-                search_depth="advanced",
-            )
+                # ONE platform-restricted advanced search. rating/review_count
+                # may only come from the independent platforms anyway, so the
+                # credits buy exactly those result slots — an open name query let
+                # SEO aggregators and practice sites crowd the extraction input,
+                # then needed a conditional rescue search when platforms didn't
+                # rank (two searches for less signal). Slots are 2x the platform
+                # count: at 5 the five domains contested five slots and a doctor
+                # present on three of them still came back single-sourced.
+                results = self._search_providers(
+                    query, max_results=2 * len(_REVIEW_PLATFORM_DOMAINS),
+                    include_raw_content=True,
+                    include_domains=list(_REVIEW_PLATFORM_DOMAINS),
+                    search_depth="advanced",
+                )
 
             # STEP 3 of URL-primary identity: the profile URLs this provider
             # has on every platform, taken from the search we ALREADY ran.
@@ -3804,27 +4062,69 @@ Response (JSON object only):"""
             # the page body (raw content costs no extra Tavily credits).
             # Multi-query fans out several phrasings of the home city for
             # recall; a single query is the escape hatch.
-            if self.config.MULTI_QUERY_ENABLED:
-                home_specs = self._candidate_queries(safe_specialty, query_location)
-                search_results = self._discover_candidates(
-                    home_specs, self.config.MAX_PROVIDERS_PER_SEARCH
-                )
-                # Metadata carries one display string per CALL, with its
-                # domain restriction visible. The three discovery calls share
-                # one query string on purpose (one listing domain per call —
-                # the restriction rides in include_domains, not the text),
-                # and rendering the bare strings showed "three identical
-                # queries" in the dev panel — which photographs exactly like
-                # a triple-spend bug (owner run, 2026-08-09).
-                home_queries = [_describe_query_spec(spec) for spec in home_specs]
-            else:
-                home_queries = [self._build_search_query(safe_specialty, query_location, safe_insurance)]
-                search_results = self._search_providers(
-                    home_queries[0],
-                    max_results=self.config.MAX_PROVIDERS_PER_SEARCH,
-                    include_raw_content=True,
-                )
-            query = home_queries[0]  # representative query for metadata
+            fetch_mode = self._tavily_mode()
+            fetch_mode_fallback = False
+            home_queries: List[str] = []
+            search_results: List[Dict[str, Any]] = []
+
+            if fetch_mode == "extract":
+                # Extract-mode discovery: the city listing pages have
+                # DETERMINISTIC URLs, so construct them (utils/platform_urls
+                # carries the full failure story and the measurements) and
+                # fetch their bodies via /extract instead of asking a
+                # degraded search index to find them. Display strings carry
+                # the URLs so the dev panel shows exactly what was fetched.
+                constructed = discovery_listing_urls(safe_specialty, query_location)
+                home_queries = [f"extract: {u}" for u in constructed]
+                if constructed:
+                    search_results, later_pages = self._extract_discovery_pages(
+                        constructed, purpose="discovery"
+                    )
+                    home_queries.extend(f"extract: {u}" for u in later_pages)
+                if not search_results:
+                    # LOUD fallback, never silent: zero pages back means the
+                    # constructed slugs missed for this specialty/city or
+                    # every fetch failed, and a degraded search run still
+                    # beats an empty results page. The flag reaches
+                    # search_metadata so a fallback run cannot masquerade as
+                    # extract-mode evidence when reading a coverage panel.
+                    fetch_mode_fallback = True
+                    logger.warning(
+                        "Extract-mode discovery got no pages for %r / %r "
+                        "(%d constructed url(s)); falling back to search-mode "
+                        "discovery for this run",
+                        safe_specialty, query_location, len(constructed),
+                    )
+
+            if fetch_mode == "search" or fetch_mode_fallback:
+                if self.config.MULTI_QUERY_ENABLED:
+                    home_specs = self._candidate_queries(safe_specialty, query_location)
+                    search_results = self._discover_candidates(
+                        home_specs, self.config.MAX_PROVIDERS_PER_SEARCH
+                    )
+                    # Metadata carries one display string per CALL, with its
+                    # domain restriction visible. The three discovery calls share
+                    # one query string on purpose (one listing domain per call —
+                    # the restriction rides in include_domains, not the text),
+                    # and rendering the bare strings showed "three identical
+                    # queries" in the dev panel — which photographs exactly like
+                    # a triple-spend bug (owner run, 2026-08-09). On a fallback
+                    # run the extract URLs stay in front of these rows: the
+                    # panel then shows both what was attempted and what ran.
+                    home_queries = home_queries + [
+                        _describe_query_spec(spec) for spec in home_specs
+                    ]
+                else:
+                    single_query = self._build_search_query(
+                        safe_specialty, query_location, safe_insurance
+                    )
+                    home_queries = home_queries + [single_query]
+                    search_results = self._search_providers(
+                        single_query,
+                        max_results=self.config.MAX_PROVIDERS_PER_SEARCH,
+                        include_raw_content=True,
+                    )
+            query = home_queries[0] if home_queries else ""  # representative query for metadata
             queries_run = list(home_queries)
 
             providers: List[Dict[str, Any]] = []
@@ -3894,15 +4194,32 @@ Response (JSON object only):"""
                         # 3 basic vs 1 advanced per ring city (+1 credit,
                         # only when the ring fires); buys parser-readable
                         # in-domain pages.
-                        ring_specs = [
-                            spec
-                            for city in ring
-                            for spec in self._candidate_queries(safe_specialty, city)
-                        ]
-                        queries_run.extend(_describe_query_spec(spec) for spec in ring_specs)
-                        ring_results = self._discover_candidates(
-                            ring_specs, self.config.MAX_PROVIDERS_PER_SEARCH
-                        )
+                        if fetch_mode == "extract" and not fetch_mode_fallback:
+                            # Ring cities get the same constructed-URL
+                            # treatment as home: their listing pages are just
+                            # as nameable, and nearby_cities returns
+                            # "City, ST" strings that resolve exactly like
+                            # the home location does.
+                            ring_urls = [
+                                url
+                                for city in ring
+                                for url in discovery_listing_urls(safe_specialty, city)
+                            ]
+                            queries_run.extend(f"extract: {u}" for u in ring_urls)
+                            ring_results, ring_later = self._extract_discovery_pages(
+                                ring_urls, purpose="ring"
+                            )
+                            queries_run.extend(f"extract: {u}" for u in ring_later)
+                        else:
+                            ring_specs = [
+                                spec
+                                for city in ring
+                                for spec in self._candidate_queries(safe_specialty, city)
+                            ]
+                            queries_run.extend(_describe_query_spec(spec) for spec in ring_specs)
+                            ring_results = self._discover_candidates(
+                                ring_specs, self.config.MAX_PROVIDERS_PER_SEARCH
+                            )
                         if ring_results:
                             ring_providers = self._extract_provider_data(
                                 ring_results, safe_specialty, safe_location
@@ -3938,6 +4255,13 @@ Response (JSON object only):"""
                         "insurance": safe_insurance,
                         "total_found": 0,
                         "fhir_count": 0,
+                        # The zero-result page is exactly where "which fetch
+                        # pipeline ran, and did it fall back" matters most —
+                        # an empty pool in extract mode with fallback=True
+                        # means BOTH pipelines came up dry, a different
+                        # diagnosis from either alone.
+                        "fetch_mode": fetch_mode,
+                        "fetch_mode_fallback": fetch_mode_fallback,
                     },
                     "status": "no_results",
                     "message": "No providers found for the specified criteria"
@@ -3993,6 +4317,15 @@ Response (JSON object only):"""
                     "query": query,
                     "queries": queries_run,
                     "query_count": len(queries_run),
+                    # Which fetch pipeline this run actually used, and whether
+                    # extract mode fell back to search mid-run (zero pages
+                    # from the constructed URLs). Recorded because the two
+                    # pipelines have DIFFERENT failure modes — a coverage
+                    # panel read without knowing the mode diagnoses the wrong
+                    # layer, which is precisely what burned the 2026-09-02
+                    # outage triage.
+                    "fetch_mode": fetch_mode,
+                    "fetch_mode_fallback": fetch_mode_fallback,
                     # Same-platform profile URLs that proved two records are
                     # different people. Surfaced rather than only logged: this
                     # is the one dedupe rule that can CREATE a duplicate, so a

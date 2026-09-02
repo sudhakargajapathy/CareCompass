@@ -52,6 +52,24 @@ class Config:
         self.CHROMA_PERSIST_DIRECTORY: str = os.getenv("CHROMA_PERSIST_DIRECTORY", "./chroma_db")
         self.CHROMA_COLLECTION_NAME: str = os.getenv("CHROMA_COLLECTION_NAME", "healthcare_providers")
 
+        # How the gatherer FETCHES pages: "extract" (default) or "search".
+        #
+        # "extract" constructs the review platforms' own listing/profile URLs
+        # (utils/platform_urls) and pulls their bodies via Tavily /extract —
+        # no /search call anywhere in a normal run. Default since 2026-09-02:
+        # Tavily's August 2026 search overhaul degraded the search path three
+        # measured ways (relevance collapse on our listing queries,
+        # include_domains leaking off-domain at BOTH depths, results ranking
+        # 0.98+ with EMPTY raw_content while /extract returned the same pages
+        # whole), which shrank the Chandler pool ~100+ -> 38 and left 7 of 8
+        # enriched providers `no_profile_found` on the live Space.
+        #
+        # "search" is the original search-driven pipeline, kept intact as the
+        # rollback lever for when the index heals — an env flip, not a code
+        # change. Unknown values fall back to "extract" with a warning at the
+        # gatherer.
+        self.TAVILY_MODE: str = os.getenv("TAVILY_MODE", "extract").strip().lower()
+
         # Search Parameters
         try:
             self.DEFAULT_SEARCH_RADIUS: int = int(os.getenv("DEFAULT_SEARCH_RADIUS", "25"))
