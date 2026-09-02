@@ -92,8 +92,15 @@ _TRAILING_MILES = re.compile(
 # vitals glues the mileage straight onto the state: "Mesa, AZ9.8 mi".
 _GLUED_MILES = re.compile(r"([A-Z]{2})\d+(?:\.\d+)?\s*mi\b")
 
+# The href may be absolute OR host-relative. healthgrades writes page 1 of a
+# city directory with absolute profile links and pages 2+ (and the state-wide
+# directory) with `/physician/dr-kan-yu-2b5bc` — measured 2026-09-02 on
+# `neurology-directory/az-arizona/chandler_2` (20 entries, all relative) and
+# `neurology-directory/az-arizona` (584 results, all relative). Requiring the
+# scheme made every entry on those pages invisible: 0 rows from a 25 KB body.
+# `parse_listing` resolves the relative form against the page URL.
 _HG_HEADING = re.compile(
-    r"#{2,3}\s*\[(?P<name>[^\]\n]+)\]\((?P<url>https?://[^)\s]*?/physician/[^)\s#]+)[^)]*\)")
+    r"#{2,3}\s*\[(?P<name>[^\]\n]+)\]\((?P<url>(?:https?://[^)\s/]+)?/physician/[^)\s#]+)[^)]*\)")
 _WEBMD_HEADING = re.compile(
     r"#{2,3}\s*\[(?P<name>[^\]\n]+)\]\((?P<url>https?://[^)\s]*?/doctor/[^)\s#]+)[^)]*\)")
 _VITALS_HEADING = re.compile(
@@ -101,9 +108,22 @@ _VITALS_HEADING = re.compile(
     r"|(?P<bname>(?!\[)[^\n#][^\n]*?))\s*$",
     re.M)
 
+# `Rated 3.8 out of 5 3.8 from 88 ratings` on a city page — and
+# `Rated 4.7 out of 54.7from 48 ratings` on the state directory (2026-09-02),
+# where the echoed number is glued to both neighbours. The whitespace between
+# "5", the echo and "from" is therefore OPTIONAL: requiring it read 20 stated
+# pairs on the state page as zero.
 _HG_PAIR = re.compile(
-    r"Rated\s+(?P<rating>\d+(?:\.\d+)?)\s+out of 5\s+\d+(?:\.\d+)?\s+"
+    r"Rated\s+(?P<rating>\d+(?:\.\d+)?)\s+out of 5\s*\d+(?:\.\d+)?\s*"
     r"from\s+(?P<count>\d+)\s+ratings?", re.I)
+# State-directory entries state specialty and address on their own lines
+# rather than in the city page's `ratings <Specialty> [<address>]` tail.
+_HG_SPECIALTY_LINE = re.compile(r"^Specialty:\s*(?P<specialty>[^\n]+?)\s*$", re.M)
+_HG_ADDRESS_LINK = re.compile(
+    r"\[(?P<address>\d[^\]\n]{6,90}?\d{5})\]\((?:https?://[^)\s/]+)?/physician/")
+# `We found 81 results within 10 miles for "Neurologists near Chandler, AZ"` —
+# the page's own count of a directory that lists 20 per page.
+_HG_RESULT_COUNT = re.compile(r"We found\s*(?P<count>\d[\d,]*)\s*results", re.I)
 _HG_TAIL = re.compile(
     r"ratings?\s+(?P<specialty>[A-Z][A-Za-z /&'-]{2,40}?)\s*\[(?P<address>[^\]\n]+)\]", re.I)
 
@@ -247,20 +267,86 @@ def _blocks(text: str, heading: re.Pattern) -> List[Dict[str, Any]]:
     return out
 
 
+# webmd states its total twice on one page, differently: "Chandler, AZ has
+# **142 Neurologist** results …" (bold markers between the number and the
+# word) and, lower down, "85 providers"; vitals states "142 Neurologists in
+# Chandler, AZ" and a smaller "85 Neurologists" further down. Measured
+# 2026-09-02. The LARGEST stated total plans the pages: over-planning by one
+# page costs a fifth of a credit and the URL-first dedupe absorbs any repeat,
+# while under-planning silently drops doctors — the asymmetry decides.
+_WEBMD_RESULT_COUNTS = (
+    re.compile(r"(?P<count>\d[\d,]*)\s+\**[A-Za-z]+\**\s+results\b", re.I),
+    re.compile(r"(?P<count>\d[\d,]*)\s+providers\b", re.I),
+)
+_VITALS_RESULT_COUNT = re.compile(
+    r"(?P<count>\d[\d,]*)\s+(?:[A-Z][A-Za-z]+\s+){0,2}[A-Z][a-z]+(?:ists|ians|ers|ors|eons)\b")
+
+
+def healthgrades_result_count(text: str) -> Optional[int]:
+    """The directory's own result total, or None when the page states none."""
+    match = _HG_RESULT_COUNT.search(text or "")
+    if not match:
+        return None
+    return _int(match.group("count").replace(",", ""))
+
+
+def listing_result_count(url: str, text: str) -> Optional[int]:
+    """A city listing's stated result total, per platform, or None.
+
+    Drives pagination (utils.platform_urls.listing_page_urls): every platform
+    serves ~20-50 entries per page and the rest behind its own page
+    parameter, so page 1 alone read 20 of healthgrades' 81, 46 of webmd's
+    142 and 45 of vitals' 142 for Chandler neurology (2026-09-02).
+    """
+    lowered = str(url or "").lower()
+    body = text or ""
+    if "healthgrades.com" in lowered:
+        return healthgrades_result_count(body)
+    if "webmd.com" in lowered:
+        patterns = _WEBMD_RESULT_COUNTS
+    elif "vitals.com" in lowered:
+        patterns = (_VITALS_RESULT_COUNT,)
+    else:
+        return None
+    counts = [
+        _int(match.group("count").replace(",", ""))
+        for pattern in patterns for match in pattern.finditer(body)
+    ]
+    counts = [c for c in counts if c]
+    return max(counts) if counts else None
+
+
 def _parse_healthgrades(text: str) -> List[Dict[str, Any]]:
     rows = []
     for block in _blocks(text, _HG_HEADING):
-        pair = _HG_PAIR.search(block["body"])
-        if not pair:
-            continue
-        tail = _HG_TAIL.search(block["body"])
+        body = block["body"]
+        pair = _HG_PAIR.search(body)
+        tail = _HG_TAIL.search(body)
+        specialty_line = _HG_SPECIALTY_LINE.search(body)
+        address_link = _HG_ADDRESS_LINK.search(body)
+        # A block with NO pair is still a row. healthgrades renders pages 2+
+        # of a city directory as heading + photo only — no rating, no
+        # address — and dropping those entries dropped the doctor entirely:
+        # Dr. Kan Yu sat on `chandler_2` while his card showed no
+        # healthgrades page at all (2026-09-02). A name plus the platform's
+        # own profile link is exactly what extract-mode enrichment fetches;
+        # the rating then comes off the profile, as it does for every webmd
+        # row (49 rows, 0 pairs on the Chandler page).
         rows.append({
             "name": block["name"],
             "profile_url": block["profile_url"],
-            "rating": _float(pair.group("rating")),
-            "review_count": _int(pair.group("count")),
-            "specialty": (tail.group("specialty").strip() if tail else None),
-            "location": clean_address(tail.group("address")) if tail else None,
+            "rating": _float(pair.group("rating")) if pair else None,
+            "review_count": _int(pair.group("count")) if pair else None,
+            "specialty": (
+                tail.group("specialty").strip() if tail
+                else specialty_line.group("specialty").strip() if specialty_line
+                else None
+            ),
+            "location": (
+                clean_address(tail.group("address")) if tail
+                else clean_address(address_link.group("address")) if address_link
+                else None
+            ),
             "years_experience": None,
         })
     return rows

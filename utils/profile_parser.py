@@ -278,6 +278,69 @@ def _vitals_compare_pair(text: str) -> Tuple[Optional[float], Optional[int]]:
     return None, None
 
 
+_COMPARE_CELL_YEARS = re.compile(r"^(?P<years>\d+)\s+Years?\s+Experience$", re.I)
+_NAME_NOISE = {"dr", "md", "do", "phd", "np", "pa", "od", "dds", "dpm"}
+
+
+def _compare_subject_column(text: str) -> Optional[List[str]]:
+    """The subject's own column of a `## Compare with Similar Doctors` table.
+
+    Shared by vitals and webmd — the two platforms run on one backend and
+    ship the same comparison widget: a table of the subject plus three
+    neighbours whose LAST row reads `Current Profile` under the subject and
+    `View Profile` under everyone else. Identified structurally by that
+    marker, never by position (the subject happens to sit first on every
+    page measured, and "happens to" is not a rule).
+
+    Second guard, added for webmd (2026-09-02): the column's own name cell
+    must agree with the page H1. On a fetched page the marker is the only
+    thing separating the subject from a neighbour, and a neighbour's stars on
+    a card is the failure every identity rule in this repo exists to prevent.
+    A page without an H1 degrades to the structural rule alone.
+    """
+    section = _VITALS_COMPARE_SECTION.search(text)
+    if not section:
+        return None
+    rows = _table_rows(section.group("body"))
+    subject_index = None
+    for cells in rows:
+        for index, cell in enumerate(cells):
+            if _CURRENT_PROFILE_CELL.match(cell):
+                subject_index = index
+                break
+        if subject_index is not None:
+            break
+    if subject_index is None:
+        return None
+    column = [cells[subject_index] for cells in rows if subject_index < len(cells)]
+
+    page_name = _page_name(text)
+    if page_name:
+        def tokens(value: str) -> set:
+            return {t for t in re.findall(r"[a-z]+", value.lower()) if t not in _NAME_NOISE}
+        wanted = tokens(page_name)
+        seen = tokens(" ".join(column))
+        if wanted and len(wanted & seen) / len(wanted) < 0.5:
+            return None
+    return column
+
+
+def _compare_column_pair(column: List[str]) -> Tuple[Optional[float], Optional[int]]:
+    for cell in column:
+        pair = _VITALS_CELL_PAIR.match(cell)
+        if pair:
+            return _float(pair.group("rating")), _int(pair.group("count"))
+    return None, None
+
+
+def _compare_column_years(column: List[str]) -> Optional[int]:
+    for cell in column:
+        years = _COMPARE_CELL_YEARS.match(cell)
+        if years:
+            return _int(years.group("years"))
+    return None
+
+
 def _parse_healthgrades(text: str) -> Dict[str, Any]:
     neighbour = _HG_NEIGHBOUR_SECTION.search(text)
     own = text[:neighbour.start()] if neighbour else text
@@ -383,6 +446,26 @@ def _parse_webmd(text: str) -> Dict[str, Any]:
     years = _YEARS.search(header) or _WEBMD_FAQ_YEARS.search(text)
     if years:
         found["years_experience"] = _int(years.group("years"))
+
+    # THIRD source, weakest, structurally bound: the comparison table. A
+    # fetched webmd profile (Dr. Kan Yu, 2026-09-02, 10,511 chars via
+    # /extract) carried NO header card and NO FAQ restatement — its
+    # `## Ratings & Reviews` section read "No data" — while
+    # `## Compare with Similar Doctors` stated `4.5 (151 Ratings)` and
+    # `40 Years Experience` in the subject's column, the exact widget the
+    # vitals parser already reads. Consulted only when the page stated
+    # neither number elsewhere, so it can never overrule the header or FAQ.
+    if found.get("rating") is None and found.get("review_count") is None:
+        column = _compare_subject_column(text)
+        if column:
+            table_rating, table_count = _compare_column_pair(column)
+            if table_rating is not None and table_count is not None:
+                found["rating"] = table_rating
+                found["review_count"] = table_count
+            if found.get("years_experience") is None:
+                table_years = _compare_column_years(column)
+                if table_years is not None:
+                    found["years_experience"] = table_years
 
     locations = _webmd_locations(text)
     if locations:

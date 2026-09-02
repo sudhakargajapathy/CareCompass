@@ -15,6 +15,24 @@ from tests.fixtures.mock_api_responses import (
 
 
 @pytest.fixture(autouse=True)
+def pin_search_fetch_mode(monkeypatch):
+    """Pre-existing suite runs the SEARCH pipeline; extract tests opt in.
+
+    TAVILY_MODE defaulted to "extract" on 2026-09-02 (the August-overhaul
+    workaround), which would silently reroute every test that arranges search
+    results through `_search_providers` mocks — their arranged data would
+    never arrive and the assertions would fail describing the wrong defect.
+    Those tests describe the search pipeline, which remains shipped behavior
+    behind the knob, so they pin it. Extract-mode tests set
+    TAVILY_MODE=extract themselves (a later setenv in the test wins), and the
+    config-default test delenvs to see the real default. Works because
+    get_config() builds a fresh Config per call and gatherers snapshot it at
+    construction — inside the test, after this fixture.
+    """
+    monkeypatch.setenv("TAVILY_MODE", "search")
+
+
+@pytest.fixture(autouse=True)
 def isolate_provider_cache(monkeypatch, request):
     """Keep the unit suite away from the real ChromaDB on disk.
 
