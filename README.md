@@ -269,9 +269,16 @@ as such on every chip; a real Plan-Net endpoint plugs in via `FHIR_USE_MOCK=fals
 the same check live), and an observability layer — per-search Langfuse traces, a golden
 parser set, metamorphic CI, and scheduled canaries with a weekly drift report.
 
-**In development:** a ground-up **deep-agents** re-architecture (conversational care
-navigation, FastAPI + React). Candidate next steps for this codebase: real-time appointment
-availability, EHR integration, HIPAA compliance framework.
+**In development:** a ground-up **deep-agents** re-architecture — a conversational care
+navigation companion (FastAPI + React). The high-level architecture for v2: a supervisor
+plans each member's care journey and delegates to four specialized subagents deliberately
+split across two model families; every request clears a deterministic, no-AI safety gate
+before any model runs; and evals gate every change — safety measured, not asserted.
+
+![CareCompass v2 — Care Navigation Companion: high-level architecture](assets/v2-architecture-overview.svg)
+
+Candidate next steps for this codebase: real-time appointment availability, EHR
+integration, HIPAA compliance framework.
 
 ## 📄 License & data attribution
 
