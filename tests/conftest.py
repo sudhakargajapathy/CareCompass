@@ -14,6 +14,43 @@ from tests.fixtures.mock_api_responses import (
 )
 
 
+PLACEHOLDER_API_KEYS = {
+    "OPENAI_API_KEY": "test-placeholder-openai-key",
+    "APP_ANTHROPIC_API_KEY": "test-placeholder-anthropic-key",
+    "TAVILY_API_KEY": "test-placeholder-tavily-key",
+}
+
+
+@pytest.fixture(autouse=True)
+def placeholder_api_keys(monkeypatch):
+    """The suite runs on PLACEHOLDER keys — never the developer's, never none.
+
+    The first CI run (2026-09-12, the repository's first workflow) failed 87
+    tests with "Tavily/OpenAI/Anthropic API key not found in configuration":
+    the agents' constructors raise without a key string, and the suite had
+    only ever run on machines whose environment carried real keys — a
+    dependency the "no live API keys, no network" contract never admitted.
+    Pinning placeholders here does two things at once: a runner with no keys
+    passes, and a developer's REAL keys never reach a test, so a test that
+    accidentally makes a live call fails on a 401 instead of spending money.
+    Tests that need a key ABSENT (`mock_env_missing_*`) delete it after this
+    fixture runs; tests asserting specific values set their own.
+    """
+    for name, value in PLACEHOLDER_API_KEYS.items():
+        monkeypatch.setenv(name, value)
+    # Tracing is OFF for every test unless the test installs the fake client.
+    # The day the development sandbox gained the three LANGFUSE_* variables,
+    # the orchestrator tests started sending real traces to the owner's
+    # project: 14 "user" runs of "Obscure Specialty in Remote Location" at
+    # $0 and 50 ms sat in the weekly report's first dry run. A test never
+    # talks to a vendor, and the trace store is a vendor.
+    for name in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_BASE_URL", "LANGFUSE_TRACING_ENABLED"):
+        monkeypatch.delenv(name, raising=False)
+    from utils import tracing
+
+    tracing.reset_client()
+
+
 @pytest.fixture(autouse=True)
 def pin_search_fetch_mode(monkeypatch):
     """Pre-existing suite runs the SEARCH pipeline; extract tests opt in.

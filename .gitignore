@@ -112,3 +112,6 @@ npm-debug.log*
 # Generated coverage artifacts
 coverage.xml
 htmlcov/
+
+# Canary / watcher outputs (uploaded as CI artifacts, never committed)
+evals/out/

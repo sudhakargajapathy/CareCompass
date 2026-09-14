@@ -1,0 +1,155 @@
+# P2 drift watch — the Tier A fetch canary.
+#
+# Runs discovery for the scheduled canary cases against the LIVE web, on a
+# schedule, and fails the job on any finding so the run goes red and the
+# owner gets mail; the watcher mirrors each finding into a GitHub issue
+# (opened on breach, commented on while breached, closed on recovery). The
+# workflow carries the P1 vendor-health checks too — a separate P1 workflow
+# would be a second daily spend for the same probe — so the ISSUE TITLE is
+# what says the severity; the workflow name says the class it mostly
+# watches.
+#
+# Two schedules in one file, told apart by the day-of-week FIELD of the cron
+# GitHub hands the run: the incident case daily, the other three on the
+# Sunday cron (~3 credits each).
+# workflow_dispatch runs either schedule, or one case, by hand.
+#
+# Secrets: the three vendor keys (the gatherer constructs the Anthropic
+# client even though a healthy extract-mode run never calls it) and the
+# Langfuse trio so each case leaves a trace. The watcher needs only the
+# job's own GITHUB_TOKEN (issues: write below). `evals/out/` is uploaded as
+# an artifact — measurements, never page bodies.
+name: P2 drift watch — Tier A fetch canary
+
+on:
+  schedule:
+    - cron: "1 13 * * *"     # daily 13:00 UTC — the incident case
+    - cron: "31 13 * * 0"    # Sundays 13:30 UTC — the three weekly cases
+  workflow_dispatch:
+    inputs:
+      schedule:
+        description: "daily | weekly | all"
+        default: daily
+        type: choice
+        options: [daily, weekly, all]
+      case:
+        description: "run one case id instead of the schedule (optional)"
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: canary-tier-a
+  cancel-in-progress: false
+
+jobs:
+  fetch-canary:
+    name: Fetch canary + watcher
+    runs-on: ubuntu-latest
+    # Scheduled runs are OPT-IN per repository. This file ships verbatim to
+    # both the private dev repo and the public one, and only one of them
+    # should spend credits and open issues on a schedule: set the repository
+    # VARIABLE SCHEDULED_RUNS=true where the crons should fire (Settings →
+    # Secrets and variables → Actions → Variables). Unset, a scheduled
+    # trigger skips the job — a grey "skipped", never a red run or an email.
+    # A manual dispatch ALWAYS runs, so a repo without the flag can still be
+    # tested by hand — that is how the base-URL fix was proven on the dev
+    # repo. A variable rather than `github.repository == "<owner>/<name>"`:
+    # the name would hardcode one repo into a file the other repo carries,
+    # and a rename or fork would flip it silently; the flag is the owner's
+    # switch, no code change to move it.
+    if: github.event_name != 'schedule' || vars.SCHEDULED_RUNS == 'true'
+    timeout-minutes: 25
+    env:
+      ENV: ci
+      TAVILY_MODE: extract
+      PROVIDER_CACHE_TTL_DAYS: "0"
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+      APP_ANTHROPIC_API_KEY: ${{ secrets.APP_ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+      LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+      LANGFUSE_BASE_URL: ${{ vars.LANGFUSE_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The geo dataset is LFS-tracked and the radius bound reads it.
+          lfs: true
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Decide what to run
+        id: plan
+        # Inputs reach the shell through env, never inline in the script.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CRON: ${{ github.event.schedule }}
+          INPUT_SCHEDULE: ${{ github.event.inputs.schedule }}
+          INPUT_CASE: ${{ github.event.inputs.case }}
+        run: |
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            # Weekly = the Sunday cron (day-of-week field 0), detected by the
+            # FIELD rather than the whole string so a minute can be shifted in
+            # the web editor without touching this line. That edit matters:
+            # GitHub sends a scheduled workflow's failure mail to whoever last
+            # modified the cron syntax, and every commit here is the agent
+            # identity — the owner re-attributes it by editing the cron lines.
+            case "$CRON" in
+              *" 0") SCHEDULE=weekly ;;
+              *)     SCHEDULE=daily ;;
+            esac
+            ARGS="--schedule $SCHEDULE"
+          else
+            SCHEDULE="${INPUT_SCHEDULE:-daily}"
+            ARGS="--schedule $SCHEDULE"
+            if [ -n "$INPUT_CASE" ]; then ARGS="$ARGS --case $INPUT_CASE"; fi
+          fi
+          # The golden set is graded on the weekly run (and on "all"); the
+          # watcher then EXPECTS its grades, and reads the weekly report's
+          # freshness stamp on every run — the watchdog for the watcher.
+          GOLDEN=false
+          WATCH_ARGS="--tier A $ARGS --reports-dir reports"
+          if [ "$SCHEDULE" = "weekly" ] || [ "$SCHEDULE" = "all" ]; then
+            GOLDEN=true
+            WATCH_ARGS="$WATCH_ARGS --golden evals/out/golden.json"
+          fi
+          echo "args=$ARGS" >> "$GITHUB_OUTPUT"
+          echo "golden=$GOLDEN" >> "$GITHUB_OUTPUT"
+          echo "watch_args=$WATCH_ARGS" >> "$GITHUB_OUTPUT"
+          echo "Running: $ARGS (golden: $GOLDEN)"
+
+      - name: Run the fetch canary
+        run: python -m evals.canary_fetch ${{ steps.plan.outputs.args }}
+
+      - name: Grade the golden set against live pages
+        # Weekly: ~1 credit per 5 key URLs. Full bodies land in evals/out/
+        # (the private artifact below), grades in evals/out/golden.json.
+        if: always() && steps.plan.outputs.golden == 'true'
+        run: python -m evals.golden_check
+
+      - name: Evaluate, summarize, sync issues
+        # always(): a crashed canary is exactly what canary_did_not_run reports.
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python -m evals.watch ${{ steps.plan.outputs.watch_args }}
+
+      - name: Upload measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canary-tier-a-${{ github.run_id }}
+          path: evals/out/
+          if-no-files-found: ignore
+          retention-days: 90

@@ -22,6 +22,13 @@ streamlit-folium==0.15.0
 cryptography==42.0.0
 bcrypt==4.1.2
 psycopg2-binary==2.9.9
+# Observability: the Langfuse SDK for traces (accounts phase of the plan).
+# Pinned to the version the verification script — and later the
+# instrumentation — were written against: its 4.x API (start_observation /
+# create_score / get_trace_url) is not the 2.x one most examples online show.
+# Pulls opentelemetry-api/sdk/exporter-otlp-proto-http, backoff, wrapt;
+# `pip check` clean against every pin above (2026-09-12).
+langfuse==4.15.2
 
 # Testing dependencies
 pytest>=7.4.0

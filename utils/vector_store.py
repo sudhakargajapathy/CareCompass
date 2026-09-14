@@ -10,6 +10,7 @@ from openai import OpenAI
 import json
 
 from .config import get_config
+from . import tracing
 from .cost_tracker import get_cost_tracker, safe_usage
 from .encryption import get_encryptor
 from .provider_key import (
@@ -139,10 +140,18 @@ class ProviderVectorStore:
             List of embedding values
         """
         try:
-            response = self.openai_client.embeddings.create(
-                model=self.config.EMBEDDING_MODEL,
-                input=text
-            )
+            with tracing.generation(
+                "embeddings.single", model=self.config.EMBEDDING_MODEL, agent="vector_store",
+                params={"texts": 1},
+            ) as gen:
+                response = self.openai_client.embeddings.create(
+                    model=self.config.EMBEDDING_MODEL,
+                    input=text
+                )
+                tokens, _ = gen.finish(response, record_cost=False)
+            # Was never costed before the seam existed — the similarity path
+            # is off the main workflow, but a call is a call.
+            get_cost_tracker().record_embeddings(tokens, model=self.config.EMBEDDING_MODEL)
             return response.data[0].embedding
         except Exception as e:
             logger.error(f"Failed to get embedding: {e}")
@@ -158,11 +167,17 @@ class ProviderVectorStore:
             One embedding per input text, in input order
         """
         try:
-            response = self.openai_client.embeddings.create(
-                model=self.config.EMBEDDING_MODEL,
-                input=texts
-            )
-            tokens, _ = safe_usage(response)
+            with tracing.generation(
+                "embeddings.batch", model=self.config.EMBEDDING_MODEL, agent="vector_store",
+                params={"texts": len(texts)},
+            ) as gen:
+                response = self.openai_client.embeddings.create(
+                    model=self.config.EMBEDDING_MODEL,
+                    input=texts
+                )
+                # The cost tracker keeps embeddings in their own ledger, so the
+                # seam records usage on the span only (record_cost=False).
+                tokens, _ = gen.finish(response, record_cost=False)
             get_cost_tracker().record_embeddings(tokens, model=self.config.EMBEDDING_MODEL)
             # response.data is index-ordered to match the input list
             return [item.embedding for item in response.data]

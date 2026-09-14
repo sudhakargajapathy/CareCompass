@@ -1,6 +1,7 @@
 """Data Gatherer Agent for collecting healthcare provider information using Tavily search and FHIR."""
 
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from itertools import zip_longest
@@ -11,7 +12,8 @@ from tavily import TavilyClient
 from anthropic import Anthropic
 
 from utils.config import get_config
-from utils.cost_tracker import get_cost_tracker, safe_usage
+from utils import tracing
+from utils.cost_tracker import TAVILY_COST_PER_CREDIT, TAVILY_CREDITS_PER_SEARCH, get_cost_tracker, safe_usage
 from utils.excerpt import build_excerpt, clip_words
 from utils.json_salvage import salvage_json_objects
 from utils.listing_parser import (
@@ -1368,7 +1370,56 @@ class DataGathererAgent:
         # without the reset in `gather_providers` a contradiction from an
         # earlier search would be reported against the current one.
         self._identity_contradictions: List[Dict[str, Any]] = []
+        # Per-search fetch accounting for the run record (pages planned /
+        # fetched / empty / failed per stage and per platform, listing rows
+        # per platform, rows the specialty bound dropped). Reset beside the
+        # contradictions in `gather_providers`; enrichment workers update it
+        # concurrently, hence the lock. Before this existed the numbers that
+        # would have shown the 2026-09 fetch degradation in a day were logged
+        # and thrown away.
+        self._stats_lock = threading.Lock()
+        self._reset_run_stats()
         self._initialize_clients()
+
+    def _reset_run_stats(self) -> None:
+        with self._stats_lock:
+            self._fetch_stats: Dict[str, Dict[str, Any]] = {
+                stage: {"planned": 0, "fetched": 0, "empty": 0, "failed": 0, "by_domain": {}}
+                for stage in ("discovery", "enrichment")
+            }
+            self._listing_rows: Dict[str, int] = {}
+            self._specialty_rows_dropped = 0
+
+    def _note_fetch(
+        self, stage: str, planned: int = 0, fetched: int = 0, empty: int = 0,
+        failed: int = 0, pages: Optional[List[Tuple[str, bool]]] = None,
+    ) -> None:
+        stage = stage if stage in ("discovery", "enrichment") else "discovery"
+        with self._stats_lock:
+            slot = self._fetch_stats[stage]
+            slot["planned"] += planned
+            slot["fetched"] += fetched
+            slot["empty"] += empty
+            slot["failed"] += failed
+            for url, has_body in pages or []:
+                domain = source_domain(url) or "other"
+                per = slot["by_domain"].setdefault(domain, {"fetched": 0, "empty": 0})
+                per["fetched" if has_body else "empty"] += 1
+
+    def _note_listing_rows(self, url: Any, rows: int, dropped: int) -> None:
+        domain = source_domain(url) or "other"
+        with self._stats_lock:
+            self._listing_rows[domain] = self._listing_rows.get(domain, 0) + rows
+            self._specialty_rows_dropped += dropped
+
+    def fetch_stats(self) -> Dict[str, Any]:
+        """A copy of this search's fetch accounting (both stages), for the run record."""
+        with self._stats_lock:
+            return json.loads(json.dumps({
+                "fetch": self._fetch_stats,
+                "listing_rows": self._listing_rows,
+                "specialty_rows_dropped": self._specialty_rows_dropped,
+            }))
 
     def _initialize_clients(self) -> None:
         """Initialize Tavily, Anthropic, and optionally FHIR clients."""
@@ -1527,7 +1578,7 @@ class DataGathererAgent:
 
         return response_text.strip()
 
-    def _search_providers(self, query: str, max_results: int = 10, include_raw_content: bool = False, include_domains: Optional[List[str]] = None, search_depth: Optional[str] = None) -> List[Dict[str, Any]]:
+    def _search_providers(self, query: str, max_results: int = 10, include_raw_content: bool = False, include_domains: Optional[List[str]] = None, search_depth: Optional[str] = None, stage: str = "discovery") -> List[Dict[str, Any]]:
         """Search for providers using Tavily API.
 
         Args:
@@ -1583,15 +1634,31 @@ class DataGathererAgent:
         # become "Search failed" for the user (the whole workflow dies on []).
         for attempt in (1, 2):
             try:
-                response = self.tavily_client.search(**search_kwargs)
+                with tracing.tool("tavily.search", input={
+                    "query": query, "depth": effective_depth, "max_results": max_results,
+                    "include_domains": list(include_domains or []), "stage": stage,
+                    "attempt": attempt,
+                }) as call:
+                    response = self.tavily_client.search(**search_kwargs)
 
-                # Record the depth actually used, not the config value —
-                # advanced costs 2 credits and overrides would misprice.
-                get_cost_tracker().record_tavily(
-                    depth=effective_depth, agent="data_gatherer"
-                )
+                    # Record the depth actually used, not the config value —
+                    # advanced costs 2 credits and overrides would misprice.
+                    get_cost_tracker().record_tavily(
+                        depth=effective_depth, agent="data_gatherer", stage=stage
+                    )
 
-                results = response.get("results", [])
+                    results = response.get("results", [])
+                    empty = sum(1 for r in results if not (r.get("raw_content") or ""))
+                    self._note_fetch(
+                        stage, planned=max_results, fetched=len(results) - empty, empty=empty,
+                        pages=[(r.get("url", ""), bool(r.get("raw_content"))) for r in results],
+                    )
+                    credits = TAVILY_CREDITS_PER_SEARCH.get(effective_depth, 1)
+                    call.finish(output={
+                        "results": len(results), "empty_bodies": empty,
+                        "credits": credits,
+                        "pages": tracing.page_digest(results),
+                    }, cost_usd=credits * TAVILY_COST_PER_CREDIT)
                 logger.info(f"Found {len(results)} search results for query: {query}")
                 return results
 
@@ -1622,7 +1689,7 @@ class DataGathererAgent:
     # chunks to it, so nothing else depends on the exact number.
     _EXTRACT_URL_BATCH = 20
 
-    def _extract_pages(self, urls: Optional[List[str]], purpose: str = "") -> List[Dict[str, Any]]:
+    def _extract_pages(self, urls: Optional[List[str]], purpose: str = "", stage: str = "discovery") -> List[Dict[str, Any]]:
         """Fetch page bodies via Tavily /extract, shaped like search results.
 
         The extract-mode fetch primitive (August 2026 overhaul workaround):
@@ -1672,36 +1739,58 @@ class DataGathererAgent:
             chunk = deduped[start:start + self._EXTRACT_URL_BATCH]
             for attempt in (1, 2):
                 try:
-                    response = self.tavily_client.extract(
-                        urls=chunk, extract_depth="basic", format="markdown"
-                    )
-                    get_cost_tracker().record_tavily_extract(
-                        len(chunk), agent="data_gatherer"
-                    )
-                    for item in response.get("results", []) or []:
-                        url = item.get("url", "")
-                        raw = item.get("raw_content") or ""
-                        if not url:
-                            continue
-                        if not raw:
-                            logger.warning(
-                                "Extract returned an empty body for %s%s",
-                                url, f" ({purpose})" if purpose else "",
-                            )
-                            continue
-                        shaped.append({
-                            "url": url,
-                            "title": url,
-                            "content": "",
-                            "raw_content": raw,
-                            "score": 1.0,
-                        })
-                    for failed in response.get("failed_results", []) or []:
-                        logger.warning(
-                            "Extract failed for %s: %s%s",
-                            failed.get("url"), failed.get("error"),
-                            f" ({purpose})" if purpose else "",
+                    batch_pages: List[Dict[str, Any]] = []
+                    seen_pages: List[Tuple[str, bool]] = []
+                    empty_here = failed_here = 0
+                    with tracing.tool("tavily.extract", input={
+                        "url_count": len(chunk), "purpose": purpose, "stage": stage,
+                        "attempt": attempt,
+                    }) as call:
+                        response = self.tavily_client.extract(
+                            urls=chunk, extract_depth="basic", format="markdown"
                         )
+                        get_cost_tracker().record_tavily_extract(
+                            len(chunk), agent="data_gatherer", stage=stage
+                        )
+                        for item in response.get("results", []) or []:
+                            url = item.get("url", "")
+                            raw = item.get("raw_content") or ""
+                            if not url:
+                                continue
+                            seen_pages.append((url, bool(raw)))
+                            if not raw:
+                                empty_here += 1
+                                logger.warning(
+                                    "Extract returned an empty body for %s%s",
+                                    url, f" ({purpose})" if purpose else "",
+                                )
+                                continue
+                            page = {
+                                "url": url,
+                                "title": url,
+                                "content": "",
+                                "raw_content": raw,
+                                "score": 1.0,
+                            }
+                            shaped.append(page)
+                            batch_pages.append(page)
+                        for failed in response.get("failed_results", []) or []:
+                            failed_here += 1
+                            logger.warning(
+                                "Extract failed for %s: %s%s",
+                                failed.get("url"), failed.get("error"),
+                                f" ({purpose})" if purpose else "",
+                            )
+                        self._note_fetch(
+                            stage, planned=len(chunk), fetched=len(batch_pages),
+                            empty=empty_here, failed=failed_here, pages=seen_pages,
+                        )
+                        credits = -(-len(chunk) // 5)
+                        call.finish(output={
+                            "fetched": len(batch_pages), "empty_bodies": empty_here,
+                            "failed": failed_here, "credits": credits,
+                            "pages": tracing.page_digest(batch_pages),
+                        }, cost_usd=credits * TAVILY_COST_PER_CREDIT)
                     break
                 except Exception as e:
                     if attempt == 1:
@@ -1872,7 +1961,9 @@ class DataGathererAgent:
             unparsed: List[Dict[str, Any]] = []
             for result in prioritized_results:
                 rows = parse_listing(result.get("url"), result.get("raw_content") or "")
-                rows = [r for r in rows if _specialty_is_compatible(r.get("specialty"), specialty)]
+                kept = [r for r in rows if _specialty_is_compatible(r.get("specialty"), specialty)]
+                self._note_listing_rows(result.get("url"), len(rows), len(rows) - len(kept))
+                rows = kept
                 if rows:
                     parsed.extend(_listing_row_to_provider(r, specialty) for r in rows)
                 else:
@@ -2038,7 +2129,6 @@ OPTIONAL FIELDS:
 
 Response (JSON array only):"""
 
-            llm_started = time.perf_counter()
             # Scaled, floored at the old flat 8000 — see the constants'
             # comment. The floor is load-bearing: round 12's ceiling raise
             # existed because truncation is fatal here, and a formula that
@@ -2048,11 +2138,20 @@ Response (JSON array only):"""
                 _DISCOVERY_TOKENS_BASE + _DISCOVERY_TOKENS_PER_BLOCK * len(pages),
                 _DISCOVERY_TOKENS_MAX,
             ))
-            response = self.anthropic_client.messages.create(
-                model=self.config.GATHERER_MODEL,
-                max_tokens=output_budget,
-                messages=[{"role": "user", "content": prompt}]
-            )
+            with tracing.generation(
+                "discovery.extract", model=self.config.GATHERER_MODEL, agent="data_gatherer",
+                prompt=prompt, params={"max_tokens": output_budget, "blocks": len(pages)},
+            ) as gen:
+                response = self.anthropic_client.messages.create(
+                    model=self.config.GATHERER_MODEL,
+                    max_tokens=output_budget,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                response_text = response.content[0].text.strip()
+                gen.finish(
+                    response, output_text=response_text,
+                    stop_reason=getattr(response, "stop_reason", None),
+                )
 
             # Round 10 added this check to the ENRICHMENT extraction and not
             # here, though this is the call that raised its own ceiling because
@@ -2066,14 +2165,6 @@ Response (JSON array only):"""
                     "truncated; complete entries will be salvaged and only the "
                     "cut entry lost", output_budget
                 )
-
-            in_tokens, out_tokens = safe_usage(response)
-            get_cost_tracker().record_llm(
-                self.config.GATHERER_MODEL, in_tokens, out_tokens,
-                agent="data_gatherer", duration_s=time.perf_counter() - llm_started
-            )
-
-            response_text = response.content[0].text.strip()
 
             # Extract JSON from response using helper
             try:
@@ -2626,21 +2717,24 @@ SEARCH RESULTS:
 
 Response (JSON object only):"""
 
-            llm_started = time.perf_counter()
-            response = self.anthropic_client.messages.create(
-                model=self.config.GATHERER_MODEL,
-                # Six result blocks can yield a summary, six observations, an
-                # insurance list, tenure, phone and address. 1000 fitted the
-                # early two-block pass and was never revisited when the block
-                # count grew.
-                max_tokens=1500,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            in_tokens, out_tokens = safe_usage(response)
-            get_cost_tracker().record_llm(
-                self.config.GATHERER_MODEL, in_tokens, out_tokens,
-                agent="data_gatherer", duration_s=time.perf_counter() - llm_started
-            )
+            with tracing.generation(
+                "enrichment.extract", model=self.config.GATHERER_MODEL, agent="data_gatherer",
+                prompt=prompt, params={"max_tokens": 1500, "blocks": len(search_results)},
+            ) as gen:
+                response = self.anthropic_client.messages.create(
+                    model=self.config.GATHERER_MODEL,
+                    # Six result blocks can yield a summary, six observations, an
+                    # insurance list, tenure, phone and address. 1000 fitted the
+                    # early two-block pass and was never revisited when the block
+                    # count grew.
+                    max_tokens=1500,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                response_text = response.content[0].text.strip()
+                gen.finish(
+                    response, output_text=response_text,
+                    stop_reason=getattr(response, "stop_reason", None),
+                )
 
             # Same class of defect as the judge's unchecked `finish_reason`
             # (round 9): a truncated response fails to parse, the handler
@@ -2652,8 +2746,6 @@ Response (JSON object only):"""
                     "truncated and may not parse; observations may be lost",
                     provider_name,
                 )
-
-            response_text = response.content[0].text.strip()
 
             # Strip any code fence, then take the outermost {...} directly.
             # _extract_json_from_response is array-biased: on a bare object
@@ -3662,6 +3754,28 @@ Response (JSON object only):"""
         return providers
 
     def _enrich_one(self, provider: Dict[str, Any], location: str, specialty: str = "", user_location: str = "") -> None:
+        """One provider's enrichment as its own trace span (body: `_enrich_one_untraced`).
+
+        The span OWNS the worker thread while open, so the Tavily fetches and
+        the Haiku extraction it triggers nest under this provider instead of
+        landing on the step span as eight interleaved siblings — the
+        OpenTelemetry context the tracing SDK relies on does not follow a
+        ThreadPoolExecutor, and without this every worker's calls were orphans.
+        """
+        name = provider.get("name") or ""
+        with tracing.span("enrichment.provider", input={
+            "provider": name,
+            "known_profile_urls": len(self._known_profile_urls(provider)) if name else 0,
+        }) as unit:
+            self._enrich_one_untraced(provider, location, specialty, user_location)
+            unit.finish(output={
+                "outcome": provider.get("enrichment_outcome"),
+                "platform_pairs": provider.get("platform_pair_count"),
+                "profile_backed_platforms": provider.get("profile_backed_platforms"),
+                "sources": len(provider.get("enrichment_sources") or []),
+            })
+
+    def _enrich_one_untraced(self, provider: Dict[str, Any], location: str, specialty: str = "", user_location: str = "") -> None:
         """Run the review-enrichment search + extraction for a single provider.
 
         user_location is the ORIGINAL search location (with any ZIP), used to
@@ -3691,7 +3805,8 @@ Response (JSON object only):"""
                 profile_urls = self._known_profile_urls(provider)
                 results = (
                     self._extract_pages(
-                        profile_urls, purpose=f"enrichment: {provider_name}"
+                        profile_urls, purpose=f"enrichment: {provider_name}",
+                        stage="enrichment",
                     )
                     if profile_urls else []
                 )
@@ -3730,6 +3845,7 @@ Response (JSON object only):"""
                     include_raw_content=True,
                     include_domains=list(_REVIEW_PLATFORM_DOMAINS),
                     search_depth="advanced",
+                    stage="enrichment",
                 )
 
             # STEP 3 of URL-primary identity: the profile URLs this provider
@@ -4020,6 +4136,7 @@ Response (JSON object only):"""
             Dictionary containing providers list, search metadata, and status
         """
         self._identity_contradictions = []
+        self._reset_run_stats()
         try:
             # Validate and sanitize inputs first
             validation_result = validate_search_params(specialty, location, insurance)
@@ -4362,6 +4479,10 @@ Response (JSON object only):"""
                     "fhir_count": 0,
                     "tavily_count": len(providers),
                     "fhir_enabled": False,
+                    # Pages planned / fetched / empty / failed per stage and
+                    # platform, listing rows per platform — the run record's
+                    # discovery health, kept instead of logged.
+                    "fetch_stats": self.fetch_stats(),
                 },
                 "status": "success" if providers else "no_providers_extracted",
                 "message": f"Found {len(providers)} {safe_specialty} providers in {safe_location}"

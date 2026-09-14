@@ -5,12 +5,14 @@ import logging
 import random
 import re
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Any, Optional
 import json
 from openai import OpenAI
 
 from utils.config import get_config
+from utils import tracing
 from utils.cost_tracker import get_cost_tracker, safe_usage
 from utils.excerpt import SUMMARY_MAX_CHARS, clip_words
 from utils.json_salvage import salvage_json_objects
@@ -622,6 +624,11 @@ class PreferenceScorerAgent:
         """Initialize the preference scorer with OpenAI client."""
         self.config = get_config()
         self.openai_client = None
+        # Judge shard outcome for the run record: shards run on threads, so
+        # the truncation count is taken under a lock where it is detected.
+        self._judge_stats_lock = threading.Lock()
+        self._judge_truncations = 0
+        self._judge_shard_stats: Dict[str, int] = {}
         self._initialize_client()
 
     def _initialize_client(self) -> None:
@@ -665,7 +672,11 @@ class PreferenceScorerAgent:
                 review_count = provider.get("blended_review_count")
                 rating_basis = "cross_platform_blend"
             else:
-                rating = float(provider.get("rating", 0))
+                # None is "unrated", the same as the extractor's 0 placeholder:
+                # a metamorphic test that nulled a provider's rating crashed
+                # this node on float(None), and a null from an extraction
+                # shard is one JSON key away from a live search doing the same.
+                rating = _as_float(provider.get("rating")) or 0.0
                 review_count = provider.get("review_count", None)
                 rating_basis = "headline"
 
@@ -976,9 +987,12 @@ class PreferenceScorerAgent:
 
             ranked_providers = providers.copy()
             seen_indices: set = set()
+            with self._judge_stats_lock:
+                self._judge_truncations = 0
 
             if len(shards) <= 1:
                 entries = self._judge_shard(provider_summaries)
+                self._note_judge_shards(1, 1 if entries else 0)
                 seen_indices |= self._apply_judge_rankings(ranked_providers, entries, None)
             else:
                 logger.info(
@@ -988,6 +1002,7 @@ class PreferenceScorerAgent:
                 with ThreadPoolExecutor(max_workers=len(shards)) as executor:
                     futures = [executor.submit(self._judge_shard, shard) for shard in shards]
                     entries_per_shard = [future.result() for future in futures]
+                self._note_judge_shards(len(shards), sum(1 for e in entries_per_shard if e))
                 for shard, entries in zip(shards, entries_per_shard):
                     # An entry claiming an index this shard was never shown is
                     # a mis-binding, not a slip: the model can only have
@@ -1038,6 +1053,18 @@ class PreferenceScorerAgent:
             self.config.JUDGE_PARALLEL_ENABLED
             and provider_count >= _MIN_PROVIDERS_TO_SPLIT_JUDGE
         )
+
+    def _note_judge_shards(self, total: int, ok: int) -> None:
+        """Record this run's judge shard outcome for the run record.
+
+        `score_providers` copies it into `scoring_metadata["judge_shards"]`;
+        a truncated shard (finish_reason=length) is counted where it is
+        detected, inside the shard, under the same lock.
+        """
+        with self._judge_stats_lock:
+            self._judge_shard_stats = {
+                "total": total, "ok": ok, "truncated": self._judge_truncations,
+            }
 
     def _judge_shard(self, provider_summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Run ONE judge call over these provider records; return its entries.
@@ -1129,21 +1156,27 @@ Return ONLY a JSON array with one entry per provider:
             # is a ceiling and not a spend — and it makes the truncation this
             # comment describes strictly less likely per call.
             budget = _judge_token_budget(len(provider_summaries))
-            llm_started = time.perf_counter()
-            response = self.openai_client.chat.completions.create(
-                model=self.config.JUDGE_MODEL,
-                messages=[
-                    {"role": "system", "content": "You are a rigorous healthcare-provider evaluation judge. Score strictly against the given rubric with cited evidence."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_completion_tokens=budget,
-                reasoning_effort="low"
-            )
-            in_tokens, out_tokens = safe_usage(response)
-            get_cost_tracker().record_llm(
-                self.config.JUDGE_MODEL, in_tokens, out_tokens,
-                agent="preference_scorer", duration_s=time.perf_counter() - llm_started
-            )
+            with tracing.generation(
+                "judge.shard", model=self.config.JUDGE_MODEL, agent="preference_scorer",
+                prompt=prompt, params={
+                    "max_completion_tokens": budget, "reasoning_effort": "low",
+                    "providers": len(provider_summaries),
+                },
+            ) as gen:
+                response = self.openai_client.chat.completions.create(
+                    model=self.config.JUDGE_MODEL,
+                    messages=[
+                        {"role": "system", "content": "You are a rigorous healthcare-provider evaluation judge. Score strictly against the given rubric with cited evidence."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_completion_tokens=budget,
+                    reasoning_effort="low"
+                )
+                gen.finish(
+                    response,
+                    output_text=getattr(response.choices[0].message, "content", None) or "",
+                    stop_reason=getattr(response.choices[0], "finish_reason", None),
+                )
 
             # Nothing in this codebase checked finish_reason, so a response cut
             # off mid-array looked identical to a malformed one — and neither
@@ -1151,6 +1184,8 @@ Return ONLY a JSON array with one entry per provider:
             # change.
             finish_reason = getattr(response.choices[0], "finish_reason", None)
             if finish_reason == "length":
+                with self._judge_stats_lock:
+                    self._judge_truncations += 1
                 logger.error(
                     "Judge response hit the %s-token ceiling for %d providers and was "
                     "TRUNCATED. Whatever survives is salvaged below; raise the budget "
@@ -1422,6 +1457,7 @@ Return ONLY a JSON array with one entry per provider:
                     "total_providers": len(ranked_providers),
                     "preferences_used": preferences,
                     "scoring_method": "weighted_algorithm_with_ai",
+                    "judge_shards": dict(getattr(self, "_judge_shard_stats", {}) or {}),
                     "top_provider": ranked_providers[0]["name"] if ranked_providers else None,
                     "score_range": {
                         "highest": ranked_providers[0]["final_score"] if ranked_providers else 0,

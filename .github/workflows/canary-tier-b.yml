@@ -1,0 +1,123 @@
+# P1 vendor health — the Tier B pipeline canary, and the per-deploy smoke.
+#
+# Runs the FULL workflow (discovery, enrichment, judge, critic) for every
+# case that opts into Tier B, cold, exactly as a user search would — the
+# only monitor that sees the model-side failures: an empty shortlist, a
+# collapsed validation, a truncated judge, no_profile_found climbing, a
+# platform missing from every card, cost or latency out of band. Weekly,
+# because it costs ~$0.55 a case; real user runs are free canaries between.
+#
+# The same job doubles as the per-deploy smoke: dispatch it with
+# mode=smoke after a Space deploy and the run is tagged source:smoke so
+# the charts can tell "we just deployed" from "it is Sunday". The watcher
+# reads the same measurements either way and fails the job on a finding.
+name: P1 vendor health — Tier B pipeline canary
+
+on:
+  schedule:
+    - cron: "1 14 * * 0"     # Sundays 14:00 UTC, after the Tier A weekly run
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "canary (scheduled shape) | smoke (per-deploy check)"
+        default: smoke
+        type: choice
+        options: [canary, smoke]
+      case:
+        description: "run one case id (optional; smoke defaults to chandler-neurology)"
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: canary-tier-b
+  cancel-in-progress: false
+
+jobs:
+  pipeline-canary:
+    name: Pipeline canary + watcher
+    runs-on: ubuntu-latest
+    # Scheduled runs are OPT-IN per repository. This file ships verbatim to
+    # both the private dev repo and the public one, and only one of them
+    # should spend credits and open issues on a schedule: set the repository
+    # VARIABLE SCHEDULED_RUNS=true where the crons should fire (Settings →
+    # Secrets and variables → Actions → Variables). Unset, a scheduled
+    # trigger skips the job — a grey "skipped", never a red run or an email.
+    # A manual dispatch ALWAYS runs, so a repo without the flag can still be
+    # tested by hand — that is how the base-URL fix was proven on the dev
+    # repo. A variable rather than `github.repository == "<owner>/<name>"`:
+    # the name would hardcode one repo into a file the other repo carries,
+    # and a rename or fork would flip it silently; the flag is the owner's
+    # switch, no code change to move it.
+    if: github.event_name != 'schedule' || vars.SCHEDULED_RUNS == 'true'
+    timeout-minutes: 30
+    env:
+      ENV: ci
+      TAVILY_MODE: extract
+      PROVIDER_CACHE_TTL_DAYS: "0"
+      ANONYMIZED_TELEMETRY: "False"   # chromadb's posthog hook logs two ERRORs per run otherwise
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+      APP_ANTHROPIC_API_KEY: ${{ secrets.APP_ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+      LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+      LANGFUSE_BASE_URL: ${{ vars.LANGFUSE_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          lfs: true
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Decide what to run
+        id: plan
+        # Inputs reach the shell through env, never inline in the script.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+          INPUT_CASE: ${{ github.event.inputs.case }}
+        run: |
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            ARGS="--source canary"
+          else
+            MODE="${INPUT_MODE:-smoke}"
+            ARGS="--source $MODE"
+            CASE="$INPUT_CASE"
+            if [ "$MODE" = "smoke" ] && [ -z "$CASE" ]; then CASE=chandler-neurology; fi
+            if [ -n "$CASE" ]; then ARGS="$ARGS --case $CASE"; fi
+          fi
+          echo "args=$ARGS" >> "$GITHUB_OUTPUT"
+          echo "Running: $ARGS"
+
+      - name: Run the pipeline canary
+        run: python -m evals.canary_pipeline ${{ steps.plan.outputs.args }}
+
+      - name: Evaluate, summarize, sync issues
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLAN_ARGS: ${{ steps.plan.outputs.args }}
+        # The watcher takes the case filter only; --source is the canary's.
+        run: |
+          CASE=$(echo "$PLAN_ARGS" | sed -n 's/.*--case \([^ ]*\).*/\1/p')
+          if [ -n "$CASE" ]; then python -m evals.watch --tier B --case "$CASE"; else python -m evals.watch --tier B; fi
+
+      - name: Upload measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canary-tier-b-${{ github.run_id }}
+          path: evals/out/
+          if-no-files-found: ignore
+          retention-days: 90
