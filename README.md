@@ -87,12 +87,9 @@ flowchart LR
 ```
 
 The **Data Gatherer** fetches the **three independent patient-review platforms'** own pages
-directly: it constructs each platform's city-listing and profile URLs, pulls the page bodies
-via Tavily `/extract` (paginating by each platform's own rules), and reads them with
-deterministic per-platform parsers — LLM extraction (Claude Haiku 4.5) is the per-page
-fallback, and source provenance is recorded on every claim. The original search-driven
-discovery pipeline stays intact behind a single env flip (`TAVILY_MODE=search`) as a rollback
-lever. The **Preference Scorer** ranks with the blend
+directly via Tavily `/extract` and reads them with deterministic per-platform parsers — LLM
+extraction (Claude Haiku 4.5) is the per-page fallback, and source provenance is recorded on
+every claim. The **Preference Scorer** ranks with the blend
 below. The **Critic Validator** then challenges the whole ordering for bias, writes an
 evidence-cited verdict per provider, audits the judge's citations, and its findings refine the
 final ranking — deterministic post-processing, no added model calls.
@@ -276,9 +273,6 @@ split across two model families; every request clears a deterministic, no-AI saf
 before any model runs; and evals gate every change — safety measured, not asserted.
 
 ![CareCompass v2 — Care Navigation Companion: high-level architecture](assets/v2-architecture-overview.svg)
-
-Candidate next steps for this codebase: real-time appointment availability, EHR
-integration, HIPAA compliance framework.
 
 ## 📄 License & data attribution
 
