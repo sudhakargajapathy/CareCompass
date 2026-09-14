@@ -66,11 +66,20 @@ def safe_usage(response: Any) -> Tuple[int, int]:
     return 0, 0
 
 
-def _llm_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
+def llm_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
+    """List-price cost of one call, 0.0 for an unpriced model.
+
+    Public because the tracing seam writes the SAME figure to the trace's
+    cost field — two cost formulas is how the cost card and the trace start
+    disagreeing about one call.
+    """
     pricing = PRICING_PER_MTOK.get(model)
     if pricing is None:
         return 0.0
     return (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
+
+
+_llm_cost_usd = llm_cost_usd  # the private name callers used before the seam
 
 
 class CostTracker:
@@ -115,13 +124,19 @@ class CostTracker:
         if not entry["priced"]:
             logger.warning(f"No pricing entry for model {model}; cost recorded as $0")
 
-    def record_tavily(self, depth: str = "basic", agent: str = "") -> None:
-        """Record one Tavily search at the given depth."""
+    def record_tavily(self, depth: str = "basic", agent: str = "", stage: str = "discovery") -> None:
+        """Record one Tavily search at the given depth.
+
+        `stage` (discovery / enrichment) is what lets the run record split
+        the credit total the two passes share one ledger for.
+        """
         credits = TAVILY_CREDITS_PER_SEARCH.get(depth, 1)
         with self._lock:
-            self._tavily_searches.append({"depth": depth, "agent": agent, "credits": credits})
+            self._tavily_searches.append(
+                {"depth": depth, "agent": agent, "credits": credits, "stage": stage}
+            )
 
-    def record_tavily_extract(self, url_count: int, agent: str = "") -> None:
+    def record_tavily_extract(self, url_count: int, agent: str = "", stage: str = "discovery") -> None:
         """Record one Tavily /extract batch.
 
         Extract bills per URL, not per call: 1 credit per 5 URLs at basic
@@ -135,7 +150,7 @@ class CostTracker:
         credits = -(-count // 5)  # ceil(count / 5)
         with self._lock:
             self._tavily_searches.append(
-                {"depth": "extract", "agent": agent, "credits": credits, "urls": count}
+                {"depth": "extract", "agent": agent, "credits": credits, "urls": count, "stage": stage}
             )
 
     def record_embeddings(self, tokens: int, model: str = "text-embedding-3-small") -> None:
@@ -195,6 +210,10 @@ class CostTracker:
 
         llm_cost = sum(call["cost_usd"] for call in llm_calls)
         tavily_credits = sum(s["credits"] for s in tavily)
+        credits_by_stage: Dict[str, int] = {}
+        for s in tavily:
+            stage = s.get("stage") or "discovery"
+            credits_by_stage[stage] = credits_by_stage.get(stage, 0) + s["credits"]
         tavily_cost = tavily_credits * TAVILY_COST_PER_CREDIT
         embedding_cost = _llm_cost_usd(embedding_model, embedding_tokens, 0)
 
@@ -220,6 +239,7 @@ class CostTracker:
                 "searches": len(tavily),
                 "credits": tavily_credits,
                 "cost_usd": round(tavily_cost, 6),
+                "credits_by_stage": credits_by_stage,
             },
             "embeddings": {
                 "model": embedding_model,

@@ -1,0 +1,42 @@
+# The repository's first workflow (observability P1): the unit suite on
+# every push and pull request. No secrets are used or needed — the suite is
+# offline by design (mocked clients, tracing is a no-op without keys), so a
+# fork or a PR from anyone can run it. Canaries, which do spend, arrive as
+# their own workflow with their own schedule and secrets (P2).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-suite:
+    name: Unit suite (offline)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # data/us_zip_coords.csv.gz is LFS-tracked and the geo tests read
+          # it; a checkout without LFS objects leaves a pointer file and the
+          # suite goes red on "environmental" geo failures that are not.
+          lfs: true
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run the suite
+        # --no-cov: pytest.ini's addopts add coverage reports the CI run does
+        # not consume, and coverage doubles the wall time.
+        run: python -m pytest -q --no-cov -p no:cacheprovider

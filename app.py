@@ -186,6 +186,11 @@ def _start_search_job(orchestrator, search_params: Dict[str, Any]) -> Dict[str, 
     waiting) when the result is harvested in `_drain_search_job`.
     """
     updates: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+    # Captured HERE, on the script thread: st.context is request-bound and
+    # not visible from the worker. Coarse facts only (see the module).
+    from utils.client_context import capture_client_context
+
+    client = capture_client_context()
     pool = ThreadPoolExecutor(max_workers=1)
     future = pool.submit(
         orchestrator.execute_workflow_streaming,
@@ -194,6 +199,7 @@ def _start_search_job(orchestrator, search_params: Dict[str, Any]) -> Dict[str, 
         preferences=search_params["preferences"],
         progress_callback=updates.put,  # thread-safe; no Streamlit calls in workers
         use_cache=search_params.get("use_cache", True),
+        client=client,
     )
     return {
         "future": future,

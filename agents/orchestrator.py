@@ -12,7 +12,9 @@ from .preference_scorer import PreferenceScorerAgent
 from .critic_validator import CriticValidatorAgent, refine_rankings
 from utils.vector_store import get_vector_store
 from utils.config import get_config
+from utils import tracing
 from utils.cost_tracker import get_cost_tracker
+from utils.run_record import build_run_record
 from utils.provenance import url_page_kind
 
 logger = logging.getLogger(__name__)
@@ -124,6 +126,15 @@ class WorkflowState(TypedDict):
     # Workflow metadata
     current_step: str
     workflow_id: str
+    # One id joins the trace, the run record and the audit log; workflow_id
+    # is its 8-char display form. source (user / canary / eval / smoke) and
+    # case_id describe WHO ran it — the run record's descriptors.
+    run_id: str
+    run_source: str
+    case_id: Optional[str]
+    # Coarse visitor facts (country / region / timezone / locale, plus a
+    # salted visitor id for the trace only) — see utils.client_context.
+    client: Dict[str, Any]
     error_messages: List[str]
     execution_log: List[Dict[str, Any]]
 
@@ -242,6 +253,17 @@ class ProviderMatchingOrchestrator:
         state["execution_log"].append(log_entry)
         logger.info(f"Workflow step completed: {step} - {status}")
 
+        # The same seam opens and closes the step's trace span, so the
+        # timeline and the trace can never disagree about a step's bounds;
+        # nested steps (enrich_reviews inside score_providers) nest in the
+        # trace exactly as they nest here.
+        run = tracing.active_run()
+        if run is not None:
+            if status == "started":
+                run.step_started(step, details)
+            elif status in ("completed", "failed"):
+                run.step_finished(step, status, details)
+
     def _emit_progress(
         self,
         step_name: str,
@@ -308,9 +330,10 @@ class ProviderMatchingOrchestrator:
             state["error_messages"] = []
             state["execution_log"] = []
 
-            # Generate workflow ID
+            # Generate workflow ID unless the run already carries one (the
+            # execute paths pre-set it so the trace and the log share it)
             import uuid
-            state["workflow_id"] = str(uuid.uuid4())[:8]
+            state["workflow_id"] = state.get("workflow_id") or str(uuid.uuid4())[:8]
 
             self._log_step(state, "initialize", "completed", {
                 "workflow_id": state["workflow_id"],
@@ -502,6 +525,16 @@ class ProviderMatchingOrchestrator:
                     use_cache=state.get("use_cache", True),
                 )
                 enrich_elapsed = time.perf_counter() - enrich_started
+                # Both stages' fetch accounting, now that enrichment has run;
+                # gather_providers wrote the discovery half at its end.
+                fetch_stats = getattr(self.data_gatherer, "fetch_stats", None)
+                if callable(fetch_stats):
+                    try:
+                        stats = fetch_stats()
+                        if isinstance(stats, dict):
+                            state["gathered_data"].setdefault("search_metadata", {})["fetch_stats"] = stats
+                    except Exception as exc:  # accounting must never fail scoring
+                        logger.debug("fetch stats unavailable: %s", exc)
                 outcomes: Dict[str, int] = {}
                 for provider in selected:
                     key = str(provider.get("enrichment_outcome") or "unknown")
@@ -978,6 +1011,16 @@ class ProviderMatchingOrchestrator:
 
             state["workflow_summary"] = workflow_summary
 
+            # The run record: every health number of this run as one flat
+            # row, computed from the finished state. Attached to the trace
+            # as scores by the execute paths; rendered nowhere yet. The
+            # REFINED pool goes in: the critic's verdicts live on those
+            # copies only (see build_run_record).
+            try:
+                workflow_summary["run_record"] = build_run_record(state, providers=refined_providers, pipeline=True)
+            except Exception as exc:
+                logger.warning("Run record could not be built: %s", exc)
+
             self._log_step(state, "finalize_results", "completed", workflow_summary)
 
             self._emit_progress(
@@ -1087,7 +1130,161 @@ class ProviderMatchingOrchestrator:
             return "success"
         return "error"
 
-    def execute_workflow(self, specialty: str, location: str, insurance: Optional[str] = None, preferences: Optional[Dict[str, Any]] = None, use_cache: bool = True) -> Dict[str, Any]:
+    def _initial_state(
+        self,
+        specialty: str,
+        location: str,
+        insurance: Optional[str],
+        preferences: Optional[Dict[str, Any]],
+        use_cache: bool,
+        source: str,
+        case_id: Optional[str],
+        client: Optional[Dict[str, Any]] = None,
+    ) -> WorkflowState:
+        """The starting state, with the run id minted BEFORE the graph runs.
+
+        The trace is seeded from `run_id`, so it has to exist before the first
+        span; `_initialize_workflow` keeps a pre-set workflow_id rather than
+        minting a second one, which would have left the trace and the timeline
+        naming the same run two ways.
+        """
+        import uuid
+
+        run_id = uuid.uuid4().hex
+        return WorkflowState(
+            specialty=specialty,
+            location=location,
+            insurance=insurance,
+            preferences=preferences or {},
+            use_cache=use_cache,
+            gathered_data={},
+            scored_providers={},
+            validation_results={},
+            current_step="",
+            workflow_id=run_id[:8],
+            run_id=run_id,
+            run_source=source or "user",
+            case_id=case_id,
+            client=dict(client or {}),
+            error_messages=[],
+            execution_log=[],
+            final_recommendations=[],
+            workflow_summary={},
+        )
+
+    def _trace_args(self, state: WorkflowState) -> Dict[str, Any]:
+        """Root-trace input, metadata and tags for this run (descriptors only)."""
+        from utils.config import get_config
+        from utils.geo import parse_location
+
+        config = get_config()
+        preferences = state.get("preferences") or {}
+        parts = parse_location(str(state.get("location") or ""))
+        radius = preferences.get("search_radius_miles") or config.DEFAULT_SEARCH_RADIUS
+        source = state.get("run_source") or "user"
+        metadata = {
+            "run_id": state["run_id"],
+            "source": source,
+            "case_id": state.get("case_id"),
+            "git_sha": tracing.git_sha(),
+            "tavily_mode": config.TAVILY_MODE,
+            "gatherer_model": config.GATHERER_MODEL,
+            "judge_model": config.JUDGE_MODEL,
+            "critic_model": config.CRITIC_MODEL,
+            "budget": config.MAX_PROVIDERS_TO_ENRICH,
+            "radius_miles": radius,
+            "specialty": state.get("specialty"),
+            "city": parts.get("city"),
+            "state": parts.get("state"),
+        }
+        # The visitor's coarse facts ride on the trace: country/region/
+        # timezone/locale, and the salted visitor id — which stays HERE,
+        # private, and never enters the run record or the exported rows.
+        client = state.get("client") or {}
+        for key in ("country", "region", "timezone", "locale", "visitor"):
+            if client.get(key):
+                metadata[f"client_{key}" if key != "visitor" else "visitor"] = client[key]
+        tags = [f"source:{source}", f"mode:{config.TAVILY_MODE}"]
+        if state.get("case_id"):
+            tags.append(f"case:{state['case_id']}")
+        if client.get("country"):
+            tags.append(f"country:{client['country']}")
+        return {
+            "run_id": state["run_id"],
+            "input": {
+                "specialty": state.get("specialty"),
+                "location": state.get("location"),
+                "insurance": state.get("insurance"),
+                "preferences": preferences,
+            },
+            "metadata": metadata,
+            "tags": tags,
+        }
+
+    def _finish_run(self, run: Any, state: Optional[Dict[str, Any]], error: Optional[str] = None) -> None:
+        """Attach the run record to the trace and close it (no-op when untraced)."""
+        if run is None:
+            return
+        try:
+            state = state or {}
+            summary = state.get("workflow_summary") or {}
+            record = summary.get("run_record") if isinstance(summary, dict) else None
+            if not isinstance(record, dict):
+                record = build_run_record(state, pipeline=True)
+            output = {
+                "recommendations": len(state.get("final_recommendations") or []),
+                "providers_found": len((state.get("gathered_data") or {}).get("providers") or []),
+                "errors": len(state.get("error_messages") or []),
+                "cost_usd": (summary.get("cost_summary") or {}).get("total_usd") if isinstance(summary, dict) else None,
+            }
+            run.finish(record=record, output=output, error=error)
+        except Exception as exc:  # tracing must never fail the workflow
+            logger.warning("Closing the run trace failed: %s", exc)
+
+    @staticmethod
+    def _package_result(result: Dict[str, Any], run: Any = None) -> Dict[str, Any]:
+        validation_results = result.get("validation_results", {})
+        return {
+            "success": len(result.get("error_messages", [])) == 0,
+            "final_recommendations": result.get("final_recommendations", []),
+            "workflow_summary": result.get("workflow_summary", {}),
+            "cost_summary": result.get("workflow_summary", {}).get("cost_summary", {}),
+            "execution_log": result.get("execution_log", []),
+            "agent_outputs": {
+                "data_gatherer": result.get("gathered_data", {}),
+                "preference_scorer": result.get("scored_providers", {}),
+                "critic_validator": validation_results
+            },
+            "error_messages": result.get("error_messages", []),
+            "run_id": result.get("run_id"),
+            "trace_url": tracing.trace_url(run),
+        }
+
+    @staticmethod
+    def _failure_result(error: Exception, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return {
+            "success": False,
+            "final_recommendations": [],
+            "workflow_summary": {"workflow_failed": True, "error": str(error)},
+            "cost_summary": {},
+            "execution_log": [],
+            "agent_outputs": {},
+            "error_messages": [str(error)],
+            "run_id": (state or {}).get("run_id"),
+            "trace_url": None,
+        }
+
+    def execute_workflow(
+        self,
+        specialty: str,
+        location: str,
+        insurance: Optional[str] = None,
+        preferences: Optional[Dict[str, Any]] = None,
+        use_cache: bool = True,
+        source: str = "user",
+        case_id: Optional[str] = None,
+        client: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Execute the complete provider matching workflow.
 
         Args:
@@ -1095,63 +1292,32 @@ class ProviderMatchingOrchestrator:
             location: Location to search in
             insurance: Insurance type filter (optional)
             preferences: User preference weights (optional)
+            source: Who ran it — user (default), canary, eval, smoke
+            case_id: The canary/eval case name, when there is one
+            client: Coarse visitor facts from utils.client_context (optional)
 
         Returns:
             Dictionary containing workflow results and recommendations
         """
-        try:
-            logger.info(f"Starting provider matching workflow: {specialty} in {location}")
+        initial_state = self._initial_state(
+            specialty, location, insurance, preferences, use_cache, source, case_id, client
+        )
+        with tracing.start_run(**self._trace_args(initial_state)) as run:
+            try:
+                logger.info(f"Starting provider matching workflow: {specialty} in {location}")
 
-            # Create initial state
-            initial_state = WorkflowState(
-                specialty=specialty,
-                location=location,
-                insurance=insurance,
-                preferences=preferences or {},
-                use_cache=use_cache,
-                gathered_data={},
-                scored_providers={},
-                validation_results={},
-                current_step="",
-                workflow_id="",
-                error_messages=[],
-                execution_log=[],
-                final_recommendations=[],
-                workflow_summary={}
-            )
+                # Execute workflow
+                result = self.workflow.invoke(initial_state)
 
-            # Execute workflow
-            result = self.workflow.invoke(initial_state)
+                logger.info(f"Workflow completed with status: {result.get('workflow_summary', {}).get('overall_confidence', 'unknown')}")
 
-            logger.info(f"Workflow completed with status: {result.get('workflow_summary', {}).get('overall_confidence', 'unknown')}")
+                self._finish_run(run, result)
+                return self._package_result(result, run)
 
-            validation_results = result.get("validation_results", {})
-
-            return {
-                "success": len(result.get("error_messages", [])) == 0,
-                "final_recommendations": result.get("final_recommendations", []),
-                "workflow_summary": result.get("workflow_summary", {}),
-                "cost_summary": result.get("workflow_summary", {}).get("cost_summary", {}),
-                "execution_log": result.get("execution_log", []),
-                "agent_outputs": {
-                    "data_gatherer": result.get("gathered_data", {}),
-                    "preference_scorer": result.get("scored_providers", {}),
-                    "critic_validator": validation_results
-                },
-                "error_messages": result.get("error_messages", [])
-            }
-
-        except Exception as e:
-            logger.error(f"Workflow execution failed: {e}")
-            return {
-                "success": False,
-                "final_recommendations": [],
-                "workflow_summary": {"workflow_failed": True, "error": str(e)},
-                "cost_summary": {},
-                "execution_log": [],
-                "agent_outputs": {},
-                "error_messages": [str(e)]
-            }
+            except Exception as e:
+                logger.error(f"Workflow execution failed: {e}")
+                self._finish_run(run, initial_state, error=str(e))
+                return self._failure_result(e, initial_state)
 
     def execute_workflow_streaming(
         self,
@@ -1160,7 +1326,10 @@ class ProviderMatchingOrchestrator:
         insurance: Optional[str] = None,
         preferences: Optional[Dict[str, Any]] = None,
         progress_callback: Optional[ProgressCallback] = None,
-        use_cache: bool = True
+        use_cache: bool = True,
+        source: str = "user",
+        case_id: Optional[str] = None,
+        client: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Execute workflow with streaming progress updates.
 
@@ -1172,74 +1341,41 @@ class ProviderMatchingOrchestrator:
             insurance: Insurance type filter (optional)
             preferences: User preference weights (optional)
             progress_callback: Callback function for receiving progress updates
+            source / case_id: as in execute_workflow
 
         Returns:
             Dictionary containing workflow results and recommendations (same format as execute_workflow)
         """
         self.progress_callback = progress_callback
+        initial_state = self._initial_state(
+            specialty, location, insurance, preferences, use_cache, source, case_id, client
+        )
 
         try:
-            logger.info(f"Starting streaming workflow: {specialty} in {location}")
+            with tracing.start_run(**self._trace_args(initial_state)) as run:
+                try:
+                    logger.info(f"Starting streaming workflow: {specialty} in {location}")
 
-            # Create initial state (same as execute_workflow)
-            initial_state = WorkflowState(
-                specialty=specialty,
-                location=location,
-                insurance=insurance,
-                preferences=preferences or {},
-                use_cache=use_cache,
-                gathered_data={},
-                scored_providers={},
-                validation_results={},
-                current_step="",
-                workflow_id="",
-                error_messages=[],
-                execution_log=[],
-                final_recommendations=[],
-                workflow_summary={}
-            )
+                    # Execute workflow with streaming
+                    final_state = None
+                    for state_chunk in self.workflow.stream(initial_state):
+                        for step_name, step_state in state_chunk.items():
+                            if step_name not in ["__start__", "__end__"]:
+                                final_state = step_state
 
-            # Execute workflow with streaming
-            final_state = None
-            for state_chunk in self.workflow.stream(initial_state):
-                for step_name, step_state in state_chunk.items():
-                    if step_name not in ["__start__", "__end__"]:
-                        final_state = step_state
+                    if final_state is None:
+                        raise RuntimeError("Workflow stream did not produce final state")
 
-            if final_state is None:
-                raise RuntimeError("Workflow stream did not produce final state")
+                    result = final_state
+                    logger.info(f"Streaming workflow completed with status: {result.get('workflow_summary', {}).get('overall_confidence', 'unknown')}")
 
-            # Extract results (same format as execute_workflow)
-            result = final_state
-            validation_results = result.get("validation_results", {})
+                    self._finish_run(run, result)
+                    return self._package_result(result, run)
 
-            logger.info(f"Streaming workflow completed with status: {result.get('workflow_summary', {}).get('overall_confidence', 'unknown')}")
-
-            return {
-                "success": len(result.get("error_messages", [])) == 0,
-                "final_recommendations": result.get("final_recommendations", []),
-                "workflow_summary": result.get("workflow_summary", {}),
-                "cost_summary": result.get("workflow_summary", {}).get("cost_summary", {}),
-                "execution_log": result.get("execution_log", []),
-                "agent_outputs": {
-                    "data_gatherer": result.get("gathered_data", {}),
-                    "preference_scorer": result.get("scored_providers", {}),
-                    "critic_validator": validation_results
-                },
-                "error_messages": result.get("error_messages", [])
-            }
-
-        except Exception as e:
-            logger.error(f"Streaming workflow execution failed: {e}")
-            return {
-                "success": False,
-                "final_recommendations": [],
-                "workflow_summary": {"workflow_failed": True, "error": str(e)},
-                "cost_summary": {},
-                "execution_log": [],
-                "agent_outputs": {},
-                "error_messages": [str(e)]
-            }
+                except Exception as e:
+                    logger.error(f"Streaming workflow execution failed: {e}")
+                    self._finish_run(run, initial_state, error=str(e))
+                    return self._failure_result(e, initial_state)
         finally:
             self.progress_callback = None
 

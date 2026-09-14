@@ -180,3 +180,35 @@ class TestResearchBudgetDefaults:
         assert config.MIN_CANDIDATE_POOL == 5
         assert config.MAX_PROVIDERS_TO_ENRICH == 12
         assert config.ENRICHMENT_MAX_WORKERS == 4
+
+
+class TestSuiteRunsOnPlaceholderKeys:
+    def test_the_suite_never_sees_real_api_keys(self):
+        """CI has no keys and a developer's shell has real ones; the suite must
+        behave identically in both — so every test sees the same placeholders.
+        The first CI run failed 87 tests on the missing-key half of this."""
+        import os
+
+        from tests.conftest import PLACEHOLDER_API_KEYS
+
+        for name, placeholder in PLACEHOLDER_API_KEYS.items():
+            assert os.environ.get(name) == placeholder, name
+        assert Config().get_missing_keys() == []
+
+
+class TestSuiteNeverTraces:
+    def test_no_langfuse_client_can_be_built_under_the_suite(self):
+        """The trace store is a vendor. With the sandbox's real LANGFUSE_*
+        variables in the environment, orchestrator tests produced 14 real
+        "user" traces on the owner's project (2026-09-13) — every one a
+        mocked run of "Obscure Specialty in Remote Location" at $0. The
+        autouse fixture unsets the trio, so a test that wants tracing must
+        install the fake client on purpose."""
+        import os
+
+        from utils import tracing
+
+        for name in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_BASE_URL"):
+            assert os.environ.get(name) is None, name
+        assert tracing.get_client() is None
+

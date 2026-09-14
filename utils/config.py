@@ -23,6 +23,20 @@ class Config:
         self.ENV: str = os.getenv("ENV", "development")
         self.DEBUG: bool = os.getenv("DEBUG", "false").lower() == "true"
 
+        # Observability (Langfuse Cloud). ALL THREE must be present for tracing
+        # to switch on: the SDK defaults an unset host to its EU cloud, and a
+        # US project's traces sent there are invisible on the dashboard the
+        # owner opens — so a missing base URL disables tracing with a warning
+        # rather than defaulting. The trace ENVIRONMENT label is derived from
+        # ENV (tracing_environment()), never a fourth variable: one knob names
+        # the tier for the auth check, the traces and the run records.
+        self.LANGFUSE_PUBLIC_KEY: Optional[str] = os.getenv("LANGFUSE_PUBLIC_KEY")
+        self.LANGFUSE_SECRET_KEY: Optional[str] = os.getenv("LANGFUSE_SECRET_KEY")
+        self.LANGFUSE_BASE_URL: Optional[str] = os.getenv("LANGFUSE_BASE_URL")
+        # Salt for the visitor pseudonym on traces (utils.client_context).
+        # Unset = no visitor id at all; the raw IP is never stored either way.
+        self.VISITOR_HASH_SALT: Optional[str] = os.getenv("VISITOR_HASH_SALT")
+
         # Demo video (optional, display-only). A Loom share/embed link; when
         # set, app.py renders a "Watch the demo" expander above "How it
         # works". Unset means that expander does not EXIST — no placeholder,
@@ -341,6 +355,12 @@ class Config:
             bool: True if environment is production
         """
         return self.ENV.lower() == "production"
+
+    def tracing_environment(self) -> str:
+        """The Langfuse environment label: ENV, validated, else `development`."""
+        from utils.tracing import environment_label  # local: tracing imports config
+
+        return environment_label(self.ENV)
 
 
 def get_config() -> Config:

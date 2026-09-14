@@ -1701,7 +1701,7 @@ class TestInFlightSearchGuard:
 
         orchestrator = MagicMock()
 
-        def run(specialty, location, preferences, progress_callback, use_cache):
+        def run(specialty, location, preferences, progress_callback, use_cache, client=None):
             progress_callback({"agent_name": "DataGathererAgent",
                                "action": "searching", "progress_percentage": 30})
             progress_callback({"agent_name": "CriticValidatorAgent",
@@ -1716,8 +1716,9 @@ class TestInFlightSearchGuard:
         import app as app_module
 
         result = {"success": True, "final_recommendations": []}
+        orchestrator = self._fake_orchestrator(result)
         job = app_module._start_search_job(
-            self._fake_orchestrator(result),
+            orchestrator,
             {"specialty": "Neurology", "location": "Chandler, AZ",
              "preferences": {}, "use_cache": True},
         )
@@ -1726,6 +1727,10 @@ class TestInFlightSearchGuard:
         assert app_module._drain_search_job(job, status, progress) is result
         assert status.write.call_count >= 2, "progress must reach the widgets"
         assert job["pool"]._shutdown, "the worker pool is released on harvest"
+        # The visitor's coarse facts are captured on the script thread (where
+        # st.context is bound to the request) and handed to the worker; with
+        # no request in this process that is an empty dict, never an error.
+        assert orchestrator.execute_workflow_streaming.call_args.kwargs["client"] == {}
 
     def test_a_second_drain_of_the_same_job_reattaches(self):
         """The rerun path: the widgets die with the old script run, the job

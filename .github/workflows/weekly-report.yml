@@ -1,0 +1,81 @@
+# P3 cost & freshness — the weekly report.
+#
+# Pulls last week's run records from Langfuse (traces + scores, the public
+# API, the same three keys tracing uses), appends them as rows to
+# reports/run_records.jsonl — the system of record that outlives the
+# trace store's retention — renders reports/YYYY-Www.md, stamps
+# reports/latest.json, and commits all three. A failed pull is a red job,
+# which IS the "export failed" alert; the daily Tier A watcher reads the
+# stamp and raises P3 "report stale" when this job silently stops
+# (GitHub disables idle crons; the commit this job makes is the activity
+# that keeps every schedule alive).
+name: P3 cost & freshness — weekly report
+
+on:
+  schedule:
+    - cron: "1 6 * * 1"      # Mondays 06:00 UTC, covering the ISO week just ended
+  workflow_dispatch:
+    inputs:
+      weeks_back:
+        description: "1 = the last complete week (default); 0 = this week so far"
+        default: "1"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weekly-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    name: Export rows + render report
+    runs-on: ubuntu-latest
+    # Scheduled runs are OPT-IN per repository. This file ships verbatim to
+    # both the private dev repo and the public one, and only one of them
+    # should spend credits and open issues on a schedule: set the repository
+    # VARIABLE SCHEDULED_RUNS=true where the crons should fire (Settings →
+    # Secrets and variables → Actions → Variables). Unset, a scheduled
+    # trigger skips the job — a grey "skipped", never a red run or an email.
+    # A manual dispatch ALWAYS runs, so a repo without the flag can still be
+    # tested by hand — that is how the base-URL fix was proven on the dev
+    # repo. A variable rather than `github.repository == "<owner>/<name>"`:
+    # the name would hardcode one repo into a file the other repo carries,
+    # and a rename or fork would flip it silently; the flag is the owner's
+    # switch, no code change to move it.
+    if: github.event_name != 'schedule' || vars.SCHEDULED_RUNS == 'true'
+    timeout-minutes: 15
+    env:
+      LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+      LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+      LANGFUSE_BASE_URL: ${{ vars.LANGFUSE_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Export and render
+        env:
+          WEEKS_BACK: ${{ github.event.inputs.weeks_back }}
+        run: python -m evals.weekly_report --weeks-back "${WEEKS_BACK:-1}"
+
+      - name: Commit the report
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add reports/
+          if git diff --cached --quiet; then
+            echo "nothing new to commit"
+          else
+            git commit -m "report: weekly run records, $(date -u +%Y-%m-%d)"
+            git push
+          fi

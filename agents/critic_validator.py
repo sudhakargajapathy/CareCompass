@@ -19,6 +19,7 @@ from anthropic import Anthropic
 # is deliberate and acyclic: preference_scorer imports nothing from here.
 from agents.preference_scorer import JUDGE_RUBRIC
 from utils.config import get_config
+from utils import tracing
 from utils.cost_tracker import get_cost_tracker, safe_usage
 from utils.excerpt import SUMMARY_MAX_CHARS, clip_words
 from utils.provenance import source_domain
@@ -86,6 +87,12 @@ _MIN_PROVIDERS_TO_SPLIT_VALIDATION = 4
 
 # Least-to-most confident. Used to merge shards conservatively — see below.
 _CONFIDENCE_ORDER = ("low", "medium", "high")
+
+
+def _shard_failed(result: Any) -> bool:
+    """Whether a deep-validation shard returned its error fallback (run record)."""
+    validity = (result or {}).get("overall_ranking_validity") if isinstance(result, dict) else None
+    return str((validity or {}).get("status") or "") == "error"
 
 
 def _timed_call(label: str, fn, *args) -> tuple:
@@ -810,8 +817,11 @@ class CriticValidatorAgent:
             logger.warning(f"{context}: mechanical JSON repair insufficient ({e}); trying LLM repair")
 
         try:
-            llm_started = time.perf_counter()
-            response = self.anthropic_client.messages.create(
+            with tracing.generation(
+                "critic.json_repair", model="claude-haiku-4-5", agent="critic_validator",
+                prompt=json_text, params={"max_tokens": 6000},
+            ) as gen:
+              response = self.anthropic_client.messages.create(
                 model="claude-haiku-4-5",
                 max_tokens=6000,
                 messages=[{
@@ -825,11 +835,7 @@ class CriticValidatorAgent:
                     ),
                 }],
             )
-            in_tokens, out_tokens = safe_usage(response)
-            get_cost_tracker().record_llm(
-                "claude-haiku-4-5", in_tokens, out_tokens,
-                agent="critic_validator", duration_s=time.perf_counter() - llm_started
-            )
+              gen.finish(response, output_text=response.content[0].text)
             repaired = self._extract_json_from_response(response.content[0].text.strip())
             result = json.loads(repaired, strict=False)
             logger.info(f"{context}: JSON recovered via LLM repair")
@@ -1003,17 +1009,20 @@ Return ONLY the JSON object, nothing else."""
             # revert to Opus 4.8 (measured latency, identical price)
             # needed no new probe — this shape was built and probed on
             # 4.8, and both models pin the same way.
-            response = self.anthropic_client.messages.create(
-                model=self.config.CRITIC_MODEL,
-                max_tokens=2000,
-                thinking={"type": "disabled"},
-                messages=[{"role": "user", "content": prompt}]
-            )
-            in_tokens, out_tokens = safe_usage(response)
-            get_cost_tracker().record_llm(
-                self.config.CRITIC_MODEL, in_tokens, out_tokens,
-                agent="critic_validator", duration_s=time.perf_counter() - llm_started
-            )
+            with tracing.generation(
+                "critic.bias", model=self.config.CRITIC_MODEL, agent="critic_validator",
+                prompt=prompt, params={"max_tokens": 2000, "providers": len(ranked_providers)},
+            ) as gen:
+                response = self.anthropic_client.messages.create(
+                    model=self.config.CRITIC_MODEL,
+                    max_tokens=2000,
+                    thinking={"type": "disabled"},
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                gen.finish(
+                    response, output_text=response.content[0].text,
+                    stop_reason=getattr(response, "stop_reason", None),
+                )
 
             if getattr(response, "stop_reason", None) == "max_tokens":
                 logger.warning(
@@ -1175,6 +1184,7 @@ Return ONLY the JSON object, nothing else."""
                     "deep_1_of_1", self._validate_shard, validation_data
                 )
                 timing["providers"] = len(validation_data)
+                timing["failed"] = _shard_failed(result)
                 result["call_timings"] = [timing]
                 return result
 
@@ -1194,8 +1204,9 @@ Return ONLY the JSON object, nothing else."""
                     for i, shard in enumerate(shards)
                 ]
                 pairs = [future.result() for future in futures]
-                for (_, timing), shard in zip(pairs, shards):
+                for (shard_result, timing), shard in zip(pairs, shards):
                     timing["providers"] = len(shard)
+                    timing["failed"] = _shard_failed(shard_result)
                 merged = _merge_validation_shards([result for result, _ in pairs])
                 merged["call_timings"] = [timing for _, timing in pairs]
                 return merged
@@ -1324,17 +1335,20 @@ Be rigorous and evidence-bound — every verdict must survive the rubric above. 
             # `temperature` for this model (400), and a param rejection here
             # kills BOTH shards, which correctly-but-catastrophically empties
             # the shortlist via `not_critiqued`.
-            response = self.anthropic_client.messages.create(
-                model=self.config.CRITIC_MODEL,
-                max_tokens=budget,
-                thinking={"type": "disabled"},
-                messages=[{"role": "user", "content": prompt}]
-            )
-            in_tokens, out_tokens = safe_usage(response)
-            get_cost_tracker().record_llm(
-                self.config.CRITIC_MODEL, in_tokens, out_tokens,
-                agent="critic_validator", duration_s=time.perf_counter() - llm_started
-            )
+            with tracing.generation(
+                "critic.deep", model=self.config.CRITIC_MODEL, agent="critic_validator",
+                prompt=prompt, params={"max_tokens": budget, "providers": len(validation_data)},
+            ) as gen:
+                response = self.anthropic_client.messages.create(
+                    model=self.config.CRITIC_MODEL,
+                    max_tokens=budget,
+                    thinking={"type": "disabled"},
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                gen.finish(
+                    response, output_text=response.content[0].text,
+                    stop_reason=getattr(response, "stop_reason", None),
+                )
 
             # Nothing checked this, so a response cut off mid-array reported
             # itself as a generic parse failure — and round 13 raised the
