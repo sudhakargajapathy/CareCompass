@@ -27,7 +27,8 @@ the ranking before you ever see it.
 
 [**🎥 3-minute demo**](https://www.loom.com/share/d2d88b31b081442695655dac2b84627f) · [**🔗 Live Demo**](https://sudhakar1109-carecompass.hf.space/) · [**📐 Architecture deep-dive**](docs/ARCHITECTURE.md) · [**🧪 Testing**](#-testing)
 
-![Tests](https://img.shields.io/badge/tests-1%2C100%2B%20passing-2ea44f)
+[![CI](https://github.com/sudhakargajapathy/CareCompass/actions/workflows/ci.yml/badge.svg)](https://github.com/sudhakargajapathy/CareCompass/actions/workflows/ci.yml)
+![Tests](https://img.shields.io/badge/tests-1%2C500%2B%20passing-2ea44f)
 ![Python](https://img.shields.io/badge/python-3.11-3776AB?logo=python&logoColor=white)
 ![Streamlit](https://img.shields.io/badge/streamlit-1.59-FF4B4B?logo=streamlit&logoColor=white)
 ![LangGraph](https://img.shields.io/badge/langgraph-orchestrated-1C3C3C)
@@ -61,8 +62,12 @@ the ranking before you ever see it.
 - **Input allowlisting end to end** — every search field is selection-only (State → City → ZIP
   pickers from the same GeoNames dataset that computes distances); free text never reaches a
   query or a prompt
+- **Observability built in** — every search is one Langfuse trace carrying the run's health
+  record as scores; a golden set of real platform-page templates pins the parsers; metamorphic
+  invariants gate every pull request through keyless CI; scheduled canaries and a weekly drift
+  report watch the live pipeline
 - **Production hygiene** — an identity-keyed provider cache encrypted at rest, a per-search cost
-  card (a full search measures **≈ $0.50–0.60**), structured audit logging, and a 1,100+-test
+  card (a full search measures **≈ $0.50–0.60**), structured audit logging, and a 1,500+-test
   suite that runs fully mocked
 
 ## 🏗️ How it works
@@ -72,7 +77,7 @@ flowchart LR
     U(["Patient search:<br/>specialty · location · priorities"]) --> G
     subgraph LG["LangGraph orchestration — typed state · retries · live progress"]
         direction LR
-        G["<b>1 · Data Gatherer</b><br/>Claude Haiku 4.5 + Tavily<br/>live-web discovery & extraction"]
+        G["<b>1 · Data Gatherer</b><br/>platform pages via Tavily /extract<br/>parsers + Claude Haiku 4.5 fallback"]
         S["<b>2 · Preference Scorer</b><br/>deterministic core +<br/>GPT-5.6 Terra rubric judge"]
         C["<b>3 · Critic Validator</b><br/>Claude Opus 4.8<br/>bias check + verdicts"]
         G --> S --> C
@@ -81,10 +86,13 @@ flowchart LR
     G -.-> DB[("ChromaDB<br/>encrypted provider cache")]
 ```
 
-The **Data Gatherer** runs multi-query live-web discovery (with adaptive expansion to nearby
-cities when the home pool is thin), then enriches each candidate across **three independent
-patient-review platforms** — deterministic page parsers first, LLM extraction as the fallback,
-and source provenance recorded on every claim. The **Preference Scorer** ranks with the blend
+The **Data Gatherer** fetches the **three independent patient-review platforms'** own pages
+directly: it constructs each platform's city-listing and profile URLs, pulls the page bodies
+via Tavily `/extract` (paginating by each platform's own rules), and reads them with
+deterministic per-platform parsers — LLM extraction (Claude Haiku 4.5) is the per-page
+fallback, and source provenance is recorded on every claim. The original search-driven
+discovery pipeline stays intact behind a single env flip (`TAVILY_MODE=search`) as a rollback
+lever. The **Preference Scorer** ranks with the blend
 below. The **Critic Validator** then challenges the whole ordering for bias, writes an
 evidence-cited verdict per provider, audits the judge's citations, and its findings refine the
 final ranking — deterministic post-processing, no added model calls.
@@ -116,7 +124,7 @@ experience) shape the core; only the weights and the critic's evidence-bound ver
 
 | # | Agent | Model | What it does |
 |---|-------|-------|--------------|
-| 1 | **Data Gatherer** | Claude Haiku 4.5 | Live-web discovery, deterministic parsers + LLM-fallback extraction, cross-platform review enrichment, provenance on every claim |
+| 1 | **Data Gatherer** | Claude Haiku 4.5 | Fetches the platforms' own listing/profile pages via Tavily `/extract`; deterministic parsers with LLM fallback; cross-platform review enrichment; provenance on every claim |
 | 2 | **Preference Scorer** | GPT-5.6 Terra | Weighted deterministic core + rubric judge (`final_score = 0.7 × core + 0.3 × judge`) |
 | 3 | **Critic Validator** | Claude Opus 4.8 | Whole-ordering bias analysis, per-provider verdicts with cited evidence, an audit of the judge itself |
 
@@ -124,6 +132,47 @@ Everything the pipeline decides is visible in the UI: live agent progress, a per
 card, an execution timeline, a Responsible-AI panel, and an **"Other providers considered"**
 list naming every withheld provider and why. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 for the full walkthrough.
+
+## 🔁 Field-tested: design decisions from 30+ hardening rounds
+
+This system was iterated against **live searches**: find a real failure, root-cause it,
+redesign, and guard the fix with a test that fails without it. Ten decisions that came out
+of that loop:
+
+1. **Re-architected fetching when the vendor shifted.** When the search vendor overhauled
+   its index and relevance/domain filtering degraded, discovery moved from search queries to
+   constructing the review platforms' own URLs and fetching the pages directly — with the old
+   pipeline kept intact behind one env flip as a rollback lever. The candidate pool grew
+   50 → 120 providers, at lower cost.
+2. **Identity is enforced in code, never assumed.** A same-practice colleague once ranked in
+   a doctor's name search and nearly shared their ratings. URL-slug vetoes, page-stated-name
+   checks, and a state-level address gate now make it structurally hard to put a stranger's
+   stars on a card.
+3. **Unknown is unknown, not bad.** Missing data scores as explicit equivalences — no rating
+   scores the Bayesian prior itself; no tenure scores as a verified 10 years — and an
+   imputation can never out-rank a real measurement.
+4. **Equal weights are not equal influence.** Measuring realized score spans showed tenure
+   (one unshrunk scraped integer) carrying ~3× the leverage of ratings (twice-compressed
+   stars); the experience ramp was flattened to restore the intended balance.
+5. **An un-anchored rubric is not reproducible.** The AI judge scored identical evidence
+   differently across runs wherever its rubric left a gap — so the bands now tile the whole
+   range, absence of evidence has its own rung, and every cited quote must be on-topic for
+   the criterion it funds.
+6. **Silent truncation is a ranking bug.** Flat token ceilings cut model JSON mid-array with
+   no error — at one point deciding *who got recommended*. Output budgets now scale with
+   input size, truncation is detected, and complete entries are salvaged.
+7. **Same search, same answer.** Run-to-run instability traced to an unseeded anti-anchoring
+   shuffle; it is now seeded from the pool itself, and the cache ships under a "warm must
+   reproduce cold exactly" acceptance bar.
+8. **Free text never reaches a prompt.** Every search field became selection-only, drawn
+   from the same geographic dataset that computes distances — closing the last
+   prompt-injection surface at the UI.
+9. **Failure is a first-class screen.** A live outage once rendered a blank results page; a
+   zero-result run now says whose fault it was — system-side (retry) versus coverage (widen
+   the search) — and still renders the cost card.
+10. **Root-cause beats patching.** A text "flicker" survived three animation fixes because it
+    was never animation: opening a panel summoned the scrollbar and rewrapped every line of
+    text. One CSS property — `scrollbar-gutter: stable` — ended it.
 
 ## 🚀 Quick start (local)
 
@@ -182,14 +231,17 @@ permanently cold. Binary assets ship through Git LFS, which Spaces requires for 
 
 ## 🧪 Testing
 
-A 1,100+-test pytest suite with fully mocked clients — no live API keys, no network:
+A 1,500+-test pytest suite with fully mocked clients — no live API keys, no network:
 
 ```bash
 python -m pytest -q --no-cov
 ```
 
 The suite grew through 30+ documented field-test-and-fix rounds against live searches; every
-fix ships with a test that fails without it.
+fix ships with a test that fails without it. It includes a **golden set** of real
+platform-page templates (`evals/`) that pins every parser offline, and **metamorphic
+invariants** over the scoring core — monotonicity, imputation equivalences, order and scale
+invariance — that gate every pull request through keyless CI.
 
 ## 🔧 Under the hood
 
@@ -200,7 +252,8 @@ fix ships with a test that fails without it.
 | **anthropic** | Claude API client (extraction + critic) | 0.75.0 |
 | **openai** | GPT-5.6 Terra judge + embeddings | 2.14.0 |
 | **chromadb** | Vector store / encrypted provider cache | 0.4.18 |
-| **tavily-python** | Live-web search API | 0.7.26 |
+| **tavily-python** | Live-web page fetching + search | 0.7.26 |
+| **langfuse** | Optional tracing / observability | 4.15.2 |
 | **cryptography** | Fernet encryption at rest | 42.0.0 |
 
 **Model selection rationale:** Haiku 4.5 for fast, cost-effective extraction over many page
@@ -213,7 +266,8 @@ critical reasoning — deliberately a different model family than the judge it a
 cross-platform review blending, GeoNames-based geographic scoring, an insurance-directory
 verification prototype (FHIR network check — coverage is **simulated** in the demo and labeled
 as such on every chip; a real Plan-Net endpoint plugs in via `FHIR_USE_MOCK=false` and runs
-the same check live).
+the same check live), and an observability layer — per-search Langfuse traces, a golden
+parser set, metamorphic CI, and scheduled canaries with a weekly drift report.
 
 **In development:** a ground-up **deep-agents** re-architecture (conversational care
 navigation, FastAPI + React). Candidate next steps for this codebase: real-time appointment
