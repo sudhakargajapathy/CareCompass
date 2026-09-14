@@ -169,10 +169,39 @@ def _paged(fetch, **kwargs) -> Iterable[Any]:
         page += 1
 
 
-def fetch_rows(client: Any, start: datetime, end: datetime) -> List[Dict[str, Any]]:
-    """Every run in [start, end) as a row, via the public API."""
+def parse_environments(text: Optional[str]) -> List[str]:
+    """A comma/space-separated list of trace environment labels → lowercase, deduped, in order; [] = all."""
+    out: List[str] = []
+    for part in (text or "").replace(",", " ").split():
+        label = part.strip().lower()
+        if label and label not in out:
+            out.append(label)
+    return out
+
+
+def fetch_rows(client: Any, start: datetime, end: datetime,
+               environments: Optional[Sequence[str]] = None) -> List[Dict[str, Any]]:
+    """Every run in [start, end) as a row, via the public API.
+
+    `environments` narrows the pull to traces whose environment label is in
+    the list. Two Spaces (a private one and the public one) write to ONE
+    Langfuse project with the same keys, and each repository's report must
+    carry only its own Space's traffic — the private Space's searches must
+    not be exported into the public repo's rows, nor the public Space's
+    into the private one. The API filters server-side, and every row is
+    checked AGAIN here: a filter the server ignored (an older deployment,
+    a renamed parameter) would otherwise export the other Space's rows
+    into a public file with nothing red to show for it. Empty = all, the
+    pre-filter behaviour.
+    """
+    wanted = {label.lower() for label in (environments or []) if label}
+    kwargs: Dict[str, Any] = dict(name=ROOT_NAME, from_timestamp=start, to_timestamp=end)
+    if wanted:
+        kwargs["environment"] = sorted(wanted)
     rows: List[Dict[str, Any]] = []
-    for trace in _paged(client.api.trace.list, name=ROOT_NAME, from_timestamp=start, to_timestamp=end):
+    for trace in _paged(client.api.trace.list, **kwargs):
+        if wanted and str(getattr(trace, "environment", "") or "").lower() not in wanted:
+            continue
         scores = list(_paged(client.api.scores.get_many, trace_id=trace.id))
         row = row_from_trace(trace, scores)
         if row is not None and is_run(row):
@@ -216,13 +245,15 @@ def append_rows(path: Path, rows: Sequence[Mapping[str, Any]]) -> Tuple[int, int
     return added, skipped
 
 
-def write_latest(directory: Path, label: str, added: int, total: int, now: Optional[datetime] = None) -> Path:
+def write_latest(directory: Path, label: str, added: int, total: int, now: Optional[datetime] = None,
+                 environments: Optional[Sequence[str]] = None) -> Path:
     path = Path(directory) / LATEST_FILE
     path.write_text(json.dumps({
         "generated_at": (now or datetime.now(timezone.utc)).isoformat(timespec="seconds"),
         "week": label,
         "rows_added": added,
         "rows_total": total,
+        "environments": list(environments or []),  # [] = every environment was exported
     }, indent=2) + "\n", encoding="utf-8")
     return path
 
@@ -297,14 +328,20 @@ def _latest_per_case(rows: Sequence[Mapping[str, Any]], source: str, pipeline: b
     return out
 
 
+def environments_scope(environments: Optional[Sequence[str]]) -> str:
+    return (f"Traces filtered to environment(s) {', '.join(environments)}." if environments
+            else "All environments.")
+
+
 def render_report(label: str, start: datetime, end: datetime, rows: Sequence[Mapping[str, Any]],
-                  generated_at: Optional[datetime] = None, history: Optional[Sequence[Mapping[str, Any]]] = None) -> str:
+                  generated_at: Optional[datetime] = None, history: Optional[Sequence[Mapping[str, Any]]] = None,
+                  environments: Optional[Sequence[str]] = None) -> str:
     when = (generated_at or datetime.now(timezone.utc)).strftime("%Y-%m-%d %H:%M UTC")
     out: List[str] = [
         f"# CareCompass weekly report — {label}",
         "",
         f"Runs from {start:%Y-%m-%d} to {(end - timedelta(days=1)):%Y-%m-%d} (UTC), generated {when}. "
-        f"Aggregates only; the rows are in `{ROWS_FILE}`.",
+        f"Aggregates only; the rows are in `{ROWS_FILE}`. {environments_scope(environments)}",
         "",
         "## Runs",
         "",
@@ -416,20 +453,27 @@ def render_report(label: str, start: datetime, end: datetime, rows: Sequence[Map
 def _client(env: Mapping[str, str]) -> Any:
     from langfuse import Langfuse
 
+    # Stripped, like utils.tracing does: the public repo's LANGFUSE_BASE_URL
+    # variable arrived with a trailing space (visible in the first armed
+    # run's log), which the canaries survived only because tracing strips —
+    # passed raw, the host " " would have failed every API call here and
+    # turned the first Monday report red.
     return Langfuse(
-        public_key=env["LANGFUSE_PUBLIC_KEY"], secret_key=env["LANGFUSE_SECRET_KEY"],
-        base_url=env["LANGFUSE_BASE_URL"], tracing_enabled=False,
+        public_key=env["LANGFUSE_PUBLIC_KEY"].strip(), secret_key=env["LANGFUSE_SECRET_KEY"].strip(),
+        base_url=env["LANGFUSE_BASE_URL"].strip(), tracing_enabled=False,
     )
 
 
 def generate(client: Any, out_dir: Path, weeks_back: int = 1, now: Optional[datetime] = None,
-             dry_run: bool = False) -> Dict[str, Any]:
+             dry_run: bool = False, environments: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     now = now or datetime.now(timezone.utc)
+    environments = list(environments or [])
     start, end, label = week_bounds(now, weeks_back)
-    rows = fetch_rows(client, start, end)
+    rows = fetch_rows(client, start, end, environments)
     history = read_rows(Path(out_dir) / ROWS_FILE)
-    text = render_report(label, start, end, rows, now, history=history)
-    result: Dict[str, Any] = {"week": label, "start": start, "end": end, "rows": len(rows), "report": text}
+    text = render_report(label, start, end, rows, now, history=history, environments=environments)
+    result: Dict[str, Any] = {"week": label, "start": start, "end": end, "rows": len(rows), "report": text,
+                              "environments": environments}
     if dry_run:
         return result
     out_dir = Path(out_dir)
@@ -437,7 +481,7 @@ def generate(client: Any, out_dir: Path, weeks_back: int = 1, now: Optional[date
     added, skipped = append_rows(out_dir / ROWS_FILE, rows)
     (out_dir / f"{label}.md").write_text(text, encoding="utf-8")
     total = len(read_rows(out_dir / ROWS_FILE))
-    write_latest(out_dir, label, added, total, now)
+    write_latest(out_dir, label, added, total, now, environments)
     result.update(added=added, skipped=skipped, total=total, report_path=str(out_dir / f"{label}.md"))
     return result
 
@@ -450,13 +494,18 @@ def main(argv: Optional[Sequence[str]] = None, env: Optional[Mapping[str, str]] 
     parser.add_argument("--weeks-back", type=int, default=1, help="1 = the last complete ISO week (default); 0 = this week so far")
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_DIR)
     parser.add_argument("--dry-run", action="store_true", help="print the report; write nothing")
+    parser.add_argument("--environments", default=None,
+                        help="comma-separated trace environment labels to export (default: the REPORT_ENVIRONMENTS "
+                             "variable; unset or empty = every environment)")
     args = parser.parse_args(argv)
+    environments = parse_environments(args.environments if args.environments is not None
+                                      else env.get("REPORT_ENVIRONMENTS"))
     missing = [k for k in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_BASE_URL") if not env.get(k)]
     if missing:
         print(f"weekly report: missing {', '.join(missing)}", file=sys.stderr)
         return 2
     try:
-        result = generate(_client(env), args.out_dir, args.weeks_back, dry_run=args.dry_run)
+        result = generate(_client(env), args.out_dir, args.weeks_back, dry_run=args.dry_run, environments=environments)
     except Exception as exc:  # the red job IS the alert
         print(f"weekly report: export failed — {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
@@ -464,7 +513,8 @@ def main(argv: Optional[Sequence[str]] = None, env: Optional[Mapping[str, str]] 
         print(result["report"])
     else:
         print(f"week {result['week']}: {result['rows']} run(s) pulled, {result['added']} row(s) added "
-              f"({result['skipped']} already exported), {result['total']} total → {result['report_path']}")
+              f"({result['skipped']} already exported), {result['total']} total → {result['report_path']} "
+              f"[{environments_scope(environments)}]")
     return 0
 
 

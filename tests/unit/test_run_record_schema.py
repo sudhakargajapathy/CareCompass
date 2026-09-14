@@ -208,6 +208,12 @@ class TestLangfuseHelloWorld:
         assert ("end", "carecompass.p0_verify") in client.log
         assert ("end", "hello_world") in client.log
 
+    def test_a_pasted_trailing_space_never_reaches_the_host(self, fake_langfuse):
+        # The public repo's LANGFUSE_BASE_URL variable arrived with a trailing
+        # space; a host ending in " " fails every call. Stripped, like tracing.
+        p0_verify.verify_langfuse({**_LF_ENV, "LANGFUSE_BASE_URL": _LF_ENV["LANGFUSE_BASE_URL"] + " "}, "run-9", None)
+        assert fake_langfuse.instances[0].kw["base_url"] == "https://us.cloud.langfuse.com"
+
     def test_rejected_keys_fail_before_any_span_is_opened(self, fake_langfuse):
         class Rejecting(_FakeLangfuse):
             def __init__(self, **kw):

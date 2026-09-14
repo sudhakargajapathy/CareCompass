@@ -50,6 +50,12 @@ jobs:
       LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
       LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
       LANGFUSE_BASE_URL: ${{ vars.LANGFUSE_BASE_URL }}
+      # Which trace environments this repository's report exports, as a
+      # comma-separated list of labels (a repository VARIABLE). Two Spaces
+      # write to ONE Langfuse project: the public repo sets the public
+      # Space's label plus "ci" (e.g. "demo,ci"); the private repo sets its
+      # own Space's label. Unset or empty = every environment.
+      REPORT_ENVIRONMENTS: ${{ vars.REPORT_ENVIRONMENTS }}
     steps:
       - uses: actions/checkout@v5
 
