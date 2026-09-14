@@ -13,6 +13,7 @@ explains how the pieces fit together and the design rules the system follows.
 - [Orchestrator](#4-orchestrator)
 - [Caching layer](#caching-layer)
 - [Transparency surfaces](#transparency-surfaces)
+- [Observability](#observability)
 - [Configuration](#configuration)
 - [Design principles](#design-principles)
 
@@ -45,13 +46,20 @@ enriches each one with verifiable evidence.
 
 ### Discovery
 
-- **Per-domain search.** One query is fanned across three review platforms —
-  healthgrades, webmd and vitals — **one domain per call**, then merged and
-  deduplicated by URL. A single combined call restricted to several platforms
-  lets whichever one ranks best take every result slot, which is what made
-  coverage swing between runs. Per-domain calls guarantee each platform its own
-  share, and the restriction holds at the cheaper `basic` search depth when only
-  one domain is named.
+- **Direct platform fetching (the default).** Discovery constructs the three
+  review platforms' own city-listing and profile URLs (`utils/platform_urls.py`)
+  and pulls the page bodies via Tavily `/extract` — no search call in a normal
+  run. City listings paginate behind each platform's own URL parameter, read
+  off the pages' own "page 2" links (the wrong parameter silently re-serves
+  page 1 — a trap pinned by test); discovery reads page 1's stated result
+  total and fetches the later pages in one extra batch, capped. If the
+  constructed URLs yield zero pages, discovery falls back to a search run and
+  records that it did — never silently.
+- **The search pipeline stays intact** behind `TAVILY_MODE=search` as a
+  rollback lever: one query per platform domain (a combined multi-domain call
+  let whichever platform ranked best take every result slot, which made
+  coverage swing between runs), multi-query fan-out, and the same parsers
+  downstream.
 - **Adaptive ring expansion.** If the deduplicated home-city pool can't fill the
   research budget, the search expands to the nearest cities (computed from
   vendored geo data, never guessed). The expansion is recorded — how many
@@ -97,12 +105,15 @@ which real platform pages use for exactly the numbers the scorer needs.
 ### Enrichment
 
 After core scoring, every provider inside the research budget that the cache
-didn't serve gets **one platform-restricted search** across three independent
-patient-review platforms (Healthgrades, WebMD, Vitals — Zocdoc and RateMDs
-were dropped after a field measurement found no usable rating data on either).
-Result slots are spent round-robin so every platform contributes a page before
-any contributes a second, and each platform's slot prefers the provider's own
-**profile page** over directory listings.
+didn't serve is enriched from three independent patient-review platforms
+(Healthgrades, WebMD, Vitals — Zocdoc and RateMDs were dropped after a field
+measurement found no usable rating data on either). In the default extract
+mode, the provider's own **profile pages** — attributed during discovery — are
+fetched directly; a provider with no attributed profile URL is the honest
+`no_profile_found`, never a guess. In search mode, one platform-restricted
+search spends its result slots round-robin so every platform contributes a
+page before any contributes a second, preferring the provider's own profile
+page over directory listings.
 
 - **Identity is enforced in code.** `_observation_is_same_person` checks the
   page's own stated name against the target with a token-overlap threshold;
@@ -282,6 +293,38 @@ a first-class output:
   insurance data from directories is displayed as unverified and never rides
   in a search query.
 
+## Observability
+
+External platforms and vendors shift underneath a live pipeline, so the system
+is instrumented to make drift loud (`utils/tracing.py`, `utils/run_record.py`,
+`evals/`):
+
+- **One search is one trace.** With Langfuse configured, every run produces a
+  single trace — a span per workflow step, a generation per model call, a tool
+  span per page fetch — with the run's health record attached as scores (pool
+  sizes, per-platform coverage, credits, timings). Strictly optional: tracing
+  activates only when all three `LANGFUSE_*` variables are set; absent, no
+  client is constructed and the app runs identically. Page bodies never enter
+  traces — only sizes, hashes and bounded previews.
+- **The golden set** (`evals/`): saved, boilerplate-trimmed copies of real
+  platform pages — one per *template* a URL can serve, because the same
+  profile URL can render different templates between fetches. Every parser is
+  unit-tested against these offline, and a scheduled freshness check grades
+  live pages against the answer key, distinguishing *world drift* (the number
+  changed) from *template drift* (the parser reads nothing live) from
+  *identity* errors (the page is about someone else).
+- **Metamorphic invariants gate every pull request** (`.github/workflows/ci.yml`):
+  properties of the deterministic core — score monotonicity, the imputation
+  equivalences, weight scaling and input-order invariance, dedupe idempotence —
+  run fully mocked, so CI needs no keys.
+- **Canaries and the weekly report.** A daily fetch canary and a weekly
+  full-pipeline canary run the production code paths on schedule (opt-in per
+  repository via the `SCHEDULED_RUNS` variable); a watcher grades results
+  against thresholds and opens GitHub issues on findings, classifying vendor
+  errors as fatal (auth, credit) or transient. A weekly job exports each run's
+  health record to `reports/run_records.jsonl` — the durable system of record —
+  alongside a human-readable summary.
+
 ## Configuration
 
 `utils/config.py` reads everything from the environment (`.env` locally). The
@@ -289,6 +332,7 @@ knobs that shape a run:
 
 | Knob | Default | Effect |
 |------|---------|--------|
+| `TAVILY_MODE` | extract | How pages are fetched: `extract` constructs the platforms' own listing/profile URLs and pulls the bodies via Tavily `/extract` (no search call in a normal run); `search` restores the original search-driven pipeline |
 | `GATHERER_MODEL` / `JUDGE_MODEL` / `CRITIC_MODEL` | Haiku 4.5 / GPT-5.6 Terra / Opus 4.8 | Per-role model selection |
 | `MAX_PROVIDERS_TO_ENRICH` | 8 | The research budget — one cut honored by enrichment, judge, and critic; also the shortlist's headroom for coverage failures |
 | `ENRICHMENT_MAX_WORKERS` | 8 | Enrichment concurrency (sets the number of waves, not the amount of work) |
@@ -296,7 +340,8 @@ knobs that shape a run:
 | `MULTI_QUERY_ENABLED` / `MIN_CANDIDATE_POOL` / `MAX_RING_CITIES` | true / 8 / 2 | Discovery breadth and when ring expansion fires |
 | `TAVILY_CHUNKS_PER_SOURCE` | 5 | How many relevance-selected chunks the search returns per page. Both extraction prompts already read that field, so this steers what the extractor sees; raising it from the vendor default of 3 roughly doubled the providers recovered with a rating *and* a review count, at no extra credit cost |
 | `PROVIDER_CACHE_TTL_DAYS` | 7 | Cache freshness window (0 disables reuse without discarding data) |
-| `TAVILY_SEARCH_DEPTH` | advanced | Reaches only the single-query fallback (`MULTI_QUERY_ENABLED=false`) — standard searches pin their own depths in code (discovery basic, enrichment advanced) |
+| `TAVILY_SEARCH_DEPTH` | advanced | Search-mode only; reaches just the single-query fallback (`MULTI_QUERY_ENABLED=false`) — standard searches pin their own depths in code |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_BASE_URL` | unset | Tracing switches on only when all three are set; absent, no client is constructed and the app runs identically |
 
 See [`.env.example`](../.env.example) for the full list, including auth,
 encryption, rate limiting, and TLS settings.
@@ -324,3 +369,7 @@ encryption, rate limiting, and TLS settings.
    allowlisted against the same vendored GeoNames dataset that computes
    distances — specialty and city from fixed lists, ZIP verified against the
    chosen city — and re-checked server-side for every non-UI path.
+8. **Drift gets a day, not a month.** The platforms and vendors under this
+   pipeline change without notice; the traces, canaries, golden set and weekly
+   report exist so a shift surfaces on a dashboard within a day instead of
+   accumulating silently.

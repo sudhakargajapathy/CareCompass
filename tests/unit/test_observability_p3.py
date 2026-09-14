@@ -249,7 +249,8 @@ class TestWatchTierB:
 # The weekly report
 # --------------------------------------------------------------------------
 
-def fake_trace(trace_id, ts, source="canary", case_id="chandler-neurology", tier="A", with_record=True, extra_metadata=None):
+def fake_trace(trace_id, ts, source="canary", case_id="chandler-neurology", tier="A", with_record=True, extra_metadata=None,
+               environment="ci"):
     record = {
         "run_id": f"run-{trace_id}", "ts": ts.isoformat(timespec="seconds"), "source": source, "case_id": case_id,
         "git_sha": "abc1234", "schema_version": 1, "tavily_mode": "extract", "gatherer_model": "claude-haiku-4-5",
@@ -263,7 +264,7 @@ def fake_trace(trace_id, ts, source="canary", case_id="chandler-neurology", tier
         metadata = {"scope": {}}
     metadata.update(extra_metadata or {})
     return SimpleNamespace(id=trace_id, timestamp=ts, tags=[f"source:{source}", f"case:{case_id}", f"tier:{tier}"],
-                           environment="ci", metadata=metadata, name="carecompass.search")
+                           environment=environment, metadata=metadata, name="carecompass.search")
 
 
 def fake_scores(trace_id, **values):
@@ -282,8 +283,10 @@ class FakeApi:
         self.trace = SimpleNamespace(list=self._list)
         self.scores = SimpleNamespace(get_many=self._get_many)
 
-    def _list(self, *, page, limit, name, from_timestamp, to_timestamp):
-        self.calls.append(("trace.list", page, name))
+    def _list(self, *, page, limit, name, from_timestamp, to_timestamp, environment=None):
+        # Recorded but NOT applied: the fake ignores the filter on purpose, so
+        # the exporter's own client-side check has to do the dropping.
+        self.calls.append(("trace.list", page, name) + ((environment,) if environment is not None else ()))
         assert name == "carecompass.search"
         window = [t for t in self._traces if from_timestamp <= t.timestamp < to_timestamp]
         size = 2  # force pagination
@@ -414,6 +417,77 @@ class TestWeeklyReport:
         assert "1 run(s) pulled, 1 row(s) added" in capsys.readouterr().out
 
 
+    def test_the_client_strips_whitespace_from_the_pasted_values(self, monkeypatch):
+        """The public repo's LANGFUSE_BASE_URL variable was pasted with a
+        trailing space (visible in the first armed run's log). The canaries
+        survived because utils.tracing strips; this client passed the value
+        raw, and a host ending in a space fails every API call — the first
+        Monday report would have gone red."""
+        import sys
+        import types
+
+        seen = {}
+
+        class FakeLangfuse:
+            def __init__(self, **kw):
+                seen.update(kw)
+
+        module = types.ModuleType("langfuse")
+        module.Langfuse = FakeLangfuse
+        monkeypatch.setitem(sys.modules, "langfuse", module)
+        weekly_report._client({"LANGFUSE_PUBLIC_KEY": " pk ", "LANGFUSE_SECRET_KEY": "sk\n", "LANGFUSE_BASE_URL": "https://us.cloud.langfuse.com "})
+        assert seen["base_url"] == "https://us.cloud.langfuse.com"
+        assert seen["public_key"] == "pk" and seen["secret_key"] == "sk" and seen["tracing_enabled"] is False
+
+    def test_environment_filter_is_sent_to_the_api_and_enforced_on_the_rows(self):
+        """Two Spaces write to ONE Langfuse project. The public repo's report
+        must carry only the public Space's traffic, so the exporter filters
+        by environment label — server-side, and again on every row: the
+        fake API here ignores the filter, and the development row must
+        still not reach the public rows."""
+        base = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+        demo = fake_trace("d1", base, source="user", case_id=None, environment="demo")
+        dev = fake_trace("v1", base + timedelta(hours=1), source="user", case_id=None, environment="development")
+        ci = fake_trace("c1", base + timedelta(hours=2), environment="ci")
+        client = fake_client([demo, dev, ci], {t.id: fake_scores(t.id, pool_raw=100) for t in (demo, dev, ci)})
+        start, end, label = weekly_report.week_bounds(NOW, 0)
+        rows = weekly_report.fetch_rows(client, start, end, environments=["demo", "ci"])
+        assert [r["trace_id"] for r in rows] == ["d1", "c1"]
+        assert client.api.calls[0] == ("trace.list", 1, "carecompass.search", ["ci", "demo"]), "the API is asked to filter"
+        assert [r["trace_id"] for r in weekly_report.fetch_rows(client, start, end)] == ["d1", "v1", "c1"], "no filter = all"
+        assert weekly_report.parse_environments(" Demo, ci ,,demo") == ["demo", "ci"]
+        assert weekly_report.parse_environments(None) == [] and weekly_report.parse_environments("  ") == []
+
+    def test_the_filter_reaches_the_rows_file_the_stamp_the_header_and_main(self, tmp_path, monkeypatch, capsys):
+        base = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+        traces = [fake_trace("d1", base, source="user", case_id=None, environment="demo"),
+                  fake_trace("v1", base, source="user", case_id=None, environment="development")]
+        client = fake_client(traces, {"d1": fake_scores("d1", pool_raw=1), "v1": fake_scores("v1", pool_raw=2)})
+        result = weekly_report.generate(client, tmp_path / "r", weeks_back=0, now=NOW, environments=["demo"])
+        assert result["rows"] == 1 and result["environments"] == ["demo"]
+        assert "Traces filtered to environment(s) demo." in result["report"]
+        assert json.loads((tmp_path / "r" / "latest.json").read_text())["environments"] == ["demo"]
+        assert [r["environment"] for r in weekly_report.read_rows(tmp_path / "r" / "run_records.jsonl")] == ["demo"]
+        unfiltered = weekly_report.generate(client, tmp_path / "all", weeks_back=0, now=NOW)
+        assert unfiltered["rows"] == 2 and "All environments." in unfiltered["report"]
+        assert json.loads((tmp_path / "all" / "latest.json").read_text())["environments"] == []
+        # main: REPORT_ENVIRONMENTS is the workflow's knob, --environments wins
+        # over it, and an empty value means all. Traces are stamped NOW: main
+        # has no --now, so "this week" is the wall clock's.
+        keys = {"LANGFUSE_PUBLIC_KEY": "pk", "LANGFUSE_SECRET_KEY": "sk", "LANGFUSE_BASE_URL": "https://us.cloud.langfuse.com"}
+        live = [fake_trace("d2", datetime.now(timezone.utc), source="user", case_id=None, environment="demo"),
+                fake_trace("v2", datetime.now(timezone.utc), source="user", case_id=None, environment="development")]
+        monkeypatch.setattr(weekly_report, "_client", lambda env: fake_client(live, {"d2": fake_scores("d2", pool_raw=1), "v2": fake_scores("v2", pool_raw=1)}))
+        assert weekly_report.main(["--out-dir", str(tmp_path / "m1"), "--weeks-back", "0"], env={**keys, "REPORT_ENVIRONMENTS": "demo"}) == 0
+        assert [r["environment"] for r in weekly_report.read_rows(tmp_path / "m1" / "run_records.jsonl")] == ["demo"]
+        assert "[Traces filtered to environment(s) demo.]" in capsys.readouterr().out
+        assert weekly_report.main(["--out-dir", str(tmp_path / "m2"), "--weeks-back", "0", "--environments", "development"],
+                                  env={**keys, "REPORT_ENVIRONMENTS": "demo"}) == 0
+        assert [r["environment"] for r in weekly_report.read_rows(tmp_path / "m2" / "run_records.jsonl")] == ["development"]
+        assert weekly_report.main(["--out-dir", str(tmp_path / "m3"), "--weeks-back", "0"], env={**keys, "REPORT_ENVIRONMENTS": ""}) == 0
+        assert len(weekly_report.read_rows(tmp_path / "m3" / "run_records.jsonl")) == 2
+
+
 # --------------------------------------------------------------------------
 # Workflow files
 # --------------------------------------------------------------------------
@@ -461,6 +535,9 @@ class TestP3Workflows:
             assert job["env"][secret] == "${{ secrets.%s }}" % secret
         assert job["env"]["LANGFUSE_BASE_URL"] == "${{ vars.LANGFUSE_BASE_URL }}" and "secrets.LANGFUSE_BASE_URL" not in text
         assert job["if"] == "github.event_name != 'schedule' || vars.SCHEDULED_RUNS == 'true'", "schedules are opt-in per repo"
+        # Each repo exports only its own Space's environment labels from the
+        # shared Langfuse project — a repository variable, empty = all.
+        assert job["env"]["REPORT_ENVIRONMENTS"] == "${{ vars.REPORT_ENVIRONMENTS }}"
         assert "secrets.TAVILY_API_KEY" not in text and "secrets.OPENAI_API_KEY" not in text, "the report reads traces; it runs no search"
         runs = [s["run"] for s in job["steps"] if "run" in s]
         assert any("evals.weekly_report" in r for r in runs)

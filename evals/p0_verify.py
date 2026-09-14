@@ -92,7 +92,7 @@ def verify_langfuse(env: Mapping[str, str], run_id: str, git_sha: Optional[str])
     client = Langfuse(
         public_key=env["LANGFUSE_PUBLIC_KEY"],
         secret_key=env["LANGFUSE_SECRET_KEY"],
-        base_url=env["LANGFUSE_BASE_URL"],
+        base_url=env["LANGFUSE_BASE_URL"].strip(),  # a pasted trailing space must not become part of the host
         environment="verify",
         release=git_sha or None,
     )
