@@ -218,9 +218,12 @@ class TestDiscoveryWiring:
     def _gatherer(self, monkeypatch, mode="extract", min_pool="1"):
         monkeypatch.setenv("TAVILY_MODE", mode)
         # Keep the ring quiet unless a test wants it: one provider under the
-        # default MIN_CANDIDATE_POOL of 8 would ring out and double the
-        # extract calls being asserted on.
+        # ring threshold would ring out and double the extract calls being
+        # asserted on. RING_MIN_IN_RADIUS_POOL is the knob that decides this;
+        # MIN_CANDIDATE_POOL rides along only so a reader can see the old gate
+        # is no longer the one being silenced.
         monkeypatch.setenv("MIN_CANDIDATE_POOL", min_pool)
+        monkeypatch.setenv("RING_MIN_IN_RADIUS_POOL", min_pool)
         gatherer = DataGathererAgent()
         gatherer._extract_pages = MagicMock(return_value=[_shaped(HG_CHANDLER)])
         gatherer._extract_provider_data = MagicMock(return_value=[_provider()])
@@ -449,6 +452,9 @@ class TestHealthgradesPaginationWiring:
     def _gatherer(self, monkeypatch, page_one_raw):
         monkeypatch.setenv("TAVILY_MODE", "extract")
         monkeypatch.setenv("MIN_CANDIDATE_POOL", "1")
+        # Pagination is what these assert on, so the ring must contribute no
+        # extract calls: the threshold goes below the one-provider pool here.
+        monkeypatch.setenv("RING_MIN_IN_RADIUS_POOL", "1")
         gatherer = DataGathererAgent()
         gatherer._extract_pages = MagicMock(side_effect=[
             [_shaped(HG_CHANDLER, raw=page_one_raw), _shaped(WEBMD_CHANDLER), _shaped(VITALS_CHANDLER)],
@@ -487,6 +493,9 @@ class TestAllPlatformPaginationWiring:
     def test_three_platforms_paginate_in_one_extra_batch(self, monkeypatch):
         monkeypatch.setenv("TAVILY_MODE", "extract")
         monkeypatch.setenv("MIN_CANDIDATE_POOL", "1")
+        # Pagination is what these assert on, so the ring must contribute no
+        # extract calls: the threshold goes below the one-provider pool here.
+        monkeypatch.setenv("RING_MIN_IN_RADIUS_POOL", "1")
         gatherer = DataGathererAgent()
         gatherer._extract_pages = MagicMock(side_effect=[
             [

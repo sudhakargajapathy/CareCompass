@@ -244,6 +244,25 @@ class Config:
         # `ring_contribution` on the next run says whether even that one earns
         # its place; going to 6 or 7 is the setting that would stop it outright.
         self.MIN_CANDIDATE_POOL: int = int(os.getenv("MIN_CANDIDATE_POOL", "8"))
+        # The ring's real trigger, and it counts the IN-RADIUS pool, not the
+        # raw one. MIN_CANDIDATE_POOL above compares the pool BEFORE the radius
+        # bound runs, which in a small market is the wrong number by an order
+        # of magnitude: two live small-market runs came back with raw pools of
+        # 13 and 76 — never below 8, so the ring never fired — while the radius
+        # bound then cut them to 9 and 22 against a research budget of 8. Nine
+        # candidates for eight slots is not selection, it is "research whoever
+        # exists", and no setting of a RAW threshold fixes it (76 is above any
+        # sane value).
+        #
+        # Default 2x MAX_PROVIDERS_TO_ENRICH, which gives the number a
+        # derivation rather than a preference: the budget must have at least a
+        # two-to-one choice before we call the pool sufficient. Left as an env
+        # knob because the right multiple is a judgement about how far a member
+        # will travel for a better-reviewed provider, and that is answered by
+        # watching live runs, not by a constant someone argued for once.
+        self.RING_MIN_IN_RADIUS_POOL: int = int(
+            os.getenv("RING_MIN_IN_RADIUS_POOL", str(2 * self.MAX_PROVIDERS_TO_ENRICH))
+        )
         self.MAX_RING_CITIES: int = int(os.getenv("MAX_RING_CITIES", "2"))
         # Tavily depth: "basic" is 1 credit and fast, "advanced" is 2 credits
         # and slower but digs deeper.

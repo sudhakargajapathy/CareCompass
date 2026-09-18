@@ -61,7 +61,8 @@ RUN_RECORD_FIELDS: Tuple[str, ...] = (
     "fetch_mode", "fallback_fired", "pages_planned", "pages_fetched",
     "pages_failed", "empty_bodies", "rows_hg", "rows_wm", "rows_vi",
     "pool_raw", "pool_after_specialty", "pool_after_radius", "radius_dropped",
-    "ring_fired", "ring_added", "credits_discovery",
+    "telehealth_dropped", "radius_dropped_after_research",
+    "ring_fired", "ring_reason", "ring_added", "credits_discovery",
     # enrichment
     "n_enriched", "n_no_profile_found", "n_failed", "n_cached",
     "n_over_budget", "n_identity_rejected", "pairs_hist", "profile_backed_hist",
@@ -91,6 +92,10 @@ DESCRIPTOR_FIELDS = frozenset(
         "tavily_mode", "gatherer_model", "judge_model", "critic_model",
         "budget", "radius_miles", "specialty", "city", "state", "zip_present",
         "fetch_mode",
+        # A string ("thin_in_radius:9<16" / "platform_blank:vitals.com"), so a
+        # DESCRIPTOR: measurements become Langfuse scores, which are numeric,
+        # and a reason that landed there would be dropped or coerced.
+        "ring_reason",
     }
 )
 
@@ -342,7 +347,19 @@ def build_run_record(
         "pool_after_specialty": None,
         "pool_after_radius": _safe_int(meta.get("total_found")),
         "radius_dropped": _safe_int(meta.get("radius_dropped")),
+        # Rows a platform listed by service area rather than by practice. A
+        # count, never the names: these rows ship to a public repository, and
+        # a bound that shrinks the pool still has to be legible from a chart.
+        "telehealth_dropped": _safe_int(meta.get("telehealth_dropped")),
+        # Providers the RESEARCH placed outside the search area — the
+        # discovery-time bound could not, because their distance was unknown
+        # until a profile stated an address. A rising number here is the
+        # signal that discovery is admitting rows it cannot place.
+        "radius_dropped_after_research": (
+            sum(1 for p in researched if p.get("beyond_radius")) if researched else None
+        ),
         "ring_fired": bool(meta.get("ring_expanded")) if "ring_expanded" in meta else None,
+        "ring_reason": meta.get("ring_reason") or None,
         "ring_added": _safe_int(meta.get("ring_added")),
         "credits_discovery": _safe_int(credits_by_stage.get("discovery")) if credits_by_stage else None,
         "n_enriched": outcomes.get("enriched", 0) if researched else None,

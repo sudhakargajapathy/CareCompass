@@ -2951,3 +2951,936 @@ class TestListingPaginationAllPlatforms:
 
     def test_non_platform_url_fetches_nothing(self):
         assert listing_page_urls("https://example.com/doctors", 500) == []
+
+
+class TestHealthgradesRowAddressCarriesMileage:
+    """A directory row states its address INSIDE a link whose text now runs on
+    past the ZIP: `[… TN 37343 9.0 mi miles away](…/physician/…#locations)`,
+    and on wider rows the mileage wraps onto a second line. The pattern used to
+    require the "]" straight after the ZIP, on one line, so BOTH shapes read as
+    no address — every row, on every directory page measured.
+
+    A dense market hides it: the other two platforms state an address for the
+    same doctors, so the pool still gets placed. A SMALL market cannot, because
+    this directory is often the only page naming the local providers — and with
+    no location on any row the radius bound places nobody, drops nobody, and
+    the research budget fills with whoever the page listed first.
+    """
+
+    CITY = "https://www.healthgrades.com/dermatology-directory/tn-tennessee/soddy-daisy"
+    METRO = "https://www.healthgrades.com/neurology-directory/az-arizona/chandler"
+
+    def test_mileage_on_the_same_line_still_yields_the_address(self):
+        text = "\n".join([
+            "### [Dr. Deanna Brown, MD](https://www.healthgrades.com/physician/dr-deanna-brown-g3m9g)", "",
+            "Specialty: Dermatology", "",
+            "Rated 4.7 out of 5 4.7 from 10 ratings•[10 written reviews]"
+            "(https://www.healthgrades.com/physician/dr-deanna-brown-g3m9g#ratings)", "",
+            "[2051 Hamill Rd Ste 301A Hixson, TN 37343 9.0 mi miles away]"
+            "(https://www.healthgrades.com/physician/dr-deanna-brown-g3m9g#locations)", "",
+        ])
+        row = parse_listing(self.CITY, text)[0]
+        assert row["location"] == "2051 Hamill Rd Ste 301A Hixson, TN 37343"
+        # The page's own mileage is measured from the page's city, never the
+        # member's, so it must not survive into the address in any form.
+        assert "mi" not in row["location"].split("TN")[-1]
+        assert (row["rating"], row["review_count"]) == (4.7, 10)
+
+    def test_mileage_wrapped_onto_a_second_line_still_yields_the_address(self):
+        text = "\n".join([
+            "### [Dr. David Morales, MD](/physician/dr-david-morales-3m6ds)", "",
+            "Specialty: Pain Medicine", "",
+            "Rated 4.6 out of 54.6from 82 ratings•[68 written reviews](/physician/dr-david-morales-3m6ds#ratings)", "",
+            "[2563 S Val Vista Dr Ste 101AGilbert, AZ 85295",
+            "4.9 mi miles away](/physician/dr-david-morales-3m6ds#locations)", "",
+        ])
+        row = parse_listing(self.METRO, text)[0]
+        assert row["location"] == "2563 S Val Vista Dr Ste 101AGilbert, AZ 85295"
+        assert row["specialty"] == "Pain Medicine"
+
+    def test_an_address_link_with_no_mileage_is_unchanged(self):
+        text = "\n".join([
+            "### [Dr. Kan Yu, MD](/physician/dr-kan-yu-2b5bc)", "",
+            "Specialty: Neurology", "",
+            "[1075 S Idaho Rd Ste 201Apache Junction, AZ 85119](/physician/dr-kan-yu-2b5bc#locations)", "",
+        ])
+        row = parse_listing(self.METRO, text)[0]
+        assert row["location"] == "1075 S Idaho Rd Ste 201Apache Junction, AZ 85119"
+
+    def test_a_row_stating_no_address_keeps_its_name_and_profile_link(self):
+        """Small-market directories render entries as heading + photo only.
+
+        That is not the bug above and must not be "fixed" into one: the row is
+        still a real provider, and extract-mode enrichment fetches the profile
+        the heading links, which states the address and the pair.
+        """
+        text = "\n".join([
+            "# 20 Best Dermatologists Near Sutherlin, OR",
+            '## We found 8 results within 25 miles for "Dermatologists near Sutherlin, OR"', "",
+            "### [Dr. Julee Richards, MD](/physician/dr-julee-richards-y3j7q)", "",
+            "![](https://dims.healthgrades.com/silhouette-female.jpg)", "",
+            "### [Dr. Robert Leposavic, MD](/physician/dr-robert-leposavic-xpqjh)", "",
+            "![](https://dims.healthgrades.com/xpqjh.jpg)", "",
+        ])
+        rows = parse_listing(
+            "https://www.healthgrades.com/dermatology-directory/or-oregon/sutherlin", text)
+        assert [r["name"] for r in rows] == ["Dr. Julee Richards, MD", "Dr. Robert Leposavic, MD"]
+        assert all(r["location"] is None for r in rows)
+        assert rows[0]["profile_url"] == (
+            "https://www.healthgrades.com/physician/dr-julee-richards-y3j7q")
+        assert healthgrades_result_count(text) == 8
+
+    def test_the_recovered_address_reaches_the_provider_with_its_provenance(self):
+        """A helper-only assertion would let the wiring be deleted green."""
+        from agents.data_gatherer import _listing_row_to_provider
+
+        text = (
+            "### [Dr. Deanna Brown, MD](/physician/dr-deanna-brown-g3m9g)\n\n"
+            "Specialty: Dermatology\n\n"
+            "[2051 Hamill Rd Ste 301A Hixson, TN 37343 9.0 mi miles away]"
+            "(/physician/dr-deanna-brown-g3m9g#locations)\n"
+        )
+        row = parse_listing(self.CITY, text)[0]
+        provider = _listing_row_to_provider(row, "Dermatology")
+        assert provider["location"] == "2051 Hamill Rd Ste 301A Hixson, TN 37343"
+        assert provider["location_source"] == f"listing_parser:{self.CITY}"
+        # ZIP precision is the point: a city-only fallback cannot separate two
+        # providers in one town, and the radius bound reads this number.
+        assert parse_location(provider["location"])["zip"] == "37343"
+
+
+# A small market's city directory, as two platforms actually render one. Both
+# shapes are real: the rows that state no street address, the photo caption
+# that is the only place some of them say where the provider is, and the
+# service-area lines that mark a virtual practice listed in a town it does not
+# sit in. Providers are named as the pages name them.
+WEBMD_SMALL_MARKET = """## All Results * VERIFIED
+
+![Dr. Anne E Allen, MD - Knoxville, TN - Dermatology](https://img.lb.wbmdstatic.com/a.jpg)
+
+## [Dr. Anne E Allen, MD](https://doctor.webmd.com/doctor/anne-allen-39dc0b60-overview)
+
+Dermatology
+
+[5.0 32 Ratings](https://doctor.webmd.com/doctor/anne-allen-39dc0b60-overview#ratings)
+
+9 Years Experience
+
+Accepting New Patients
+
+Telehealth Only
+
+![Dr. Luke Josiah Maxfield, DO - Soddy Daisy, TN - Dermatology, Internal Medicine](https://img.lb.wbmdstatic.com/b.jpg)
+
+## [Dr. Luke Josiah Maxfield, DO](https://doctor.webmd.com/doctor/luke-maxfield-11dabf02-overview)
+
+Dermatology
+
+10 Years Experience
+
+Accepting New Patients
+
+Virtual Visit available
+"""
+
+VITALS_SMALL_MARKET = """## All Results
+
+![Dr. Jarod Conley, MD - Boulder, CO - Dermatology](https://img-vitals.lb.wbmdstatic.com/a.jpg) VERIFIED
+
+### [Dr. Jarod Conley, MD](/doctors/jarod-conley-8ab12c)
+
+Dermatology
+
+[0 ratings](/doctors/jarod-conley-8ab12c#rating-overview)
+
+12 years exp
+
+Virtual Visit available
+
+![Dr. Anna Chacon, MD - Miami, FL - Dermatology, Medical and Cosmetic Dermatology, Virtual Visits in all 50 states](https://img-vitals.lb.wbmdstatic.com/b.jpg) VERIFIED
+
+### [Dr. Anna Chacon, MD](/doctors/anna-chacon-qjb1rz)
+
+Dermatology
+
+[0 ratings](/doctors/anna-chacon-qjb1rz#rating-overview)
+
+14 years exp
+
+Virtual Visit available
+"""
+
+
+class TestRowCaptionSuppliesTheCityAndMarksServiceAreaListings:
+    """A city directory for a small market is largely national virtual
+    practices: the platform has nothing local to show, so it shows providers
+    who serve the state from elsewhere. Those rows state no street address, so
+    they used to reach the pool with no location at all, inherit the searched
+    city by default, and take research-budget slots from the providers who are
+    actually there — measured at 0 of 7, 0 of 11 and 0 of 3 rows with an
+    address on three small-market pages in three states.
+
+    Two facts on the page fix it. Each entry is introduced by a photo caption
+    that states the practice city, and a virtual practice states its SERVICE
+    AREA.
+    """
+
+    WEBMD = "https://doctor.webmd.com/providers/specialty/dermatology/tennessee/soddy-daisy"
+    VITALS = "https://www.vitals.com/dermatology/or/sutherlin"
+
+    def test_the_caption_supplies_a_city_when_the_row_states_no_address(self):
+        rows = {r["name"]: r for r in parse_listing(self.WEBMD, WEBMD_SMALL_MARKET)}
+        assert rows["Dr. Luke Josiah Maxfield, DO"]["location"] == "Soddy Daisy, TN"
+        assert rows["Dr. Anne E Allen, MD"]["location"] == "Knoxville, TN"
+        assert rows["Dr. Luke Josiah Maxfield, DO"]["location_from_caption"] is True
+
+    def test_a_stated_street_address_always_wins_over_the_caption(self):
+        """City precision cannot separate two providers in one town, so the
+        coarser source must never overwrite the finer one."""
+        text = (
+            "![Dr. Jung Ho Lee, MD - Hendersonville, TN - Cardiovascular Disease](a.jpg) "
+            "## [Dr. Jung Ho Lee, MD](https://doctor.webmd.com/doctor/jung-lee-6349c816-overview)\n"
+            "Cardiovascular Disease\n\n"
+            "[4.5 33 Ratings](https://doctor.webmd.com/doctor/jung-lee-6349c816-overview#ratings)"
+            "  35 Years Exp erience 353 New Shackle Island Rd Ste 300C, Hendersonville, TN, 37075\n"
+        )
+        row = parse_listing(self.WEBMD, text)[0]
+        assert row["location"] == "353 New Shackle Island Rd Ste 300C, Hendersonville, TN 37075"
+        assert row["location_from_caption"] is False
+
+    def test_a_row_never_inherits_the_next_entrys_caption(self):
+        """An entry's caption sits BEFORE its heading, so the next entry's
+        caption falls inside what would otherwise be this entry's body.
+
+        Read naively, the first provider on this page takes the second's city
+        AND the second's "Virtual Visits in all 50 states" — a wrong city
+        published as a distance, and an exclusion applied to the wrong doctor.
+        """
+        rows = {r["name"]: r for r in parse_listing(self.VITALS, VITALS_SMALL_MARKET)}
+        assert rows["Dr. Jarod Conley, MD"]["location"] == "Boulder, CO"
+        assert rows["Dr. Jarod Conley, MD"]["telehealth_only"] is False
+        assert rows["Dr. Anna Chacon, MD"]["telehealth_only"] is True
+
+    def test_a_caption_naming_a_different_doctor_is_refused(self):
+        """Two providers who share a surname are the case that decides how the
+        caption is bound to its heading.
+
+        A ratio would accept this: the caption and the heading share "Smith",
+        which is half of a two-token name. It must be a SUBSET — every token of
+        the heading's name present in the caption — because refusing a real
+        caption costs one row its city, while accepting a neighbour's publishes
+        a different city as though it were this provider's.
+        """
+        text = (
+            "![Dr. Jane Smith, MD - Miami, FL - Dermatology](a.jpg)\n\n"
+            "## [Dr. John Smith, MD](https://doctor.webmd.com/doctor/john-smith-99-overview)\n\n"
+            "Dermatology\n"
+        )
+        row = parse_listing(self.WEBMD, text)[0]
+        assert row["name"] == "Dr. John Smith, MD"
+        assert row["location"] is None
+        assert row["location_from_caption"] is False
+
+    @pytest.mark.parametrize("marker", [
+        "Telehealth Only",
+        "ACCEPTING NEW PATIENTS FOR TELEHEALTH SERVICES in AL, AK, AR, CA, CO, TN and WY",
+        "Dermatology, Medical and Cosmetic Dermatology, Virtual Visits in all 50 states",
+    ])
+    def test_a_stated_service_area_marks_the_row(self, marker):
+        text = (
+            "## [Dr. Test Person, MD](https://doctor.webmd.com/doctor/test-person-1-overview)\n"
+            f"Dermatology\n\n{marker}\n"
+        )
+        assert parse_listing(self.WEBMD, text)[0]["telehealth_only"] is True
+
+    @pytest.mark.parametrize("attribute", [
+        "Virtual Visit available",
+        "Video is available for this profile",
+        "*   Virtual Visits",
+    ])
+    def test_offering_video_visits_is_an_attribute_not_a_service_area(self, attribute):
+        """LOCAL providers carry these, on all three platforms. Excluding on
+        them would delete the market's own doctors — which is the failure this
+        whole change exists to prevent, not a stricter version of the fix."""
+        text = (
+            "## [Dr. Test Person, MD](https://doctor.webmd.com/doctor/test-person-1-overview)\n"
+            f"Dermatology\n\n{attribute}\n"
+        )
+        assert parse_listing(self.WEBMD, text)[0]["telehealth_only"] is False
+
+    def test_a_directory_row_with_an_address_is_never_marked(self):
+        """The healthgrades attribute bullet reads "Virtual Visits" and sits
+        beside a real street address."""
+        text = "\n".join([
+            "### [Dr. Deanna Brown, MD](/physician/dr-deanna-brown-g3m9g)", "",
+            "Specialty: Dermatology", "",
+            "[2051 Hamill Rd Ste 301A Hixson, TN 37343 9.0 mi miles away]"
+            "(/physician/dr-deanna-brown-g3m9g#locations)", "",
+            "*   Virtual Visits", "",
+            "*   Found trustworthy",
+        ])
+        row = parse_listing(
+            "https://www.healthgrades.com/dermatology-directory/tn-tennessee/soddy-daisy", text)[0]
+        assert row["telehealth_only"] is False
+        assert row["location"] == "2051 Hamill Rd Ste 301A Hixson, TN 37343"
+
+
+class TestServiceAreaRowsLeaveTheGathererBeforeTheBudget:
+    """Composed on `_extract_provider_data`: a parser-only test would stay
+    green if the exclusion were never wired, and the whole point is that these
+    rows must not reach the research budget, where each one costs an enrichment
+    fetch, a judge slot and a critic verdict."""
+
+    WEBMD = "https://doctor.webmd.com/providers/specialty/dermatology/tennessee/soddy-daisy"
+
+    def test_the_service_area_row_is_dropped_and_the_local_row_survives(self, gatherer):
+        from unittest.mock import patch as _patch
+        with _patch.object(gatherer, "_extract_page_shard"):
+            out = gatherer._extract_provider_data(
+                [_page(self.WEBMD, WEBMD_SMALL_MARKET)], "Dermatology", "Soddy Daisy, TN")
+        assert [p["name"] for p in out] == ["Dr. Luke Josiah Maxfield, DO"]
+
+    def test_the_drop_is_counted_and_named_never_silent(self, gatherer):
+        """A bound that quietly shrinks the pool is indistinguishable from a
+        discovery failure — the symptom of both is "fewer providers than last
+        time". Same rule the radius bound follows."""
+        from unittest.mock import patch as _patch
+        with _patch.object(gatherer, "_extract_page_shard"):
+            gatherer._extract_provider_data(
+                [_page(self.WEBMD, WEBMD_SMALL_MARKET)], "Dermatology", "Soddy Daisy, TN")
+        stats = gatherer.fetch_stats()
+        assert stats["telehealth_rows_dropped"] == 1
+        assert stats["telehealth_names"] == ["Dr. Anne E Allen, MD"]
+
+    def test_the_surviving_row_carries_its_caption_provenance(self, gatherer):
+        from unittest.mock import patch as _patch
+        with _patch.object(gatherer, "_extract_page_shard"):
+            out = gatherer._extract_provider_data(
+                [_page(self.WEBMD, WEBMD_SMALL_MARKET)], "Dermatology", "Soddy Daisy, TN")
+        provider = out[0]
+        assert provider["location"] == "Soddy Daisy, TN"
+        assert provider["location_source"] == f"listing_parser:{self.WEBMD} (photo caption)"
+
+    def test_the_count_reaches_the_run_record_as_an_aggregate(self):
+        """Names stay on the developer surface; the exported row carries a
+        count, because those rows ship to a public repository."""
+        from utils.run_record import RUN_RECORD_FIELDS, build_run_record
+
+        assert "telehealth_dropped" in RUN_RECORD_FIELDS
+        record = build_run_record({
+            "gathered_data": {"search_metadata": {
+                "telehealth_dropped": 4, "telehealth_names": ["Dr. A", "Dr. B"]}},
+        })
+        assert record["telehealth_dropped"] == 4
+        assert "telehealth_names" not in record
+
+
+class TestRadiusIsReAskedAfterResearch:
+    """The radius bound runs ONCE, at discovery, and an unknown distance never
+    drops anyone — correctly, since that is our geocoding coverage rather than
+    the provider's location.
+
+    Enrichment is where the unknown becomes known: a profile states a street
+    address and the distance is recomputed. Nothing re-asked the bound, so a
+    provider admitted with no location at all could be carded hundreds of
+    miles outside the area the member chose. Small markets make that the
+    normal case rather than the exception, because their directory rows
+    routinely state no address.
+    """
+
+    @staticmethod
+    def _enriched(gatherer, distance, radius=25.0, name="Dr. Far Away, MD"):
+        from unittest.mock import patch as _patch
+
+        providers = [{"name": name, "computed_distance_miles": None}]
+
+        def backfill(pool, *args, **kwargs):
+            pool[0]["computed_distance_miles"] = distance
+            pool[0]["enrichment_outcome"] = "enriched"
+            return pool
+
+        with _patch.object(gatherer, "_enrich_missing_reviews", side_effect=backfill):
+            gatherer.enrich_providers(
+                providers, location="Sutherlin, OR", use_cache=False, radius_miles=radius)
+        return providers[0]
+
+    def test_an_address_found_outside_the_area_is_marked(self, gatherer):
+        provider = self._enriched(gatherer, 512.3)
+        assert provider["beyond_radius"] == {"miles": 512.3, "radius_miles": 25.0}
+
+    def test_the_outcome_stays_enriched_so_the_row_is_still_cached(self, gatherer):
+        """Re-labelling it a failure would bar the retry AND throw away the one
+        fact this pass established — the address. Kept as `enriched`, the row
+        is stored with that address and the NEXT search's discovery-time bound
+        drops it before it costs anything."""
+        from unittest.mock import patch as _patch
+
+        provider = self._enriched(gatherer, 512.3)
+        assert provider["enrichment_outcome"] == "enriched"
+        # And the store really does take it: the write filters on that exact
+        # outcome, so the assertion above is the whole contract.
+        with _patch("utils.vector_store.get_vector_store") as store:
+            gatherer._store_enrichment([provider])
+        assert store.return_value.store_providers.called or \
+            store.return_value.method_calls, "the enriched row reached the store"
+
+    def test_a_provider_inside_the_area_is_never_marked(self, gatherer):
+        assert "beyond_radius" not in self._enriched(gatherer, 9.0)
+
+    def test_an_unknown_distance_still_never_drops_anyone(self, gatherer):
+        """Our geocoding coverage is not the provider's location — the same
+        rule the discovery-time bound follows."""
+        assert "beyond_radius" not in self._enriched(gatherer, None)
+
+    def test_the_mark_follows_the_members_chosen_radius(self, gatherer):
+        """Passing the configured constant instead would silently ignore a
+        10-mile search, which is the failure the chosen radius exists to fix."""
+        assert "beyond_radius" in self._enriched(gatherer, 18.0, radius=10.0)
+        assert "beyond_radius" not in self._enriched(gatherer, 18.0, radius=25.0)
+
+    def test_the_mark_is_not_sticky(self, gatherer):
+        """A nearer trusted office or a corrected address must clear it, or one
+        bad fetch bars a provider for the cache's whole TTL."""
+        provider = {"name": "Dr. Moved, MD", "computed_distance_miles": 4.0,
+                    "beyond_radius": {"miles": 512.3, "radius_miles": 25.0}}
+        gatherer._mark_beyond_radius([provider], 25.0)
+        assert "beyond_radius" not in provider
+
+
+class TestOutOfAreaProvidersAreWithheldAndExplained:
+    """Withheld, never hidden — and the reason names the number, because this
+    is the one withholding a reader can undo with a single control."""
+
+    @staticmethod
+    def _provider(miles=512.3, radius=25.0, **extra):
+        provider = {
+            "name": "Dr. Far Away, MD",
+            "enrichment_outcome": "enriched",
+            "ai_rubric": {"review_substance": 40},
+            "critic_review": {"validation_status": "approved"},
+        }
+        if miles is not None:
+            provider["beyond_radius"] = {"miles": miles, "radius_miles": radius}
+        provider.update(extra)
+        return provider
+
+    def test_a_fully_processed_provider_outside_the_area_is_not_recommendable(self):
+        from agents.orchestrator import withheld_reason
+
+        assert withheld_reason(self._provider()) == "beyond_radius"
+        assert withheld_reason(self._provider(miles=None)) is None
+
+    def test_the_area_is_asked_before_every_stage_that_could_not_have_run(self):
+        """Order matters in `withheld_reason`: the earliest decided reason is
+        the one reported. A provider outside the area is not ALSO "not judged"
+        — we deliberately did not judge them, and naming the downstream symptom
+        would blame our pipeline for a bound the member set."""
+        from agents.orchestrator import withheld_reason
+
+        provider = self._provider()
+        provider.pop("ai_rubric")
+        provider.pop("critic_review")
+        assert withheld_reason(provider) == "beyond_radius"
+
+    def test_it_is_not_counted_as_a_failure_of_ours(self):
+        from agents.orchestrator import _PIPELINE_FAILURE_REASONS, _withheld_summary
+
+        summary = _withheld_summary([self._provider()])
+        assert "beyond_radius" not in _PIPELINE_FAILURE_REASONS
+        assert summary["pipeline_failures"] == 0
+        assert summary["no_data"] == 0
+        assert summary["beyond_radius"] == 1
+
+    def test_the_reader_facing_reason_states_the_distance(self):
+        from agents.orchestrator import withheld_label
+
+        label = withheld_label(self._provider(miles=512.3, radius=25.0))
+        assert "outside your search area" in label
+        assert "512 mi" in label and "25 mi" in label
+
+    def test_the_judge_and_critic_skip_them(self):
+        """Composed on the scoring node: they can never be recommended, so
+        spending rubric and verdict tokens on them is pure waste. Expressed by
+        reordering the pinned list and moving `judge_count`, the mechanism the
+        budget cut already uses."""
+        from unittest.mock import MagicMock, patch as _patch
+        from agents.orchestrator import ProviderMatchingOrchestrator
+
+        near = {"name": "Dr. Near, MD"}
+        far = {"name": "Dr. Far Away, MD", "beyond_radius": {"miles": 512.3, "radius_miles": 25.0}}
+
+        with _patch("agents.orchestrator.DataGathererAgent"), \
+             _patch("agents.orchestrator.PreferenceScorerAgent"), \
+             _patch("agents.orchestrator.CriticValidatorAgent"), \
+             _patch("agents.orchestrator.get_vector_store"):
+            orchestrator = ProviderMatchingOrchestrator()
+        orchestrator.preference_scorer.score_core.return_value = [near, far]
+        orchestrator.preference_scorer.score_providers.return_value = {
+            "status": "success", "ranked_providers": [near, far]}
+        orchestrator.data_gatherer.enrich_providers.return_value = [near, far]
+
+        orchestrator._score_providers({
+            "specialty": "Dermatology", "location": "Sutherlin, OR",
+            "preferences": {"search_radius_miles": 25.0},
+            "gathered_data": {"providers": [near, far], "search_metadata": {}},
+            "error_messages": [], "execution_log": [],
+        })
+        kwargs = orchestrator.preference_scorer.score_providers.call_args.kwargs
+        assert kwargs["judge_count"] == 1
+        assert kwargs["providers"][0] is near
+        assert kwargs["providers"][kwargs["judge_count"]] is far
+
+    def test_the_count_reaches_the_run_record(self):
+        from utils.run_record import RUN_RECORD_FIELDS, build_run_record
+
+        assert "radius_dropped_after_research" in RUN_RECORD_FIELDS
+        record = build_run_record({}, providers=[
+            self._provider(), self._provider(miles=None, name="Dr. Near, MD")])
+        assert record["radius_dropped_after_research"] == 1
+
+    def test_an_all_out_of_area_run_tells_the_reader_to_widen_the_area(self):
+        """An empty shortlist used to say "try again in a few minutes" for
+        every cause. Here the fix is one control away, and retry framing is
+        the one piece of advice guaranteed not to help."""
+        from app import _empty_shortlist_notice
+
+        message, _ = _empty_shortlist_notice({"workflow_summary": {
+            "total_providers_found": 9,
+            "withheld": {"total": 8, "by_reason": {"beyond_radius": 8}},
+        }})
+        assert "outside the area you chose" in message
+        assert "again in a few minutes" not in message
+
+
+class TestListingReviewExcerpts:
+    """Some providers have a rating, a count, and no words a fetch can reach.
+
+    webmd serves its own summary paragraph for providers who HAVE written
+    reviews, and the pipeline already reads it; what it never serves is the
+    individual reviews, since that body is script-rendered and `-overview`,
+    `-reviews` and `-ratings` return identical bytes. A provider with reviews
+    but no summary paragraph therefore reaches the judge with nothing to cite,
+    and the judge correctly cites the absence.
+
+    The directory entry beside that provider's name quotes an actual patient,
+    and for that case it is the only review text obtainable.
+    """
+
+    WEBMD = "https://doctor.webmd.com/providers/specialty/cardiovascular-disease/tennessee/soddy-daisy"
+    VITALS = "https://www.vitals.com/dermatology/tn/soddy-daisy"
+
+    def test_the_quoted_review_is_parsed_from_the_row(self):
+        text = (
+            "## [Dr. James Jay Merrill, MD](https://doctor.webmd.com/doctor/james-merrill-d1eb-overview)\n"
+            "Cardiovascular Disease\n\n"
+            "[4.5 31 Ratings](https://doctor.webmd.com/doctor/james-merrill-d1eb-overview#ratings)"
+            "  40 Years Exp erience 1 Medical Park Blvd, Bristol, TN, 37620 "
+            '"Dr. Merrill is an excellent physician.Very informative, patient and kind."'
+            "...View Profile\n"
+        )
+        row = parse_listing(self.WEBMD, text)[0]
+        assert row["review_snippet"] == (
+            "Dr. Merrill is an excellent physician.Very informative, patient and kind.")
+
+    def test_the_platforms_own_generated_blurb_is_never_taken_as_patient_feedback(self):
+        """The unquoted sentence beside the quote is the platform's own copy.
+        Presenting it as a patient review would be an invented endorsement."""
+        text = (
+            "## [Dr. Jung Ho Lee, MD](https://doctor.webmd.com/doctor/jung-lee-6349-overview)\n"
+            "Cardiovascular Disease\n\n"
+            "[4.5 33 Ratings](https://doctor.webmd.com/doctor/jung-lee-6349-overview#ratings)"
+            "  35 Years Exp erience 353 New Shackle Island Rd, Hendersonville, TN, 37075 "
+            "Dr. Jung Lee brings 35 years of cardiovascular disease experience to his "
+            "practice across multiple Tennessee locations....View Profile\n"
+        )
+        assert parse_listing(self.WEBMD, text)[0]["review_snippet"] is None
+
+    def test_a_link_title_is_too_short_to_be_a_review(self):
+        text = (
+            "### [Dr. Luke Josiah Maxfield, DO](/doctors/luke-maxfield-73wrra)\n\n"
+            "Dermatology\n\n10 years exp\n\n"
+            '[View Profile](/doctors/luke-maxfield-73wrra "View Profile")\n'
+        )
+        assert parse_listing(self.VITALS, text)[0]["review_snippet"] is None
+
+    def test_the_excerpt_reaches_the_provider_with_the_page_it_came_from(self):
+        text = (
+            "### [Trisha Khanna, MD, FAAD](/doctors/trisha-khanna-st91aw)\n\n"
+            "Dermatology\n\n8 years exp\n\n"
+            '"Dr. Trisha Khanna was incredibly compassionate and reassuring during a '
+            'very stressful time for me." [View Profile](/doctors/trisha-khanna-st91aw)\n'
+        )
+        from agents.data_gatherer import _listing_row_to_provider
+
+        provider = _listing_row_to_provider(parse_listing(self.VITALS, text)[0], "Dermatology")
+        assert provider["review_snippets"] == [{
+            "text": "Dr. Trisha Khanna was incredibly compassionate and reassuring "
+                    "during a very stressful time for me.",
+            "source_url": self.VITALS,
+        }]
+
+    def test_excerpts_union_across_platforms_on_dedupe(self, gatherer):
+        """Appearing on two directories is the normal case, and each quotes a
+        different patient — the same reason observations and insurance union."""
+        from agents.data_gatherer import _UNION_ON_DEDUPE
+
+        assert "review_snippets" in _UNION_ON_DEDUPE
+        merged = gatherer._dedupe_providers([
+            {"name": "Dr. Jane Roe, MD", "specialty": "Dermatology",
+             "review_snippets": [{"text": "a" * 45, "source_url": "https://a/1"}]},
+            {"name": "Dr. Jane Roe, MD", "specialty": "Dermatology",
+             "review_snippets": [{"text": "b" * 45, "source_url": "https://b/1"}]},
+        ])
+        assert len(merged) == 1
+        assert len(merged[0]["review_snippets"]) == 2
+
+
+class TestMarkdownIsNeverPublishedAsPatientFeedback:
+    """Markdown link and image syntax is QUOTED in the raw body and runs long,
+    so the 40-char floor alone let it through as a patient review.
+
+    Found by auditing six live directory pages against the shipped parser
+    rather than against fixtures. A webmd row for a real physician yielded
+    `) ![TAG Registered Seal](https://img.webmd.com/…` and a vitals row
+    yielded `[View Profile](/doctors/dan-joseph-capampangan-rtzjkh) [View
+    Profile](…` — 1 of 49 webmd rows and 1 of 19 quote-bearing vitals rows,
+    each of which would have been rendered on that doctor's card as their
+    patient feedback. The floor was written to exclude link titles, which are
+    short; nothing excluded the long ones.
+
+    The first quoted run in a block is a CANDIDATE, not the answer. Skipping
+    markup and taking the next clean run matters because the real review
+    usually sits AFTER the entry's photo and profile link: on the live vitals
+    page the fix did not merely blank the bad row, it recovered the true
+    review underneath it."""
+
+    WEBMD = "https://doctor.webmd.com/providers/specialty/neurology/arizona/chandler"
+    VITALS = "https://www.vitals.com/neurology/az/chandler"
+    HEALTHGRADES = "https://www.healthgrades.com/usearch?what=Neurology&where=Chandler,AZ"
+
+    def test_an_image_tag_is_not_a_review(self):
+        """The exact body shape a live webmd row produced."""
+        text = (
+            "## [Dr. Albert L Klaski, MD](https://doctor.webmd.com/doctor/albert-klaski-8e21-overview)\n"
+            "Neurology\n\n"
+            "[4.0 12 Ratings](https://doctor.webmd.com/doctor/albert-klaski-8e21-overview#ratings)"
+            "  30 Years Exp erience 1 Main St, Chandler, AZ, 85224 "
+            '") ![TAG Registered Seal](https://img.webmd.com/dtmcms/live/webmd/consumer_assets/'
+            'site_images/layout/tag_seal.png"'
+            "...View Profile\n"
+        )
+        row = parse_listing(self.WEBMD, text)[0]
+        assert row["review_snippet"] is None
+
+    def test_a_run_of_profile_links_is_not_a_review(self):
+        """The exact body shape a live vitals row produced — and the real
+        review sitting after it is what must be returned."""
+        text = (
+            "### Dr. Dan Capampangan\n"
+            "Neurology\n"
+            '"[View Profile](/doctors/dan-joseph-capampangan-rtzjkh) '
+            '[View Profile](/doctors/dan-joseph-capampangan-rtzjkh)"\n'
+            "4.5 21 ratings\n"
+            '"He really listened closely to my concerns and answered every question I had."\n'
+            "[View Profile](/doctors/dan-joseph-capampangan-rtzjkh)\n"
+        )
+        row = parse_listing(self.VITALS, text)[0]
+        assert row["review_snippet"] == (
+            "He really listened closely to my concerns and answered every question I had.")
+
+    def test_a_bare_url_is_not_a_review(self):
+        text = (
+            "### Dr. Mina Fahim\n"
+            "Neurology\n"
+            '"https://www.vitals.com/doctors/mina-fahim-abc123/reviews-and-ratings"\n'
+            "4.0 8 ratings\n"
+        )
+        row = parse_listing(self.VITALS, text)[0]
+        assert row["review_snippet"] is None
+
+    def test_a_healthgrades_row_never_carries_a_quote(self):
+        """Measured 0 of 31 rows across two live city directories. The page
+        DOES carry quoted text — testimonials about the site itself, which sit
+        outside any entry block — so per-block scoping is what keeps marketing
+        copy off a physician's card, and reading the page would not."""
+        text = (
+            '"It\'s nice to see Healthgrades go beyond by showing the history and '
+            'background of the Drs."\n'
+            "### [Dr. Hemant Pandey, MD](https://www.healthgrades.com/physician/dr-hemant-pandey-xsjwm)\n"
+            "Rated 3.8 out of 5 3.8 from 88 ratings Neurology "
+            "[4045 W Chandler Blvd Chandler, AZ 85226 4.1 mi miles away]"
+            "(https://www.healthgrades.com/physician/dr-hemant-pandey-xsjwm#locations)\n"
+        )
+        rows = parse_listing(self.HEALTHGRADES, text)
+        assert rows
+        assert all(r.get("review_snippet") is None for r in rows)
+
+class TestTheWordlessClaimStaysRetracted:
+    """The claim that a webmd profile carries no review text is FALSE, and it
+    reached three shipping comments before anyone measured it.
+
+    It was written from the parsers: no parser reads review prose, so a sweep
+    of `profile_parser` finds numbers and an address and concludes the page has
+    no words. The paragraph is there — "Patients consistently praise Dr. X …
+    However, some patients have experienced significant delays …" — and reaches
+    the model through the excerpt builder, not through a parser. Measured on
+    five profiles; one live run's judge evidence traces to it phrase for phrase.
+
+    Banned as a phrase rather than pinned as behaviour because there is no
+    behaviour to pin: the correction is entirely in what the next reader
+    believes. A comment is the only carrier, and this one was already restated
+    twice from the first wrong version, so the wording is guarded the way the
+    retired animation tokens are — across the shipping source, comments and
+    docstrings included."""
+
+    SHIPPING_SOURCES = (
+        "utils/listing_parser.py",
+        "agents/data_gatherer.py",
+    )
+
+    def _sources(self):
+        """Comment text with wrapping and `#` markers normalized away.
+
+        A first version compared raw substrings and passed a file whose
+        correction it could not see: the phrase it required was split across
+        two lines as "review summary\n# paragraph". A source guard that a
+        line break defeats guards nothing.
+        """
+        import re
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[2]
+        out = {}
+        for name in self.SHIPPING_SOURCES:
+            text = (root / name).read_text()
+            flat = re.sub(r"\s*\n\s*#?\s*", " ", text)
+            out[name] = re.sub(r"\s+", " ", flat).lower()
+        return out
+
+    def test_no_shipping_comment_says_a_webmd_profile_has_no_words(self):
+        for name, flat in self._sources().items():
+            assert "no words anywhere a fetch can reach" not in flat, name
+            assert "no words at all" not in flat, name
+            assert "a rating and a count and no words" not in flat, name
+            assert "wordless" not in flat or "not wordless" in flat, name
+
+    def test_the_shipping_comments_state_the_summary_paragraph_instead(self):
+        """Retracting is not enough: a reader who sees only "the individual
+        reviews are script-rendered" can still infer the profile is empty. The
+        source has to say the summary paragraph EXISTS and is already read."""
+        for name, flat in self._sources().items():
+            assert "summary paragraph" in flat, name
+            assert "individual reviews" in flat, name
+
+    def test_the_narrow_case_is_named_so_the_fallback_is_not_read_as_typical(self):
+        from agents.data_gatherer import _apply_listing_excerpt_summary
+        doc = (_apply_listing_excerpt_summary.__doc__ or "").lower()
+        assert "three" in doc
+        assert "no written reviews" in doc
+        assert "carries no summary" in doc
+
+
+
+class TestExcerptSummaryIsALastResortAndSaysSo:
+    @staticmethod
+    def _provider(outcome="enriched", summary="No reviews available", snippets=1):
+        return {
+            "name": "Dr. Michael Allan Love, MD",
+            "enrichment_outcome": outcome,
+            "review_summary": summary,
+            "review_snippets": [
+                {"text": f"Quoted patient review number {i} about this doctor's care.",
+                 "source_url": f"https://doctor.webmd.com/providers/specialty/x/y/z{i}"}
+                for i in range(snippets)
+            ],
+        }
+
+    def test_a_placeholder_summary_is_replaced_by_the_quoted_review(self):
+        from agents.data_gatherer import _apply_listing_excerpt_summary
+
+        provider = self._provider()
+        assert _apply_listing_excerpt_summary(provider) is True
+        assert "No profile review text was available" in provider["review_summary"]
+        assert "1 patient review quoted on a directory listing" in provider["review_summary"]
+        assert "Quoted patient review number 0" in provider["review_summary"]
+
+    def test_a_real_summary_is_never_overwritten(self):
+        from agents.data_gatherer import _apply_listing_excerpt_summary
+
+        provider = self._provider(summary="Patients praise her thorough exams.")
+        assert _apply_listing_excerpt_summary(provider) is False
+        assert provider["review_summary"] == "Patients praise her thorough exams."
+
+    @pytest.mark.parametrize("outcome", ["no_profile_found", "identity_rejected", "failed"])
+    def test_it_never_dresses_up_a_failed_lookup(self, outcome):
+        """Running before classification would flip these to `enriched` on the
+        strength of one directory line — and `identity_rejected` means every
+        page fetched was about someone else. The outcome answers what the
+        research achieved; this answers whether there is anything true to
+        show, and they are not the same question."""
+        from agents.data_gatherer import _apply_listing_excerpt_summary
+
+        provider = self._provider(outcome=outcome)
+        assert _apply_listing_excerpt_summary(provider) is False
+        assert provider["review_summary"] == "No reviews available"
+
+    def test_at_most_two_excerpts_are_ever_published(self):
+        from agents.data_gatherer import _MAX_LISTING_EXCERPTS, _apply_listing_excerpt_summary
+
+        provider = self._provider(snippets=5)
+        _apply_listing_excerpt_summary(provider)
+        assert provider["review_summary"].count("Quoted patient review") == _MAX_LISTING_EXCERPTS
+        assert "2 patient reviews quoted" in provider["review_summary"]
+
+    def test_the_excerpts_are_offered_to_the_model_before_the_code_composes_anything(self, gatherer):
+        """The model gets them first, labelled as single reviews — the code
+        path exists only for the case where it still answers 'no reviews'."""
+        from unittest.mock import MagicMock
+
+        captured = {}
+
+        def fake_create(**kwargs):
+            captured["prompt"] = kwargs["messages"][0]["content"]
+            response = MagicMock()
+            response.content = [MagicMock(text='{"review_summary": "No reviews available"}')]
+            return response
+
+        gatherer.anthropic_client.messages.create = fake_create
+        gatherer._extract_review_data_only(
+            [{"url": "https://doctor.webmd.com/doctor/x-overview", "title": "t",
+              "content": "c", "raw_content": "body"}],
+            "Dr. Michael Allan Love, MD",
+            listing_excerpts=[{"text": "A quoted patient review about this doctor's care.",
+                               "source_url": "https://doctor.webmd.com/providers/x"}],
+        )
+        prompt = captured["prompt"]
+        assert "PATIENT REVIEW EXCERPTS quoted on a directory listing" in prompt
+        assert "A quoted patient review about this doctor's care." in prompt
+        assert "each is a single review" in prompt
+
+    def test_it_writes_the_field_both_models_actually_read(self):
+        """`review_summary` and nothing else.
+
+        A composed sentence parked in a new key would be invisible to the
+        rubric judge and the critic alike — both read `review_summary` through
+        one shared helper, which is the payload-parity contract — and the card
+        would still say "No reviews available" while the text sat in the
+        provider dict. It is also the field the cache stores, so a new key
+        would be recomposed from scratch on every warm hit or lost entirely.
+        """
+        from utils.vector_store import CACHEABLE_FIELDS
+        from agents.data_gatherer import _apply_listing_excerpt_summary
+
+        provider = self._provider()
+        before = set(provider)
+        _apply_listing_excerpt_summary(provider)
+        assert set(provider) - before <= {"review_source_url"}
+        assert "quoted on a directory listing" in provider["review_summary"]
+        assert "review_summary" in CACHEABLE_FIELDS
+
+
+# Two small markets in different regions, as their directory pages actually
+# render. The point of having both is that the failure is a PROPERTY OF THIN
+# WEB PRESENCE, not of one region: the same national virtual practices appear
+# on both pages, the local doctor is the one the platform has least to say
+# about, and the row shapes differ between the two renderings.
+SOUTHEAST_MARKET = {
+    "search": ("Dermatology", "Soddy Daisy, TN"),
+    "healthgrades": (
+        "https://www.healthgrades.com/dermatology-directory/tn-tennessee/soddy-daisy",
+        "\n".join([
+            '## We found 12 results within 10 miles for "Dermatologists near Soddy Daisy, TN"', "",
+            "### [Dr. Deanna Brown, MD](/physician/dr-deanna-brown-g3m9g)", "",
+            "Specialty: Dermatology", "",
+            "Rated 4.7 out of 5 4.7 from 10 ratings•[10 written reviews](/physician/dr-deanna-brown-g3m9g#ratings)", "",
+            "[2051 Hamill Rd Ste 301A Hixson, TN 37343 9.0 mi miles away]"
+            "(/physician/dr-deanna-brown-g3m9g#locations)", "",
+            "*   Virtual Visits", "",
+        ]),
+    ),
+    "webmd": (
+        "https://doctor.webmd.com/providers/specialty/dermatology/tennessee/soddy-daisy",
+        WEBMD_SMALL_MARKET,
+    ),
+    "local": "Dr. Luke Josiah Maxfield, DO",
+    "local_city": "Soddy Daisy, TN",
+}
+
+WEST_COAST_MARKET = {
+    "search": ("Dermatology", "Sutherlin, OR"),
+    "healthgrades": (
+        "https://www.healthgrades.com/dermatology-directory/or-oregon/sutherlin",
+        "\n".join([
+            '## We found 8 results within 25 miles for "Dermatologists near Sutherlin, OR"', "",
+            "### [Dr. Julee Richards, MD](/physician/dr-julee-richards-y3j7q)", "",
+            "![](https://dims.healthgrades.com/silhouette-female.jpg)", "",
+            "### [Dr. Robert Leposavic, MD](/physician/dr-robert-leposavic-xpqjh)", "",
+            "![](https://dims.healthgrades.com/xpqjh.jpg)", "",
+        ]),
+    ),
+    "webmd": (
+        "https://doctor.webmd.com/providers/specialty/dermatology/oregon/sutherlin",
+        "\n".join([
+            "All Results * VERIFIED", "",
+            "![Dr. Anne E Allen, MD - Knoxville, TN - Dermatology](https://img.lb.wbmdstatic.com/a.jpg)", "",
+            "## [Dr. Anne E Allen, MD](https://doctor.webmd.com/doctor/anne-allen-39dc0b60-overview)", "",
+            "Dermatology", "",
+            "[5.0 32 Ratings](https://doctor.webmd.com/doctor/anne-allen-39dc0b60-overview#ratings)", "",
+            "9 Years Experience", "", "Telehealth Only", "",
+            '"Wonderful, deeply compassionate and caring doctor who is an amazing diagnostician."', "",
+            "![Dr. Jarod Conley, MD - Boulder, CO - Dermatology](https://img.lb.wbmdstatic.com/b.jpg)", "",
+            "## [Dr. Jarod Conley, MD](https://doctor.webmd.com/doctor/jarod-conley-8ab12c-overview)", "",
+            "Dermatology", "", "12 Years Experience", "", "Virtual Visit available", "",
+        ]),
+    ),
+    "local": "Dr. Julee Richards, MD",
+    "local_city": None,
+}
+
+
+@pytest.mark.parametrize("market", [SOUTHEAST_MARKET, WEST_COAST_MARKET],
+                         ids=["southeast", "west-coast"])
+class TestSmallMarketDiscoveryEndToEnd:
+    """Composed over the whole discovery read for two small markets.
+
+    A small market's directory pages are thin in ways a dense one never is:
+    rows without addresses, national virtual practices standing in for local
+    providers, and entries rendered as heading and photo alone. Each fix in
+    this batch covers one of those; this asserts what they produce TOGETHER,
+    which is the only thing a reader of the results actually sees.
+    """
+
+    @staticmethod
+    def _providers(gatherer, market):
+        from unittest.mock import patch as _patch
+
+        specialty, location = market["search"]
+        pages = [_page(url, body) for url, body in (market["healthgrades"], market["webmd"])]
+        with _patch.object(gatherer, "_extract_page_shard", return_value=[]):
+            return gatherer._extract_provider_data(pages, specialty, location)
+
+    def test_no_provider_is_admitted_with_an_unplaceable_out_of_area_row(self, gatherer, market):
+        """Either the row states where it is and the radius can judge it, or it
+        states a service area and never reaches the budget. What must not
+        happen is a row with neither, which inherits the searched city."""
+        for provider in self._providers(gatherer, market):
+            location = provider.get("location")
+            assert location is None or "," in location
+
+        stats = gatherer.fetch_stats()
+        assert stats["telehealth_rows_dropped"] >= 1
+
+    def test_the_local_provider_survives_every_bound(self, gatherer, market):
+        """The whole risk of this batch: a filter aimed at out-of-area
+        listings deleting the providers a small market actually has."""
+        providers = {p["name"]: p for p in self._providers(gatherer, market)}
+        assert market["local"] in providers
+        if market["local_city"]:
+            assert providers[market["local"]]["location"] == market["local_city"]
+
+    def test_a_row_with_no_address_still_yields_a_profile_link_to_research(self, gatherer, market):
+        """Heading-and-photo-only entries are how these directories render, and
+        the profile the heading links is what enrichment fetches. Dropping
+        them would delete the market's own doctors."""
+        providers = self._providers(gatherer, market)
+        assert providers, "a small market's pages must still produce candidates"
+        assert all(p.get("profile_url") for p in providers)

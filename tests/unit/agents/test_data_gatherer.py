@@ -13,8 +13,11 @@ from agents.data_gatherer import (
     _DISCOVERY_MAX_BLOCKS,
     _ENRICHMENT_EXCERPT_BUDGET,
     _ENRICHMENT_HEAD_CHARS,
+    _blank_listing_domains,
     _is_review_platform_url,
+    _ring_trigger,
 )
+from utils.config import Config
 from utils.excerpt import SUMMARY_MAX_CHARS, build_excerpt
 from tests.fixtures.mock_agent_responses import (
     MOCK_TAVILY_SEARCH_RESPONSE,
@@ -719,9 +722,17 @@ def test_ring_expansion_rescues_empty_home_pool(data_gatherer: DataGathererAgent
     assert [p["name"] for p in result["providers"]] == ["Dr. Ring Only"]
 
 def test_ring_expansion_skipped_when_pool_is_rich(data_gatherer: DataGathererAgent):
-    """A large, geographically-spread pool needs no expansion — no ring cost."""
+    """A large, geographically-spread pool needs no expansion — no ring cost.
+
+    Sized FROM the threshold rather than at a literal, because the threshold is
+    an operator knob (RING_MIN_IN_RADIUS_POOL) that gets retuned against live
+    markets. A hardcoded 12 meant "rich" only while the gate was the old raw
+    pool of 8; the moment the gate moved this test asserted nothing about
+    richness and everything about a number nobody had revisited.
+    """
     rich = [
-        {"name": f"Dr. {i}", "location": f"City{i}, AZ 8500{i}"} for i in range(12)
+        {"name": f"Dr. {i}", "location": f"City{i}, AZ 8500{i}"}
+        for i in range(data_gatherer.config.RING_MIN_IN_RADIUS_POOL)
     ]
     with patch.object(data_gatherer, "_search_providers", return_value=[{"url": "u", "title": "t"}]), \
          patch.object(data_gatherer, "_extract_provider_data", return_value=rich), \
@@ -746,8 +757,12 @@ def test_a_healthy_single_city_pool_does_not_ring_out(data_gatherer: DataGathere
     Keyed on city alone the metric would fire on EVERY single-city search; keyed
     on ZIP-else-city it measured our address-parsing coverage instead of
     geography. No unit repairs it, so the trigger is gone."""
+    # At the threshold, so pool SIZE cannot be what fires the ring and the only
+    # thing left that could is a clustering rule — which is precisely what this
+    # test exists to keep deleted.
     single_city = [
-        {"name": f"Dr. {i}", "location": "Chandler, AZ"} for i in range(12)
+        {"name": f"Dr. {i}", "location": "Chandler, AZ"}
+        for i in range(data_gatherer.config.RING_MIN_IN_RADIUS_POOL)
     ]
     with patch.object(data_gatherer, "_search_providers", return_value=[{"url": "u", "title": "t"}]), \
          patch.object(data_gatherer, "_extract_provider_data", return_value=single_city), \
@@ -759,7 +774,8 @@ def test_a_healthy_single_city_pool_does_not_ring_out(data_gatherer: DataGathere
     mock_nearby.assert_not_called()
     assert result["search_metadata"]["query_count"] == 3
     assert result["search_metadata"]["ring_expanded"] is False
-    assert len(result["providers"]) == 12
+    assert result["search_metadata"]["ring_reason"] is None
+    assert len(result["providers"]) == data_gatherer.config.RING_MIN_IN_RADIUS_POOL
 
 
 def test_single_query_mode_is_the_escape_hatch(data_gatherer: DataGathererAgent):
@@ -2145,6 +2161,211 @@ class TestEnrichmentConcurrencyAndSources:
         assert live["enrichment_outcome"] == "no_profile_found"
 
 
+class TestRingFiresOnTheInRadiusPool:
+    """The ring used to measure the pool BEFORE the radius bound, and so could
+    not fire in the markets it was written for.
+
+    Two live small-market runs: raw pools of 13 and 76 — never below the old
+    threshold of 8, so the ring stayed home — that the radius bound then cut to
+    9 and 22 against a research budget of 8. Nine candidates for eight slots is
+    not selection. No setting of a RAW threshold repairs it either, because 76
+    is above any value worth configuring; the raw count describes the
+    platforms' city pages, which are radius CENTRES covering a whole metro.
+    """
+
+    def _pool(self, n_near, n_far):
+        return (
+            [{"name": f"Dr. Near {i}", "computed_distance_miles": 5.0} for i in range(n_near)]
+            + [{"name": f"Dr. Far {i}", "computed_distance_miles": 120.0} for i in range(n_far)]
+        )
+
+    def test_a_big_raw_pool_that_the_radius_guts_still_rings(self):
+        """The live cardiology shape: 76 raw, 22 inside 25 miles."""
+        assert _ring_trigger(self._pool(22, 54), radius_miles=25, min_in_radius=32)
+
+    def test_the_raw_count_is_not_what_is_measured(self):
+        """76 raw would satisfy any sane raw threshold; 22 in-radius does not
+        satisfy a 32 one. If this ever passes, the trigger has regressed to
+        counting the pool before the bound."""
+        pool = self._pool(22, 54)
+        assert len(pool) == 76
+        assert _ring_trigger(pool, radius_miles=25, min_in_radius=32) is not None
+
+    def test_a_pool_at_the_threshold_stays_home(self):
+        assert _ring_trigger(self._pool(16, 40), radius_miles=25, min_in_radius=16) is None
+
+    def test_an_unknown_distance_counts_as_in_radius(self):
+        """Never our geocoding coverage held against the member: the same rule
+        `_split_by_radius` follows when it refuses to drop an unplaceable
+        provider. It makes this trigger conservative — an unplaceable pool
+        looks full and stays home rather than spending credits on a guess."""
+        unplaceable = [{"name": f"Dr. {i}"} for i in range(16)]
+        assert _ring_trigger(unplaceable, radius_miles=25, min_in_radius=16) is None
+
+    def test_the_reason_names_the_numbers(self):
+        """A flag that a decision FIRED cannot say which follow-up to make."""
+        reason = _ring_trigger(self._pool(9, 4), radius_miles=25, min_in_radius=16)
+        assert reason == "thin_in_radius:9<16"
+
+
+class TestABlankPlatformRingsOut:
+    """A platform serving no rows for a town is a fact about the TOWN.
+
+    A live cardiology run read 16 healthgrades rows and 65 webmd rows — a
+    comfortable-looking pool — while vitals returned a 17 KB body with zero: not
+    an error and not a slug miss, but the platform's own "Popular specialties /
+    Top Doctors Near" landing page, which is how it says a place is below its
+    granularity. The same slug served 59 rows for the metro 16 miles away.
+    """
+
+    HG = "https://www.healthgrades.com/cardiology-directory/tn-tennessee/soddy-daisy"
+    WM = "https://doctor.webmd.com/providers/specialty/cardiovascular-disease/tennessee/soddy-daisy"
+    VI = "https://www.vitals.com/cardiovascular-disease/tn/soddy-daisy"
+
+    def test_the_live_shape_names_the_blank_platform(self):
+        assert _blank_listing_domains(
+            [self.HG, self.WM, self.VI],
+            {"healthgrades.com": 16, "doctor.webmd.com": 65},
+        ) == ["vitals.com"]
+
+    def test_a_platform_never_asked_is_not_blank(self):
+        """healthgrades publishes no pathology directory, so that specialty
+        constructs no URL for it. Counting the absence as a blank would ring
+        out on every search for it, forever, on our own mapping."""
+        assert _blank_listing_domains(
+            [self.WM, self.VI], {"doctor.webmd.com": 7, "vitals.com": 6}
+        ) == []
+
+    def test_all_blank_reports_nothing(self):
+        """Zero rows EVERYWHERE is a parser or fetch failure on our side, not a
+        sparse town — the LLM per-page fallback already answers it, and more
+        pages from a second city would be just as unreadable. A blank is only
+        meaningful relative to a platform that worked."""
+        assert _blank_listing_domains([self.HG, self.WM, self.VI], {}) == []
+        assert _blank_listing_domains(
+            [self.HG, self.WM, self.VI],
+            {"healthgrades.com": 0, "doctor.webmd.com": 0, "vitals.com": 0},
+        ) == []
+
+    def test_a_blank_rings_even_when_the_pool_looks_full(self):
+        full = [{"name": f"Dr. {i}", "computed_distance_miles": 4.0} for i in range(40)]
+        assert _ring_trigger(full, 25, 16, ["vitals.com"]) == "platform_blank:vitals.com"
+
+    def test_a_healthy_three_platform_town_rings_on_neither_count(self):
+        full = [{"name": f"Dr. {i}", "computed_distance_miles": 4.0} for i in range(40)]
+        blanks = _blank_listing_domains(
+            [self.HG, self.WM, self.VI],
+            {"healthgrades.com": 11, "doctor.webmd.com": 7, "vitals.com": 6},
+        )
+        assert _ring_trigger(full, 25, 16, blanks) is None
+
+
+class TestTheRingThresholdIsAnOperatorKnob:
+    """Left in the environment because the right multiple is a judgement about
+    how far a member will travel for a better-reviewed provider — answered by
+    watching live runs, not by a constant argued for once."""
+
+    def test_default_is_twice_the_research_budget(self, monkeypatch):
+        monkeypatch.delenv("RING_MIN_IN_RADIUS_POOL", raising=False)
+        config = Config()
+        assert config.RING_MIN_IN_RADIUS_POOL == 2 * config.MAX_PROVIDERS_TO_ENRICH
+
+    def test_env_override_is_honoured(self, monkeypatch):
+        monkeypatch.setenv("RING_MIN_IN_RADIUS_POOL", "24")
+        assert Config().RING_MIN_IN_RADIUS_POOL == 24
+
+    def test_zero_disables_the_pool_trigger_without_touching_the_blank_one(self):
+        """The off switch has to leave the platform signal alone: they answer
+        different questions and an operator turning down eagerness on pool size
+        is not saying a town's missing platform stopped mattering."""
+        assert _ring_trigger([], 25, 0) is None
+        assert _ring_trigger([], 25, 0, ["vitals.com"]) == "platform_blank:vitals.com"
+
+
+class TestTheTriggerIsWiredAndRecorded:
+    """Helper-only tests let the wiring be deleted with the suite green, and
+    the whole defect here WAS wiring: the predicate was fine, it was being
+    asked about the wrong pool at the wrong point in the pipeline."""
+
+    def _run(self, gatherer, providers, radius=25):
+        with patch.object(gatherer, "_search_providers",
+                          return_value=[{"url": "https://example.com/a", "title": "t"}]), \
+             patch.object(gatherer, "_extract_provider_data", return_value=providers), \
+             patch("agents.data_gatherer.nearby_cities",
+                   return_value=["Chattanooga, TN"]) as nearby:
+            # `_discover_candidates` is left REAL: the suite pins
+            # TAVILY_MODE=search, where it is the function that calls
+            # `_search_providers`, so stubbing it out empties `search_results`
+            # and the ring block never runs at all.
+            result = gatherer.gather_providers(
+                specialty="Dermatology", location="Soddy Daisy, TN 37379",
+                radius_miles=radius, enrich=False,
+            )
+        return result, nearby
+
+    def test_a_thin_in_radius_pool_rings_and_records_why(
+        self, data_gatherer: DataGathererAgent
+    ):
+        """The live dermatology shape: 13 raw, 9 inside 25 miles, budget 8."""
+        data_gatherer.config.RING_MIN_IN_RADIUS_POOL = 16
+        pool = (
+            [{"name": f"Dr. Near {i}", "location": "Soddy Daisy, TN 37379"} for i in range(9)]
+            + [{"name": f"Dr. Far {i}", "location": "Nashville, TN 37203"} for i in range(4)]
+        )
+        result, nearby = self._run(data_gatherer, pool)
+
+        nearby.assert_called_once()
+        assert result["search_metadata"]["ring_expanded"] is True
+        assert result["search_metadata"]["ring_reason"] == "thin_in_radius:9<16"
+
+    def test_the_same_pool_stays_home_under_a_lower_threshold(
+        self, data_gatherer: DataGathererAgent
+    ):
+        """The knob has to actually reach the decision — the operator sets it
+        on the deployment, so a value that changed nothing would be worse than
+        no knob at all."""
+        data_gatherer.config.RING_MIN_IN_RADIUS_POOL = 8
+        pool = [
+            {"name": f"Dr. Near {i}", "location": "Soddy Daisy, TN 37379"} for i in range(9)
+        ]
+        result, nearby = self._run(data_gatherer, pool)
+
+        nearby.assert_not_called()
+        assert result["search_metadata"]["ring_expanded"] is False
+        assert result["search_metadata"]["ring_reason"] is None
+
+    def test_the_ring_reaches_exactly_as_far_as_the_member_allowed(
+        self, data_gatherer: DataGathererAgent
+    ):
+        """Ringing past the chosen radius imports cities the radius bound then
+        deletes — credits and an extraction spent on rows that cannot survive."""
+        data_gatherer.config.RING_MIN_IN_RADIUS_POOL = 16
+        pool = [{"name": "Dr. Solo", "location": "Soddy Daisy, TN 37379"}]
+        _, nearby = self._run(data_gatherer, pool, radius=10)
+
+        assert nearby.call_args.args[1] == 10
+
+    def test_the_reason_reaches_the_run_record_as_a_descriptor(self):
+        """It is a STRING. Measurements become Langfuse scores, which are
+        numeric, so a reason classified as one would be dropped or coerced —
+        and the field exists precisely to be read back off a trace."""
+        from utils.run_record import (
+            DESCRIPTOR_FIELDS, RUN_RECORD_FIELDS, build_run_record, measurement_fields,
+        )
+
+        assert "ring_reason" in RUN_RECORD_FIELDS
+        assert "ring_reason" in DESCRIPTOR_FIELDS
+        assert "ring_reason" not in measurement_fields()
+
+        record = build_run_record({
+            "gathered_data": {"search_metadata": {
+                "ring_expanded": True, "ring_reason": "platform_blank:vitals.com",
+            }},
+        })
+        assert record["ring_reason"] == "platform_blank:vitals.com"
+        assert record["ring_fired"] is True
+
+
 class TestRingProvenance:
     """`ring_expanded` said the ring FIRED; nothing said what it bought.
 
@@ -2243,7 +2464,10 @@ class TestRingProvenance:
              patch.object(data_gatherer, "_extract_provider_data",
                           return_value=[{"name": "Dr. Jane Kim"}]), \
              patch.object(data_gatherer, "_attach_location_evidence", lambda *a, **k: None):
-            data_gatherer.config.MIN_CANDIDATE_POOL = 0    # never fires
+            # RING_MIN_IN_RADIUS_POOL is the gate; MIN_CANDIDATE_POOL no
+            # longer decides this and zeroing it alone would let the ring fire.
+            data_gatherer.config.MIN_CANDIDATE_POOL = 0
+            data_gatherer.config.RING_MIN_IN_RADIUS_POOL = 0    # never fires
             result = data_gatherer.gather_providers("Neurology", "Chandler, AZ", enrich=False)
 
         assert result["search_metadata"]["ring_expanded"] is False

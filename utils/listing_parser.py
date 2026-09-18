@@ -119,8 +119,31 @@ _HG_PAIR = re.compile(
 # State-directory entries state specialty and address on their own lines
 # rather than in the city page's `ratings <Specialty> [<address>]` tail.
 _HG_SPECIALTY_LINE = re.compile(r"^Specialty:\s*(?P<specialty>[^\n]+?)\s*$", re.M)
+# The address link, whose text now carries the page's own mileage AFTER the
+# ZIP — on one line, or wrapped onto a second:
+#
+#     [2051 Hamill Rd Ste 301A Hixson, TN 37343 9.0 mi miles away](…/physician/…)
+#     [2563 S Val Vista Dr Ste 101AGilbert, AZ 85295
+#     4.9 mi miles away](…/physician/…)
+#
+# This pattern used to demand the "]" immediately after the ZIP and keep the
+# link text on ONE line, so both shapes read as NO ADDRESS: every row on every
+# directory page measured came back with a name, a rating and no location.
+# In a dense market that is invisible, because the other two platforms state
+# an address for the same doctors. In a SMALL market it is total: that
+# directory is often the only page naming the local providers, and with no
+# location for anyone the radius bound cannot place a single row, so it drops
+# nobody and the research budget fills with whoever the page listed first —
+# including providers in other states.
+#
+# The mileage is matched only so it can be SKIPPED. It is measured from the
+# page's own city, not from the member's location, so parsing it as a distance
+# would publish a number from the wrong origin as though it were measured
+# (the same reason `_TRAILING_MILES` strips it from an address that carries it).
 _HG_ADDRESS_LINK = re.compile(
-    r"\[(?P<address>\d[^\]\n]{6,90}?\d{5})\]\((?:https?://[^)\s/]+)?/physician/")
+    r"\[(?P<address>\d[^\]]{6,90}?\d{5})"
+    r"(?:\s*\d+(?:\.\d+)?\s*mi(?:les)?(?:\s+miles)?(?:\s+away)?)?"
+    r"\s*\]\((?:https?://[^)\s/]+)?/physician/")
 # `We found 81 results within 10 miles for "Neurologists near Chandler, AZ"` —
 # the page's own count of a directory that lists 20 per page.
 _HG_RESULT_COUNT = re.compile(r"We found\s*(?P<count>\d[\d,]*)\s*results", re.I)
@@ -166,6 +189,100 @@ _VITALS_VIEW_PROFILE = re.compile(
 # dividing by the smaller set would penalise every correct pairing.
 _SLUG_NAME_AGREEMENT = 0.5
 _VITALS_CITY = re.compile(r"^(?P<city>[A-Z][A-Za-z .'-]{2,40},\s*[A-Z]{2})", re.M)
+
+# Each webmd and vitals entry is introduced by its own PHOTO CAPTION, which
+# states the provider's practice city even when the row itself states no
+# address:
+#
+#     ![Dr. Anne E Allen, MD - Knoxville, TN - Dermatology](…)
+#     ![Image 34: Dr. James Jay Merrill, MD - Bristol, TN - Cardiovascular Disease](…)
+#
+# That is the only place some rows say where the provider is. A city directory
+# for a SMALL market is largely national virtual practices, and those rows
+# carry no street address at all — measured on three small-market pages in
+# three states, 0 of 7, 0 of 11 and 0 of 3 rows stated one. With no location a
+# row inherits the searched city by default, scores as a neighbour, and takes a
+# research-budget slot from a provider who is actually nearby.
+#
+# The caption is city precision, never better, so it is used ONLY when the row
+# states no address: `_attach_location_evidence` already treats a city-centroid
+# distance as the honest `city_estimate` basis rather than a measurement.
+_ROW_CAPTION = re.compile(r"!\[(?P<alt>[^\]\n]{3,300})\]\(")
+_CAPTION_IMAGE_PREFIX = re.compile(r"^Image\s+\d+:\s*", re.I)
+_CAPTION_PLACE = re.compile(
+    r"^(?P<name>.{2,80}?)\s+-\s+(?P<city>[A-Z][A-Za-z .'-]{1,40}?),\s*(?P<state>[A-Z]{2})\s+-\s+"
+    r"(?P<tail>.{0,240})$")
+# How much of the HEADING's name the caption must carry before its city is
+# believed. Subset, not a ratio: a caption sits between two entries, so the
+# only question that matters is whether it names THIS provider, and two
+# adjacent doctors sharing a surname would clear any ratio at 0.5. Missing a
+# city costs one row a precise position, which the post-research radius check
+# recovers; taking the neighbour's city publishes a wrong distance as measured.
+
+# A row that states a SERVICE AREA is a virtual practice listed in a city it
+# does not sit in — a national telehealth provider appearing on a small
+# market's directory page because the platform has nothing local to show:
+#
+#     Telehealth Only
+#     ACCEPTING NEW PATIENTS FOR TELEHEALTH SERVICES in AL, AK, AR, CA, …
+#     …Dermatology, Medical and Cosmetic Dermatology, Virtual Visits in all 50 states
+#
+# Deliberately NOT matched, because LOCAL providers carry them too and
+# excluding on them would delete the market's own doctors: "Virtual Visit
+# available", "Video is available for this profile", and healthgrades' own
+# "Virtual Visits" attribute bullet. Offering video visits is an attribute;
+# stating the states you serve is a different claim.
+_TELEHEALTH_SERVICE_AREA = re.compile(
+    r"Telehealth\s+Only"
+    r"|TELEHEALTH\s+SERVICES\s+in\s+[A-Z]{2}\b"
+    r"|Virtual\s+Visits?\s+in\s+all\s+50\s+states",
+    re.I)
+
+# The one quoted patient review a webmd or vitals entry carries:
+#
+#     … Bristol, TN, 37620 "Dr. Merrill is an excellent physician.Very
+#     informative, patient and kind."…View Profile
+#     "Dr. Khanna was incredibly compassionate and reassuring during a very
+#     stressful time for me." [View Profile](/doctors/trisha-khanna-st91aw)
+#
+# A webmd profile is NOT wordless, which an earlier version of this comment
+# asserted and measurement refuted: the platform writes its OWN review summary
+# paragraph ("Patients consistently praise … However, some patients …") for
+# providers who have written reviews, and the enrichment excerpt already
+# carries it to the model. What webmd never serves is the INDIVIDUAL reviews —
+# that body is rendered by script and absent from every fetchable variant of
+# the URL, `-overview`, `-reviews` and `-ratings` returning identical bytes.
+# So this quote is the only patient review text obtainable for the NARROWER
+# case it was built for: a row quoting a patient beside a profile that carries
+# no summary of its own. Reading the parsers alone is what produced the wrong
+# claim, since no parser reads that paragraph — only the model does.
+#
+# Quoted text only, and at least 40 characters. The unquoted sentence beside
+# it is the platform's own generated blurb ("Dr. Lee brings 35 years of
+# cardiovascular disease experience to his practice…"), which is not patient
+# feedback and must never be presented as any. The floor also keeps out link
+# titles, which are short and quoted (`[View Profile](… "View Profile")`).
+#
+# healthgrades rows are NOT read for quotes, and the reason is not that they
+# have none. Measured over two live city directories, 0 of 31 healthgrades
+# rows carried one — but the PAGE carries several, and they are testimonials
+# about the site itself ("It's nice to see Healthgrades go beyond by showing
+# the history and background of the Drs.", "I always go to Healthgrades to
+# look up providers."). They sit outside any entry block, so per-block
+# scoping already keeps them out; reading the page instead would attribute
+# marketing copy to a physician.
+_ROW_REVIEW_QUOTE = re.compile(r'["\u201c](?P<quote>[^"\u201c\u201d]{40,400})["\u201d]')
+
+# The 40-char floor is not enough on its own, because markdown link and image
+# syntax is QUOTED in the raw body and runs long. Measured over six live
+# directory pages: a webmd row yielded `) ![TAG Registered Seal](https://
+# img.webmd.com/…` and a vitals row `[View Profile](/doctors/dan-joseph-
+# capampangan-rtzjkh) [View Profile](…`, and both would have been published on
+# a card as that doctor's patient feedback. The first quoted run in a block is
+# therefore a CANDIDATE, not the answer: markup-bearing candidates are skipped
+# and the first clean one wins, because the real review usually sits after the
+# entry's photo and profile link rather than before them.
+_QUOTE_IS_MARKUP = re.compile(r"!\[|\]\(|https?://|www\.")
 
 _SPECIALTY_LINE = re.compile(r"^(?P<specialty>[A-Z][A-Za-z /&'-]{2,40})\s*$", re.M)
 
@@ -251,18 +368,89 @@ def _absolute_url(page_url: str, href: Optional[str]) -> Optional[str]:
         return href
 
 
+def _parse_caption(alt: str) -> Optional[Dict[str, str]]:
+    """A photo caption's provider name, practice city and trailing labels.
+
+    None when the alt text is not a provider caption at all — a bare
+    `![](photo.jpg)`, a logo ("Daily Mail logo"), a brand ("DermatologistOnCall")
+    or healthgrades' positional `![Image 2](…)`. Those must not be mistaken for
+    a place: the whole value of this field is that it says where someone is.
+    """
+    alt = _CAPTION_IMAGE_PREFIX.sub("", str(alt or "").strip())
+    match = _CAPTION_PLACE.match(alt)
+    if not match:
+        return None
+    return {
+        "name": match.group("name").strip(),
+        "place": f"{match.group('city').strip()}, {match.group('state')}",
+        "tail": match.group("tail").strip(),
+        "text": alt,
+    }
+
+
+def _caption_names(caption_name: str, heading_name: str) -> bool:
+    """Does this caption name the provider whose heading follows it?
+
+    Every token of the HEADING's name must appear in the caption. A ratio would
+    admit two adjacent doctors who share a surname, and a caption sits exactly
+    between two entries — so "close enough" is the one answer that cannot be
+    allowed. Refusing a real caption costs a row its city, which the
+    post-research radius check recovers; accepting a neighbour's publishes a
+    wrong distance as though it were measured.
+    """
+    heading_tokens = normalize_name_tokens(heading_name)
+    if not heading_tokens:
+        return False
+    return heading_tokens <= normalize_name_tokens(caption_name)
+
+
+def _caption_before(text: str, start: int, end: int, name: str):
+    """(offset, parsed caption) for the caption introducing `name`, or (None, None)."""
+    if not name or start >= end:
+        return None, None
+    window = text[start:end]
+    for match in reversed(list(_ROW_CAPTION.finditer(window))):
+        caption = _parse_caption(match.group("alt"))
+        if caption and _caption_names(caption["name"], name):
+            return start + match.start(), caption
+    return None, None
+
+
 def _blocks(text: str, heading: re.Pattern) -> List[Dict[str, Any]]:
-    """(name, profile_url, body) per entry, body running to the next heading."""
+    """(name, profile_url, body, caption) per entry.
+
+    An entry's own photo caption sits BEFORE its heading, which means the NEXT
+    entry's caption sits inside what would otherwise be this entry's body. That
+    is not cosmetic: one platform writes "Virtual Visits in all 50 states" into
+    the caption, so a row read with its neighbour's caption still attached
+    inherits the neighbour's city AND the neighbour's service-area claim. The
+    body therefore ends where the next entry's caption begins, and each block
+    carries only the caption that names its own provider.
+    """
     found = list(heading.finditer(text))
-    out = []
-    for index, match in enumerate(found):
+    entries = []
+    for match in found:
         groups = match.groupdict()
-        name = (groups.get("name") or groups.get("lname") or groups.get("bname") or "").strip()
-        stop = found[index + 1].start() if index + 1 < len(found) else len(text)
-        out.append({
-            "name": name,
+        entries.append({
+            "match": match,
+            "name": (groups.get("name") or groups.get("lname") or groups.get("bname") or "").strip(),
             "profile_url": (groups.get("url") or "").strip() or None,
+        })
+    out = []
+    for index, entry in enumerate(entries):
+        match = entry["match"]
+        lead_start = entries[index - 1]["match"].end() if index else 0
+        stop = entries[index + 1]["match"].start() if index + 1 < len(entries) else len(text)
+        _, caption = _caption_before(text, lead_start, match.start(), entry["name"])
+        if index + 1 < len(entries):
+            next_at, _ = _caption_before(text, match.end(), stop, entries[index + 1]["name"])
+            if next_at is not None:
+                stop = next_at
+        out.append({
+            "name": entry["name"],
+            "profile_url": entry["profile_url"],
             "body": text[match.end():stop],
+            "caption": caption,
         })
     return out
 
@@ -316,6 +504,42 @@ def listing_result_count(url: str, text: str) -> Optional[int]:
     return max(counts) if counts else None
 
 
+def _caption_fields(block: Dict[str, Any], location: Optional[str]):
+    """(location, came-from-caption, telehealth-only) for one parsed block.
+
+    The caption supplies a CITY only when the row itself states no address, so
+    a street address always wins: city precision cannot separate two providers
+    in one town, and `_attach_location_evidence` scores a city-centroid
+    distance under the honest `city_estimate` basis rather than as a
+    measurement.
+
+    The service-area test reads the block's own caption and body — and only
+    those, which is what the caption-aware block boundary is for.
+    """
+    caption = block.get("caption") or {}
+    from_caption = False
+    if not location and caption.get("place"):
+        location = caption["place"]
+        from_caption = True
+    own_text = f"{caption.get('text', '')}\n{block.get('body', '')}"
+    return location, from_caption, bool(_TELEHEALTH_SERVICE_AREA.search(own_text))
+
+
+def _row_review_quote(block: Dict[str, Any]) -> Optional[str]:
+    """The quoted patient review inside this entry's own block, or None.
+
+    Read from the BODY only, never the caption, and the block ends before the
+    next entry's caption — a review attributed to the wrong doctor is worse
+    than no review at all.
+    """
+    for match in _ROW_REVIEW_QUOTE.finditer(block.get("body", "") or ""):
+        quote = " ".join(match.group("quote").split())
+        if _QUOTE_IS_MARKUP.search(quote):
+            continue
+        return quote
+    return None
+
+
 def _parse_healthgrades(text: str) -> List[Dict[str, Any]]:
     rows = []
     for block in _blocks(text, _HG_HEADING):
@@ -324,6 +548,11 @@ def _parse_healthgrades(text: str) -> List[Dict[str, Any]]:
         tail = _HG_TAIL.search(body)
         specialty_line = _HG_SPECIALTY_LINE.search(body)
         address_link = _HG_ADDRESS_LINK.search(body)
+        location, from_caption, telehealth_only = _caption_fields(block, (
+            clean_address(tail.group("address")) if tail
+            else clean_address(address_link.group("address")) if address_link
+            else None
+        ))
         # A block with NO pair is still a row. healthgrades renders pages 2+
         # of a city directory as heading + photo only — no rating, no
         # address — and dropping those entries dropped the doctor entirely:
@@ -342,11 +571,9 @@ def _parse_healthgrades(text: str) -> List[Dict[str, Any]]:
                 else specialty_line.group("specialty").strip() if specialty_line
                 else None
             ),
-            "location": (
-                clean_address(tail.group("address")) if tail
-                else clean_address(address_link.group("address")) if address_link
-                else None
-            ),
+            "location": location,
+            "location_from_caption": from_caption,
+            "telehealth_only": telehealth_only,
             "years_experience": None,
         })
     return rows
@@ -369,13 +596,18 @@ def _parse_webmd(text: str) -> List[Dict[str, Any]]:
         address = _WEBMD_ADDRESS.search(
             _WEBMD_YEARS.sub(" ", body) if years else body
         )
+        location, from_caption, telehealth_only = _caption_fields(
+            block, clean_address(address.group("address")) if address else None)
         rows.append({
             "name": block["name"],
             "profile_url": block["profile_url"],
             "rating": _float(pair.group("rating")) if pair else None,
             "review_count": _int(pair.group("count")) if pair else None,
             "specialty": specialty.group("specialty").strip() if specialty else None,
-            "location": clean_address(address.group("address")) if address else None,
+            "location": location,
+            "location_from_caption": from_caption,
+            "telehealth_only": telehealth_only,
+            "review_snippet": _row_review_quote(block),
             "years_experience": _int(years.group("years")) if years else None,
         })
     return rows
@@ -519,13 +751,18 @@ def _parse_vitals(text: str) -> List[Dict[str, Any]]:
         # provider can still be enriched from their profile page.
         count = _int(plain.group("count")) if plain else (
             _int(linked.group("count")) if linked else None)
+        location, from_caption, telehealth_only = _caption_fields(
+            block, clean_address(city.group("city")) if city else None)
         rows.append({
             "name": block["name"],
             "profile_url": block["profile_url"],
             "rating": rating,
             "review_count": count,
             "specialty": specialty.group("specialty").strip() if specialty else None,
-            "location": clean_address(city.group("city")) if city else None,
+            "location": location,
+            "location_from_caption": from_caption,
+            "telehealth_only": telehealth_only,
+            "review_snippet": _row_review_quote(block),
             "years_experience": _int(years.group("years")) if years else None,
         })
     return rows
