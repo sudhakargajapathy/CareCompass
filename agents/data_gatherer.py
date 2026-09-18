@@ -405,6 +405,94 @@ def _specialty_is_compatible(row_specialty: Any, target: str) -> bool:
     )
 
 
+# How many quoted directory excerpts are ever shown or published. Two, because
+# one is the normal case and a third adds no new theme — and because the point
+# is to say SOMETHING true about a provider nobody has written about at
+# length, not to assemble a review corpus out of directory furniture.
+_MAX_LISTING_EXCERPTS = 2
+
+_NO_REVIEWS = "No reviews available"
+
+
+def _listing_excerpts(provider: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """This provider's quoted directory reviews, bounded and de-blanked."""
+    out = []
+    for entry in (provider.get("review_snippets") or []):
+        text = " ".join(str((entry or {}).get("text") or "").split())
+        if text:
+            out.append({"text": text, "source_url": (entry or {}).get("source_url")})
+        if len(out) >= _MAX_LISTING_EXCERPTS:
+            break
+    return out
+
+
+def _listing_excerpt_block(excerpts: Optional[List[Dict[str, Any]]]) -> str:
+    """The prompt section carrying the directory excerpts, or "" when none."""
+    excerpts = excerpts or []
+    if not excerpts:
+        return ""
+    quoted = "\n".join(
+        f'- "{e["text"]}" (quoted on {e.get("source_url") or "a directory listing"})'
+        for e in excerpts
+    )
+    return (
+        "\nPATIENT REVIEW EXCERPTS quoted on a directory listing for this same "
+        "provider, NOT included below — each is a single review, so integrate "
+        "them without presenting them as a body of feedback:\n"
+        f"{quoted}\n"
+    )
+
+
+def _apply_listing_excerpt_summary(provider: Dict[str, Any]) -> bool:
+    """Compose a summary from a quoted directory review when nothing else exists.
+
+    THREE cases, and only the third reaches here. This shipped on the premise
+    that a listed provider's profile reaches a fetch carrying no review prose
+    at all, which measuring five webmd profiles refuted: the platform writes
+    its OWN review summary paragraph for providers who have written reviews,
+    and the enrichment excerpt already carries it to the model, so those never
+    arrive here — the premise came from reading the parsers, and no parser
+    reads that paragraph. A
+    provider with ratings but NO written reviews has an empty "Patients'
+    Perspective" heading and no summary anywhere, and "No reviews available"
+    is the correct card for them. The third case is the one this serves: a
+    provider whose directory row quotes an actual patient while their profile
+    carries no summary, where the card would otherwise read "No reviews
+    available" beside a rating built from dozens of reviews and the rubric
+    judge, asked to cite evidence, would correctly cite the absence.
+
+    Runs AFTER the outcome is classified and never touches it. Composing the
+    summary earlier would flip a provider from `no_profile_found` — or, worse,
+    from `identity_rejected`, where every page fetched was about someone else —
+    to `enriched`, on the strength of one line from a directory. The outcome
+    answers "what did researching this provider achieve"; this answers "is
+    there anything true to show", and those must not be the same question.
+
+    Written in CODE rather than left to the model, because the model has
+    already answered: this runs only where it returned the placeholder. Stated
+    as N quoted reviews from a listing, so the sentence cannot be read as a
+    summary of a body of feedback — the judge's own source-credibility ceiling
+    then bounds what a single quote can fund.
+    """
+    if provider.get("enrichment_outcome") not in ("enriched", "cached"):
+        return False
+    summary = str(provider.get("review_summary") or "").strip()
+    if summary and summary != _NO_REVIEWS:
+        return False
+    excerpts = _listing_excerpts(provider)
+    if not excerpts:
+        return False
+    quoted = " ".join(f'"{e["text"]}"' for e in excerpts)
+    noun = "review" if len(excerpts) == 1 else "reviews"
+    provider["review_summary"] = (
+        f"No profile review text was available for this provider. "
+        f"{len(excerpts)} patient {noun} quoted on a directory listing: {quoted}"
+    )
+    if not provider.get("review_source_url"):
+        provider["review_source_url"] = excerpts[0].get("source_url")
+    return True
+
+
 def _listing_row_to_provider(row: Dict[str, Any], specialty: str) -> Dict[str, Any]:
     """A parsed listing row in the shape the rest of the pipeline expects.
 
@@ -423,11 +511,18 @@ def _listing_row_to_provider(row: Dict[str, Any], specialty: str) -> Dict[str, A
         "name": row.get("name"),
         "specialty": row.get("specialty") or specialty,
         "location": row.get("location"),
-        # Where the address came from, carried from the first write. A card
-        # showed two different doctors at one street address and one distance,
-        # and no surface could say whether that came from a listing row, a
-        # parsed profile, or a model reading a group practice page.
-        "location_source": f"listing_parser:{row.get('review_source_url')}",
+        # A card showed two different doctors at one street address and one
+        # distance, and no surface could say whether that came from a listing
+        # row, a parsed profile, or a model reading a group practice page.
+        # Where the address came from, carried from the first write, and
+        # whether it was the row's own street address or the entry's photo
+        # caption — a caption gives a CITY, which is a coarser claim, and a
+        # triage surface that cannot tell the two apart cannot explain why two
+        # providers in one town share a distance.
+        "location_source": (
+            f"listing_parser:{row.get('review_source_url')}"
+            + (" (photo caption)" if row.get("location_from_caption") else "")
+        ),
         "years_experience": row.get("years_experience"),
         # Same provenance discipline as the address: tenure decides real
         # ranking points (a stated year vs the unknown imputation), so triage
@@ -444,6 +539,17 @@ def _listing_row_to_provider(row: Dict[str, Any], specialty: str) -> Dict[str, A
         "review_summary": "No reviews available",
         "review_sentiment": "unknown",
         "insurance_accepted": [],
+        # The quoted patient review the entry carried, kept with the page it
+        # was read from. NOT the usual source of review text: a webmd profile
+        # states its own summary paragraph for providers who have written
+        # reviews and the enrichment excerpt already carries it. This is the
+        # only text obtainable where a row quotes a patient beside a profile
+        # carrying no summary — the individual reviews being script-rendered
+        # and absent from every fetchable variant of the URL.
+        "review_snippets": (
+            [{"text": row["review_snippet"], "source_url": row.get("review_source_url")}]
+            if row.get("review_snippet") else []
+        ),
         "extraction_source": "listing_parser",
     }
     if row.get("rating") is not None and (row.get("review_count") or 0) > 0:
@@ -517,7 +623,7 @@ _MIN_CREDIBLE_COUNT = 3
 # rather than competing versions of the same fact — merge them instead of
 # picking a winner. (`_select_review_observation` collapses observations to one
 # voice per platform downstream, so a union here cannot double-count.)
-_UNION_ON_DEDUPE = ("review_observations", "insurance_accepted")
+_UNION_ON_DEDUPE = ("review_observations", "insurance_accepted", "review_snippets")
 
 
 def _union_platform_profile_urls(*records: Dict[str, Any]) -> Dict[str, str]:
@@ -910,6 +1016,80 @@ def _split_by_radius(
         else:
             near.append(provider)
     return near, far
+
+
+def _blank_listing_domains(
+    attempted_urls: Optional[List[str]], listing_rows: Optional[Dict[str, Any]]
+) -> List[str]:
+    """Review platforms we FETCHED that returned no readable rows.
+
+    Only domains we actually asked for: a specialty with no directory on a
+    platform (healthgrades publishes none for pathology) is mapped to None and
+    never fetched, and counting that as a blank would ring out on every search
+    for it. `attempted_urls` is what discovery constructed, so the difference
+    between "asked and got nothing" and "never asked" stays visible — the same
+    distinction `enrichment_sources.yielded` exists to preserve one stage down.
+
+    A blank is a real signal about the TOWN, not about us. A live small-market
+    cardiology run read 16 healthgrades rows and 65 webmd rows while vitals
+    returned a 17 KB body with zero: not an error page and not a slug miss —
+    the platform's own "Popular specialties / Top Doctors Near" landing page,
+    which is how vitals says a place is below its granularity. The same slug
+    served 59 rows for the metro 16 miles away. When a platform files a town's
+    doctors under the metro, the metro is where they are.
+
+    A blank is only meaningful RELATIVE to a platform that worked. When no
+    domain recorded a single row, the honest reading is that the parsers never
+    ran or could not read anything — a failure on our side, which the LLM
+    per-page fallback already answers and which more pages from a second city
+    would not fix. So an all-blank result reports nothing and leaves the
+    decision to the pool-size test. The live signal that motivated this trigger
+    has the shape it requires: healthgrades 16 rows, webmd 65, vitals 0.
+    """
+    rows = listing_rows or {}
+    if not any(rows.values()):
+        return []
+    blank = []
+    for url in attempted_urls or []:
+        domain = source_domain(url)
+        if domain and not rows.get(domain) and domain not in blank:
+            blank.append(domain)
+    return blank
+
+
+def _ring_trigger(
+    providers: List[Dict[str, Any]],
+    radius_miles: float,
+    min_in_radius: int,
+    blank_domains: Optional[List[str]] = None,
+) -> Optional[str]:
+    """Why the ring should fire, or None to stay home.
+
+    Counts the pool INSIDE the radius, which is the only count the research
+    budget ever sees. The predecessor compared the RAW pool against the budget
+    and could not fire in the markets it was built for: two live small-market
+    runs held 13 and 76 raw candidates — both above any threshold worth
+    setting — that the radius bound then cut to 9 and 22 against a budget of 8.
+    The raw number describes the platforms' city pages, which are radius
+    CENTRES covering a whole metro; the in-radius number describes the member's
+    actual choices.
+
+    Distances must already be attached, and an UNKNOWN distance counts as
+    in-radius here for the same reason `_split_by_radius` refuses to drop one:
+    it is our geocoding coverage, not their location. That makes this
+    trigger CONSERVATIVE by construction — an unplaceable pool looks full and
+    stays home rather than spending credits on a guess.
+
+    Returns a reason string because "the ring fired" and "the ring fired
+    BECAUSE a platform was blank" have different follow-ups, and a flag that
+    only records that a decision happened cannot tell them apart.
+    """
+    in_radius, _ = _split_by_radius(providers, radius_miles)
+    if len(in_radius) < max(0, min_in_radius):
+        return f"thin_in_radius:{len(in_radius)}<{min_in_radius}"
+    if blank_domains:
+        return f"platform_blank:{','.join(sorted(blank_domains))}"
+    return None
 
 
 def _parse_profile_pages(results: Optional[List[Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
@@ -1389,6 +1569,12 @@ class DataGathererAgent:
             }
             self._listing_rows: Dict[str, int] = {}
             self._specialty_rows_dropped = 0
+            # Rows excluded because the listing states a SERVICE AREA rather
+            # than a practice. Counted and named, never silent: a filter that
+            # shrinks the pool is indistinguishable from a discovery failure
+            # from the outside — the same reason `radius_dropped` is recorded.
+            self._telehealth_rows_dropped = 0
+            self._telehealth_names: List[str] = []
 
     def _note_fetch(
         self, stage: str, planned: int = 0, fetched: int = 0, empty: int = 0,
@@ -1406,11 +1592,16 @@ class DataGathererAgent:
                 per = slot["by_domain"].setdefault(domain, {"fetched": 0, "empty": 0})
                 per["fetched" if has_body else "empty"] += 1
 
-    def _note_listing_rows(self, url: Any, rows: int, dropped: int) -> None:
+    def _note_listing_rows(
+        self, url: Any, rows: int, dropped: int, telehealth: Optional[List[str]] = None,
+    ) -> None:
         domain = source_domain(url) or "other"
         with self._stats_lock:
             self._listing_rows[domain] = self._listing_rows.get(domain, 0) + rows
             self._specialty_rows_dropped += dropped
+            if telehealth:
+                self._telehealth_rows_dropped += len(telehealth)
+                self._telehealth_names.extend(telehealth)
 
     def fetch_stats(self) -> Dict[str, Any]:
         """A copy of this search's fetch accounting (both stages), for the run record."""
@@ -1419,6 +1610,8 @@ class DataGathererAgent:
                 "fetch": self._fetch_stats,
                 "listing_rows": self._listing_rows,
                 "specialty_rows_dropped": self._specialty_rows_dropped,
+                "telehealth_rows_dropped": self._telehealth_rows_dropped,
+                "telehealth_names": self._telehealth_names[:20],
             }))
 
     def _initialize_clients(self) -> None:
@@ -1962,7 +2155,28 @@ class DataGathererAgent:
             for result in prioritized_results:
                 rows = parse_listing(result.get("url"), result.get("raw_content") or "")
                 kept = [r for r in rows if _specialty_is_compatible(r.get("specialty"), specialty)]
-                self._note_listing_rows(result.get("url"), len(rows), len(rows) - len(kept))
+                # A row that states a SERVICE AREA ("Telehealth Only", "…
+                # TELEHEALTH SERVICES in AL, AK, …", "Virtual Visits in all 50
+                # states") is a virtual practice the platform lists in a city
+                # it does not sit in. That is how a small market's directory
+                # page fills: with nothing local to show, the platform shows
+                # national providers, and those rows carry no address, so they
+                # inherit the searched city and take research-budget slots from
+                # the providers who are actually there.
+                #
+                # Excluded HERE, before the budget, for the same reason the
+                # specialty gate and the radius bound run here: every candidate
+                # admitted also spends an enrichment fetch, a judge slot and a
+                # critic verdict. Per ROW, not per provider — the drop costs a
+                # doctor only this platform's listing, and any platform that
+                # lists them with a real practice address still carries them
+                # into the pool.
+                telehealth = [r["name"] for r in kept if r.get("telehealth_only")]
+                kept = [r for r in kept if not r.get("telehealth_only")]
+                self._note_listing_rows(
+                    result.get("url"), len(rows), len(rows) - len(kept) - len(telehealth),
+                    telehealth=telehealth,
+                )
                 rows = kept
                 if rows:
                     parsed.extend(_listing_row_to_provider(r, specialty) for r in rows)
@@ -2513,7 +2727,7 @@ Response (JSON array only):"""
             logger.info("Dedup: %d extracted -> %d unique providers", len(providers), len(deduped))
         return deduped
 
-    def _extract_review_data_only(self, search_results: List[Dict[str, Any]], provider_name: str, specialty: str = "", provider_location: str = "", prior_summary: str = "") -> Dict[str, Any]:
+    def _extract_review_data_only(self, search_results: List[Dict[str, Any]], provider_name: str, specialty: str = "", provider_location: str = "", prior_summary: str = "", listing_excerpts: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         """Extract only review-related data for a specific provider using Claude Haiku.
 
         Args:
@@ -2671,6 +2885,13 @@ Response (JSON array only):"""
                     f"discard it:\n{carried}\n"
                 )
 
+            # The quoted review a directory entry carried. Shown for the same
+            # reason `prior_block` is: this pass replaces the summary wholesale
+            # and reads only its own pages, so anything it is not shown is
+            # dropped. It is labelled as ONE quoted excerpt, not a corpus,
+            # because that is what it is.
+            excerpt_block = _listing_excerpt_block(listing_excerpts)
+
             prompt = f"""Extract ONLY review information for the healthcare provider {identity} from the search results below.
 CRITICAL: Return ONLY a valid JSON object with review data.
 
@@ -2711,7 +2932,7 @@ IMPORTANT REVIEW EXTRACTION RULES:
 5. If NO actual patient review content found, use "No reviews available" and "unknown"
 6. review_summary must cover BOTH the previously gathered feedback (if any is shown below) and the new results — it REPLACES the earlier summary, so anything you leave out is lost. Where the two disagree, say so ("reviews on one platform note long waits, another does not") rather than dropping either. review_sentiment must reflect the combined evidence
 7. A page's own headline figure IS a stated value and must be transcribed: "3.4 out of 5 (23 ratings)", "4.2 / 5 · 108 reviews", "Rated 3.4 by 23 patients" all give rating AND review_count. These usually sit at the very TOP of a profile page, above the patient comments — read the beginning of each page's text, not only the parts that mention the provider by name. This does not loosen the rule above: a star-PERCENTAGE breakdown ("48% 5-star, 39% 1-star") is still never a rating, and you must not average one
-{prior_block}
+{prior_block}{excerpt_block}
 SEARCH RESULTS:
 {results_text}
 
@@ -3483,6 +3704,7 @@ Response (JSON object only):"""
         location: str,
         specialty: str = "",
         use_cache: bool = True,
+        radius_miles: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Public enrichment pass over the caller's ranked list (mutates in place).
 
@@ -3529,12 +3751,74 @@ Response (JSON object only):"""
             providers, query_location, specialty, user_location=location or ""
         )
 
+        # Before the store, so a provider whose only review text is a quoted
+        # directory line keeps it on the next search too — and after both
+        # paths, so a cache hit whose stored summary is the placeholder gets
+        # today's discovery excerpt rather than staying silent for the TTL.
+        for provider in providers:
+            _apply_listing_excerpt_summary(provider)
+
         if use_cache:
             self._store_enrichment(providers)
             for provider in providers:
                 provider.pop(CACHE_KEY_FIELD, None)
 
+        self._mark_beyond_radius(providers, radius_miles)
         return providers
+
+    def _mark_beyond_radius(
+        self, providers: List[Dict[str, Any]], radius_miles: Optional[float] = None,
+    ) -> int:
+        """Flag providers whose researched address lands outside the radius.
+
+        The radius bound runs ONCE, at discovery, and an unknown distance never
+        drops anyone — correctly, because that is our geocoding coverage rather
+        than the provider's location. Enrichment is where the unknown becomes
+        known: a profile states a street address, `_attach_location_evidence`
+        recomputes, and a provider admitted with no location at all turns out
+        to be hundreds of miles away. Nothing re-asked the question, so that
+        provider stayed a candidate and could be carded — measured on a live
+        search whose top five were all outside the radius the member chose.
+
+        Here rather than inside the per-provider worker, because the distance
+        is final only after BOTH paths have run: the live pass recomputes when
+        an address backfill changes the location, and a cache hit re-runs the
+        member-relative nearest-trusted-office selection and recomputes too.
+        One pass over the finished list reads the number both paths agree on.
+
+        `enrichment_outcome` is deliberately NOT changed. The row stays
+        `enriched`, so it is cached WITH the address it just proved — and the
+        next search's discovery-time bound drops it before it costs anything.
+        Re-labelling it a failure would bar the retry and throw away the one
+        fact this pass established.
+
+        An unknown distance still never marks anyone.
+        """
+        radius = radius_miles or self.config.DEFAULT_SEARCH_RADIUS
+        marked = 0
+        for provider in providers:
+            distance = provider.get("computed_distance_miles")
+            if distance is None or distance <= radius:
+                # Never sticky: a provider re-enriched into the radius (a
+                # nearer trusted office, a corrected address) must lose the
+                # mark, or one bad fetch would bar them for the cache's TTL.
+                provider.pop("beyond_radius", None)
+                continue
+            provider["beyond_radius"] = {
+                "miles": round(float(distance), 1),
+                "radius_miles": float(radius),
+            }
+            marked += 1
+        if marked:
+            logger.info(
+                "%d researched provider(s) sit beyond the %g-mile radius: %s",
+                marked, radius,
+                ", ".join(
+                    f"{p.get('name')} ({p['beyond_radius']['miles']:.0f} mi)"
+                    for p in providers if p.get("beyond_radius")
+                ),
+            )
+        return marked
 
     def _apply_cached_enrichment(
         self, providers: List[Dict[str, Any]], user_location: str = ""
@@ -3903,6 +4187,7 @@ Response (JSON object only):"""
             review_data = self._extract_review_data_only(
                 results, provider_name, specialty, provider.get("location", ""),
                 prior_summary=provider.get("review_summary", ""),
+                listing_excerpts=_listing_excerpts(provider),
             )
             # Annotated from THIS pass's extraction, before the merge folds in
             # discovery's observations — the question is what these pages
@@ -4181,6 +4466,16 @@ Response (JSON object only):"""
             # recall; a single query is the escape hatch.
             fetch_mode = self._tavily_mode()
             fetch_mode_fallback = False
+            # The listing URLs discovery CONSTRUCTED, so a platform that came
+            # back empty can be told apart from one we never asked (a
+            # specialty with no directory there is mapped to None upstream).
+            # Empty in search mode: nothing is constructed, so "blank" has no
+            # meaning and the ring falls to the pool-size test alone.
+            attempted_listing_urls: List[str] = []
+            # Why the ring fired, or None. Initialised out here because the
+            # metadata below reads it on every path, including the one where
+            # discovery returned no pages at all and the ring block never ran.
+            ring_reason: Optional[str] = None
             home_queries: List[str] = []
             search_results: List[Dict[str, Any]] = []
 
@@ -4192,6 +4487,7 @@ Response (JSON object only):"""
                 # degraded search index to find them. Display strings carry
                 # the URLs so the dev panel shows exactly what was fetched.
                 constructed = discovery_listing_urls(safe_specialty, query_location)
+                attempted_listing_urls = list(constructed)
                 home_queries = [f"extract: {u}" for u in constructed]
                 if constructed:
                     search_results, later_pages = self._extract_discovery_pages(
@@ -4260,13 +4556,16 @@ Response (JSON object only):"""
                 # scenario). Its cost (extra searches + one extraction) is paid
                 # only where it helps.
                 #
-                # MIN_CANDIDATE_POOL equals MAX_PROVIDERS_TO_ENRICH by intent,
-                # which gives this threshold a derivation rather than a
-                # preference: ring out exactly when the home city cannot fill
-                # the research budget. Deliberately NOT enforced as an
-                # invariant — round 4's clamp between two knobs was removed on
-                # purpose, and MIN_CANDIDATE_POOL=5 ("only rescue genuinely
-                # sparse towns") is a legitimate setting.
+                # The threshold is RING_MIN_IN_RADIUS_POOL, and it counts the
+                # pool the radius bound leaves behind. Its predecessor compared
+                # the RAW pool against MIN_CANDIDATE_POOL and could not fire in
+                # the markets it was written for: two live small-market runs
+                # held 13 and 76 raw candidates — above any threshold worth
+                # setting — that the radius then cut to 9 and 22 against a
+                # research budget of 8. The platforms' city pages are radius
+                # CENTRES covering a metro, so the raw count describes their
+                # catchment and not the member's choices. MIN_CANDIDATE_POOL
+                # keeps its own meaning elsewhere and no longer gates this.
                 #
                 # A second trigger — "or the pool is single-clustered" — was
                 # deleted in round 10. It answered "distance can't tell these
@@ -4280,8 +4579,34 @@ Response (JSON object only):"""
                 # search scores 1 and would ring out every time — on the ideal
                 # outcome. The sparse-town case it was built for already trips
                 # the thin-pool test above.
-                if (self.config.MULTI_QUERY_ENABLED
-                        and len(providers) < self.config.MIN_CANDIDATE_POOL):
+                #
+                # The SECOND trigger that does exist is a platform returning no
+                # rows for a town it was asked about — a fact about the town,
+                # not about us, and one the pool size cannot express: a live
+                # cardiology run read 16 healthgrades and 65 webmd rows (a
+                # comfortable-looking pool) while vitals served its "Popular
+                # specialties" landing page with zero, and the same slug
+                # returned 59 rows for the metro 16 miles away.
+                #
+                # The pool this asks about is the one INSIDE the radius, and
+                # the distances have to exist before it can be counted — so
+                # location evidence is attached HERE rather than only after
+                # the ring. It is pure computation over vendored centroids
+                # (no network, no model), it is idempotent, and the pass below
+                # re-runs it over the ring's own additions, so the early call
+                # costs a few milliseconds and buys the trigger its number.
+                ring_radius = radius_miles or self.config.DEFAULT_SEARCH_RADIUS
+                for provider in providers:
+                    self._attach_location_evidence(provider, safe_location)
+                ring_reason = _ring_trigger(
+                    providers,
+                    ring_radius,
+                    self.config.RING_MIN_IN_RADIUS_POOL,
+                    _blank_listing_domains(
+                        attempted_listing_urls, self.fetch_stats().get("listing_rows")
+                    ),
+                )
+                if self.config.MULTI_QUERY_ENABLED and ring_reason:
                     ring = nearby_cities(
                         # The ring reaches exactly as far as the user allowed.
                         # Reaching further would import cities the radius bound
@@ -4293,8 +4618,8 @@ Response (JSON object only):"""
                     )
                     if ring:
                         logger.info(
-                            f"Home pool thin ({len(providers)} providers, "
-                            f"below {self.config.MIN_CANDIDATE_POOL}); ringing out to {ring}"
+                            "Ringing out to %s (%s; %d raw home providers)",
+                            ring, ring_reason, len(providers),
                         )
                         # The SAME specs the home city uses — one basic call
                         # per listing domain — not `_build_search_query`. The
@@ -4428,6 +4753,10 @@ Response (JSON object only):"""
                 )
                 providers = in_radius
 
+            # One snapshot, read twice below: the whole-run counters and the
+            # two bound counts have to describe the SAME moment or a reader
+            # comparing them diagnoses a gap that never existed.
+            fetch_stats = self.fetch_stats()
             result = {
                 "providers": providers,
                 "search_metadata": {
@@ -4453,12 +4782,24 @@ Response (JSON object only):"""
                     # than inferred downstream from a query count the UI would
                     # have to hardcode the home-phrasing total to interpret.
                     "ring_expanded": len(queries_run) > len(home_queries),
+                    # WHY it fired, not just that it did. The two reasons have
+                    # different follow-ups — a thin in-radius pool is answered
+                    # by the threshold knob, a blank platform is answered by
+                    # looking at that platform's coverage for the town — and a
+                    # boolean cannot tell a reader which one to chase.
+                    "ring_reason": ring_reason,
                     # How many candidates the radius bound removed, and what it
                     # was. Recorded because a filter that silently shrinks the
                     # pool is indistinguishable from a discovery failure — the
                     # symptom of both is "fewer providers than last time".
                     "radius_miles": radius,
                     "radius_dropped": len(out_of_radius),
+                    # Rows a platform listed by SERVICE AREA rather than by
+                    # practice. Same reasoning as `radius_dropped`: a bound
+                    # that quietly shrinks the pool has to say so, or the next
+                    # reader diagnoses a discovery failure that never happened.
+                    "telehealth_dropped": fetch_stats.get("telehealth_rows_dropped") or 0,
+                    "telehealth_names": fetch_stats.get("telehealth_names") or [],
                     # What it BOUGHT, which the boolean above never said. The
                     # ring's cost is two searches, an extraction, and — because
                     # it fills the research budget — enrichment, judge and
@@ -4482,7 +4823,7 @@ Response (JSON object only):"""
                     # Pages planned / fetched / empty / failed per stage and
                     # platform, listing rows per platform — the run record's
                     # discovery health, kept instead of logged.
-                    "fetch_stats": self.fetch_stats(),
+                    "fetch_stats": fetch_stats,
                 },
                 "status": "success" if providers else "no_providers_extracted",
                 "message": f"Found {len(providers)} {safe_specialty} providers in {safe_location}"

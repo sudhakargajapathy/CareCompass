@@ -1877,6 +1877,12 @@ def _empty_shortlist_notice(workflow_results: Dict[str, Any]) -> Tuple[str, str]
 
     ours = sum(int(by_reason.get(r) or 0) for r in ("not_judged", "not_critiqued", "failed"))
     coverage = sum(int(by_reason.get(r) or 0) for r in ("no_profile_found", "identity_rejected"))
+    # A third cause, and the only one the reader can fix in one click: every
+    # provider we researched turned out to sit outside the area they chose.
+    # It is neither a coverage gap nor a fault of ours, and telling someone to
+    # "try again in a few minutes" when the answer is one control away is the
+    # same failure the retry copy was written to end.
+    out_of_area = int(by_reason.get("beyond_radius") or 0)
 
     found_clause = f"We found {found} providers, but " if found else "We found providers, but "
     if ours:
@@ -1886,6 +1892,13 @@ def _empty_shortlist_notice(workflow_results: Dict[str, Any]) -> Tuple[str, str]
             "checked. This is usually a temporary service problem on our side — "
             "not a problem with your search. Running the same search again in a "
             "few minutes usually resolves it."
+        )
+    elif out_of_area and not coverage:
+        message = (
+            found_clause + "every provider we researched turned out to practise "
+            "outside the area you chose. Widening the search distance is the "
+            "quickest fix — smaller towns often have their nearest specialists "
+            "in a neighbouring city."
         )
     elif coverage:
         message = (
@@ -2624,6 +2637,22 @@ def render_agent_workflow(workflow_results: Dict[str, Any]) -> None:
             # search, a judge slot and an Opus verdict on top of the discovery
             # spend — which makes "added, but none shortlisted" the signal that
             # MIN_CANDIDATE_POOL is set too high.
+            # Rows a platform listed by SERVICE AREA rather than by practice —
+            # a national virtual practice shown on a city's directory because
+            # the platform has nothing local to list. They are set aside before
+            # the research budget, and the count is rendered ONLY when it is
+            # non-zero: a permanent "0 excluded" row trains the eye to skip the
+            # row that matters, the same reason the ring line is conditional.
+            telehealth_dropped = search_metadata.get("telehealth_dropped") or 0
+            if telehealth_dropped:
+                names = search_metadata.get("telehealth_names") or []
+                st.markdown("**Listings excluded as service-area only:**")
+                st.caption(
+                    f"{telehealth_dropped} row(s) set aside before research"
+                    + (f" — {', '.join(names[:5])}" if names else "")
+                    + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+                )
+
             ring = (workflow_results.get("workflow_summary") or {}).get("ring_contribution") or {}
             if search_metadata.get("ring_expanded"):
                 st.markdown("**Ring expansion — what it bought:**")
@@ -2632,6 +2661,16 @@ def render_agent_workflow(workflow_results: Dict[str, Any]) -> None:
                     f"{ring.get('researched', 0)} researched · "
                     f"{ring.get('shortlisted', 0)} reached the recommendations"
                 )
+                # WHY it fired, beside what it bought. The threshold is an
+                # operator knob tuned by watching live runs, and "added 3,
+                # shortlisted 0" means one thing when a thin in-radius pool
+                # triggered it (lower the threshold) and another when a
+                # platform served the town nothing (the pool was never the
+                # problem). Dev surface only — the reason names our own
+                # plumbing, which is not the patient's register.
+                reason = search_metadata.get("ring_reason")
+                if reason:
+                    st.caption(f"Triggered by: `{reason}`")
 
             # Review coverage per researched provider. Three different failures
             # produce the same finished card — the platform's profile was never

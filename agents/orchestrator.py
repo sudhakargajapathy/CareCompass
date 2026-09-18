@@ -27,11 +27,12 @@ logger = logging.getLogger(__name__)
 # a card has something true to show.
 _OUTCOMES_WITH_DATA = frozenset({"enriched", "cached"})
 
-# Why a provider was kept out of the shortlist. The first three are coverage —
-# nobody's fault, and normal operation. The last two are OUR pipeline failing on
-# a provider whose data we successfully found, which is a different claim and
-# belongs on a different surface.
+# Why a provider was kept out of the shortlist. Three kinds, and the split is
+# the point: coverage (nobody's fault, normal operation), a cut WE chose, and
+# OUR pipeline failing on a provider whose data we successfully found — which
+# is a different claim and belongs on a different surface.
 _WITHHELD_LABELS = {
+    "beyond_radius": "researched — the address found is outside your search area",
     "over_budget": "not researched — outside this search's research budget",
     "no_profile_found": "researched, but no reviews were found",
     "identity_rejected": "reviews found, but not verifiably this provider's",
@@ -54,6 +55,14 @@ def withheld_reason(provider: Dict[str, Any]) -> Optional[str]:
     never researched is not ALSO "not judged" — reporting the downstream
     symptom would blame our pipeline for a cut we made deliberately.
     """
+    # A cut we chose, and it is asked FIRST because it is decided before any
+    # of the stages below could have run. The radius bound runs at discovery,
+    # where an unknown distance never drops anyone; enrichment is where the
+    # unknown becomes known, and a provider whose researched address lands
+    # outside the member's chosen area cannot be a recommendation however well
+    # the rest of the pipeline scored them.
+    if provider.get("beyond_radius"):
+        return "beyond_radius"
     outcome = str(provider.get("enrichment_outcome") or "")
     if outcome not in _OUTCOMES_WITH_DATA:
         # "" (never enriched at all) falls here too, and is reported as the
@@ -64,6 +73,25 @@ def withheld_reason(provider: Dict[str, Any]) -> Optional[str]:
     if not provider.get("critic_review"):
         return "not_critiqued"
     return None
+
+
+def withheld_label(provider: Dict[str, Any]) -> str:
+    """The reader-facing reason, with the number when the reason IS a number.
+
+    "outside your search area" invites the obvious question, and the answer is
+    already on the provider. A reason a reader cannot act on is a reason they
+    will read as a malfunction — here they can widen the radius and get this
+    provider back.
+    """
+    reason = withheld_reason(provider)
+    label = _WITHHELD_LABELS.get(reason or "", "")
+    beyond = provider.get("beyond_radius") if reason == "beyond_radius" else None
+    if beyond and beyond.get("miles") is not None:
+        return (
+            f"{label} — about {beyond['miles']:.0f} mi away, "
+            f"beyond the {beyond.get('radius_miles', 0):.0f} mi you chose"
+        )
+    return label
 
 
 def _is_recommendable(provider: Dict[str, Any]) -> bool:
@@ -89,6 +117,10 @@ def _withheld_summary(withheld: List[Dict[str, Any]]) -> Dict[str, Any]:
             if reason in ("no_profile_found", "identity_rejected", "failed")
         ),
         "not_researched": by_reason.get("over_budget", 0),
+        # A bound the member set, not a gap in the web and not a fault of
+        # ours — counted on its own so the empty-shortlist notice can say
+        # "widen your search area" instead of "try again".
+        "beyond_radius": by_reason.get("beyond_radius", 0),
     }
 
 
@@ -523,6 +555,12 @@ class ProviderMatchingOrchestrator:
                     location=state["location"],
                     specialty=state["specialty"],
                     use_cache=state.get("use_cache", True),
+                    # The SAME radius discovery was bound by. Enrichment is
+                    # where an unknown distance becomes known, so the bound has
+                    # to be re-asked here against the member's own choice —
+                    # passing the constant instead would silently ignore a
+                    # 10-mile search.
+                    radius_miles=(state.get("preferences") or {}).get("search_radius_miles"),
                 )
                 enrich_elapsed = time.perf_counter() - enrich_started
                 # Both stages' fetch accounting, now that enrichment has run;
@@ -561,10 +599,24 @@ class ProviderMatchingOrchestrator:
                 action="Scoring the enriched evidence against the rubric",
                 metrics={"providers_to_judge": len(selected)}
             )
+            # A provider whose researched address turned out to be outside the
+            # member's search area cannot be a recommendation, so the rubric
+            # judge — and, through `ai_judged`, the critic — should not spend
+            # tokens scoring them. Expressed by REORDERING the pinned list and
+            # moving the count, which is the mechanism already used for the
+            # budget cut: "first N" is positional, `_calculate_base_scores`
+            # preserves input order, and everyone still receives a
+            # deterministic core score and keeps their place in the pool.
+            #
+            # They are NOT relabelled `over_budget`: we did research them, the
+            # spend is real, and `withheld_reason` names the radius so the
+            # reader is told the true reason.
+            in_area = [p for p in selected if not p.get("beyond_radius")]
+            out_of_area = [p for p in selected if p.get("beyond_radius")]
             scored_results = self.preference_scorer.score_providers(
-                providers=selected + deferred,
+                providers=in_area + out_of_area + deferred,
                 preferences=judge_preferences,
-                judge_count=len(selected),
+                judge_count=len(in_area),
             )
 
             state["scored_providers"] = scored_results
@@ -839,9 +891,7 @@ class ProviderMatchingOrchestrator:
                     # stage that did not complete — which is what the UI groups
                     # on, and what the developer surface prints per provider.
                     "withheld_reason": withheld_reason(provider),
-                    "withheld_label": _WITHHELD_LABELS.get(
-                        withheld_reason(provider) or "", ""
-                    ),
+                    "withheld_label": withheld_label(provider),
                     # Kept for the score-scale distinction: an `over_budget`
                     # provider reached NO model, so its number is pure
                     # imputation, while a researched-but-unrecommendable one was

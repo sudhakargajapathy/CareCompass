@@ -34,8 +34,9 @@ Chandler, AZ (row yield through the DETERMINISTIC listing parser — the LLM
 fallback in `_extract_provider_data` still processes non-empty bodies the
 parser can't read, so real discovery is at or above these numbers):
 
-  * healthgrades: 22 of 23 specialty directories parse (pathology has no
-    directory page at all — the fetch fails). The FIRST sweep read only
+  * healthgrades: 23 of 24 specialty directories parse (pathology has no
+    directory page at all, at city OR state level, in two states — mapped to
+    None below rather than fetched). The FIRST sweep read only
     three; the other nineteen were `0 rows` from full 23-66 KB bodies
     because pages other than a city directory's page 1 write entry links
     host-relative and the heading regex demanded a scheme — fixed the same
@@ -44,15 +45,17 @@ parser can't read, so real discovery is at or above these numbers):
     + profile URL and the profile supplies the pair. All three platforms
     paginate their city listings (`listing_page_urls` — count-driven, each
     platform's own parameter, capped at 5 pages; the table beside it).
-  * webmd: reads on 22 of 24 (general surgery and radiology serve near-empty
-    bodies); city listing rows carry a profile URL but no rating pair.
-  * vitals: reads ~15 of 24; returns a ~1.3 KB stub for cardiology,
-    endocrinology, family-practice, general-surgery, otolaryngology,
-    radiology (a different vitals slug shape those pages want — unmapped).
+  * webmd: 24 of 24; city listing rows carry a profile URL but no rating pair.
+  * vitals: 24 of 24.
 
-Refining the vitals stubs is known, recorded follow-up work — the slug shape
-those six specialties want is unmapped, not unmappable. Neurology — the app's
-demo case and the reported outage — is fully covered on all three platforms.
+Coverage re-measured 2026-09-17 by probing every allowlisted specialty on all
+three platforms (`evals/probe_listing_slugs.py`). It found nine URLs that
+served no directory, and every one was a SLUG rather than a gap in the
+platform: six vitals stubs, two webmd near-empty bodies, and healthgrades'
+pathology directory, which does not exist at any level and is mapped to None.
+A wrong slug is invisible by construction — the platform answers with a
+marketing page, not an error — so this sweep is the only thing that finds one,
+and its result is the tables below.
 """
 
 import re
@@ -90,6 +93,11 @@ _HEALTHGRADES_SPECIALTY_SLUGS: Dict[str, Optional[str]] = {
     "obstetrics": "obstetrics-gynecology",
     "gynecology": "obstetrics-gynecology",
     "orthopedics": "orthopedic-surgery",
+    # No pathology directory exists: `/pathology-directory/<state>/<city>`,
+    # the state page and a second state all returned an EMPTY body (2026-09-17).
+    # None is the honest answer — discovery then fetches one page fewer for
+    # this specialty instead of spending a credit on nothing.
+    "pathology": None,
 }
 
 _WEBMD_SPECIALTY_SLUGS: Dict[str, Optional[str]] = {
@@ -100,13 +108,33 @@ _WEBMD_SPECIALTY_SLUGS: Dict[str, Optional[str]] = {
     "obstetrics": "obstetrics-gynecology",
     "gynecology": "obstetrics-gynecology",
     "orthopedics": "orthopedic-surgery",
+    # The two the 2026-09-17 allowlist sweep caught. Both served a ~6.4 KB
+    # body that parsed to ZERO rows — recorded until then as "webmd serves
+    # near-empty bodies for these", which was true of the WRONG SLUG and not
+    # of the platform: the discipline names return 60 rows apiece.
+    "general surgery": "surgery",
+    "radiology": "diagnostic-radiology",
 }
 
+# vitals shares webmd's vocabulary (both are Internet Brands properties) and
+# publishes it at `vitals.com/specialties`. Read off that index 2026-09-17 and
+# then verified by fetching each candidate: the six specialties below served a
+# 1,326-char marketing STUB under the naive slug — identical bytes in every
+# city, which is why a wrong slug looks exactly like a city with no providers
+# rather than like an error — and 41 to 59 parsed rows under the platform's own
+# term. `family medicine` is the one that was actively WRONG rather than
+# merely absent: it was set to healthgrades' "family-practice", which vitals
+# does not use.
 _VITALS_SPECIALTY_SLUGS: Dict[str, Optional[str]] = {
     "obstetrics": "obstetrics-gynecology",
     "gynecology": "obstetrics-gynecology",
     "orthopedics": "orthopedic-surgery",
-    "family medicine": "family-practice",
+    "family medicine": "family-medicine",
+    "cardiology": "cardiovascular-disease",
+    "endocrinology": "endocrinology-diabetes-metabolism",
+    "general surgery": "surgery",
+    "otolaryngology": "otolaryngology-head-neck-surgery",
+    "radiology": "diagnostic-radiology",
 }
 
 
