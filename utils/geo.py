@@ -261,9 +261,17 @@ def nearby_cities(location: Optional[str], radius_miles: float, limit: int = 2, 
     Powers adaptive ring expansion: when a one-city search returns a pool too
     thin to fill the research budget, discovery rings out to these. (The
     single-cluster trigger this also served was deleted in round 10.) Excludes the home
-    city itself and micro-towns (fewer than min_zip_count ZIP rows — keeps
-    Sun Lakes out and Gilbert/Mesa/Tempe in). Empty when the home location
-    can't be resolved to coordinates.
+    city itself and micro-towns (fewer than min_zip_count ZIP rows — measured
+    from Chandler at 25 mi, that keeps Higley and Chandler Heights out and
+    Gilbert/Mesa/Tempe in). Empty when the home location can't be resolved to
+    coordinates.
+
+    The example here was "Sun Lakes" for four rounds and was the WRONG one:
+    the dataset does not name that place at all, so it never reaches this
+    rule — it is refused one layer up, by the location allowlist. A later
+    monitoring case was written on this line's implied promise that the
+    dataset knows the name, and could never run. An example in a comment is
+    a claim about the data; check it against the data.
     """
     home = parse_location(location)
     home_coords = _coords_for(home)

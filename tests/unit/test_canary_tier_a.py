@@ -30,6 +30,7 @@ from evals.thresholds import (
     worst_severity,
 )
 from tests.helpers.fake_langfuse import FakeLangfuse, by_name, install_fake_tracing
+from utils.security import validate_search_params
 
 REPO = Path(__file__).resolve().parents[2]
 CHANDLER = case_by_id("chandler-neurology")
@@ -92,6 +93,34 @@ class TestCases:
         assert "vi" not in PHOENIX.platforms_expected and CHANDLER.platforms_expected == ("hg", "wm", "vi")
         assert all(c.pool_floor > 0 for c in CASES)
         assert case_by_id("nowhere") is None
+
+    def test_every_case_is_a_search_the_gatherer_would_accept(self):
+        """A case the input gate refuses can never measure anything.
+
+        `sun-lakes-neurology` shipped with "Sun Lakes, AZ" — a real place the
+        vendored GeoNames dataset does not name — so `gather_providers`
+        returned `invalid_input` before one page was fetched, and the weekly
+        run spent a P1 telling us about our own case list. Nothing offline
+        said so: every runner test in this file mocks the gatherer, and the
+        gate lives behind exactly that seam. `validate_search_params` is what
+        `gather_providers` runs on entry; a case list is an input to it.
+
+        The canonical check is the second half: the dataset echoes its own
+        spelling, so a case whose location merely RESOLVES (a stray ZIP, a
+        casing variant) would have the canary searching a string the reports
+        and issue titles do not name.
+        """
+        for case in CASES:
+            result = validate_search_params(case.specialty, case.location)
+            assert result["is_valid"], f"{case.case_id}: {[e for e in result['errors'] if e]}"
+            assert result["location"] == case.location, (
+                f"{case.case_id}: {case.location!r} is not the dataset's own "
+                f"spelling of itself ({result['location']!r})"
+            )
+            assert result["specialty"] == case.specialty, (
+                f"{case.case_id}: {case.specialty!r} is not the allowlist's "
+                f"spelling ({result['specialty']!r})"
+            )
 
 
 # --------------------------------------------------------------------------
@@ -465,7 +494,7 @@ class TestWatch:
         payload = payload_for([entry_for(PHOENIX)], schedule="weekly")
         findings, evaluated = watch.evaluate_results("A", cases_for("weekly"), payload)
         assert sorted((f.check, f.case_id) for f in findings) == [
-            ("canary_did_not_run", "gilbert-family-medicine"), ("canary_did_not_run", "sun-lakes-neurology"),
+            ("canary_did_not_run", "gilbert-family-medicine"), ("canary_did_not_run", "gold-canyon-neurology"),
         ]
         assert all(f.severity == "P1" and f.observed == "no result recorded" for f in findings)
         assert evaluated["phoenix-cardiology"] == set(checks_for_tier("A"))
@@ -604,7 +633,7 @@ class TestCanaryRunner:
         ])
         payload = canary_fetch.run("weekly", out_path=tmp_path / "o.json", agent_factory=lambda: next(gatherers))
         statuses = [(c["case_id"], c["status"]) for c in payload["cases"]]
-        assert statuses == [("phoenix-cardiology", "crashed"), ("gilbert-family-medicine", "success"), ("sun-lakes-neurology", "success")]
+        assert statuses == [("phoenix-cardiology", "crashed"), ("gilbert-family-medicine", "success"), ("gold-canyon-neurology", "success")]
         crashed = payload["cases"][0]
         assert crashed["error"] == "RuntimeError: boom with ***" and crashed["record"]["pool_raw"] is None
         assert crashed["record"]["extra"]["errors"] == 1
@@ -627,9 +656,9 @@ class TestCanaryRunner:
     def test_main_selects_cases_and_always_exits_zero(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(canary_fetch, "_default_factory", FakeGatherer)
         assert canary_fetch.main(["--case", "nowhere"]) == 2
-        assert canary_fetch.main(["--case", "sun-lakes-neurology", "--out", str(tmp_path / "o.json")]) == 0
+        assert canary_fetch.main(["--case", "gold-canyon-neurology", "--out", str(tmp_path / "o.json")]) == 0
         out = capsys.readouterr().out
-        assert "sun-lakes-neurology" in out and "chandler" not in out and "pool 118" in out
+        assert "gold-canyon-neurology" in out and "chandler" not in out and "pool 118" in out
         assert canary_fetch.main(["--schedule", "daily", "--out", str(tmp_path / "o.json"), "--radius", "10"]) == 0
         assert json.loads((tmp_path / "o.json").read_text())["cases"][0]["record"]["radius_miles"] == 10.0
 
