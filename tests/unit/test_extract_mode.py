@@ -67,8 +67,15 @@ class TestConstructedUrls:
         ]
 
     def test_multiword_city_slugs(self):
-        urls = discovery_listing_urls("Neurology", "Sun Lakes, AZ")
-        assert all(u.endswith("/sun-lakes") for u in urls)
+        """The example city is one the location allowlist ACCEPTS.
+
+        URL construction does not validate, so any string slugs — but this
+        test read as a catalogue of ordinary search inputs, and a canary case
+        was later written from its city ("Sun Lakes, AZ", which the dataset
+        does not name). It could never run.
+        """
+        urls = discovery_listing_urls("Neurology", "Gold Canyon, AZ")
+        assert all(u.endswith("/gold-canyon") for u in urls)
 
     def test_webmd_specialty_vocabulary_override(self):
         """webmd names the discipline, not the colloquial specialty — observed

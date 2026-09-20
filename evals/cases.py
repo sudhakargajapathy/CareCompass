@@ -49,10 +49,33 @@ CASES: Tuple[CanaryCase, ...] = (
         "healthgrades 722-result directory — exercises the 5-page cap",
         pool_floor=60,
     ),
+    # A case is a SEARCH, so its location must survive the same gate a
+    # member's does. This case shipped as "Sun Lakes, AZ" and could never
+    # run: a real place, but one the vendored GeoNames dataset does not
+    # name (its ZIPs file under Chandler), so the location allowlist
+    # refused it and every run returned `invalid_input` — 0 pages, 0
+    # credits, reported correctly as a P1. It went unseen because the case
+    # is WEEKLY and the schedules run in one repository only: it first
+    # executed six days after arming, and the canary's own tests mock the
+    # gatherer, which is precisely the seam the production gate sits
+    # behind. `TestCases` now runs every case through
+    # `validate_search_params`. Gold Canyon is the same market shape the
+    # case was written for — an affluent retirement community at the far
+    # edge of the metro, one ZIP row, real neighbours to ring out to
+    # (Apache Junction 8.8 mi, San Tan Valley 14.0, Gilbert 23.3) — and
+    # the dataset names it.
+    #
+    # NO platform is expected to serve rows. In a thin market a platform
+    # that answers the town with nothing is a fact about the TOWN, not
+    # drift — it is the pipeline's own second ring trigger — so demanding
+    # three non-zero platforms here would alert every week for the exact
+    # condition this case exists to watch. The pool floor still guards the
+    # aggregate (all three blank is a pool of zero); fill this tuple with
+    # whatever the first runs actually serve.
     CanaryCase(
-        "sun-lakes-neurology", "Neurology", "Sun Lakes, AZ", "weekly",
-        "thin home pool — exercises the ring",
-        pool_floor=4,
+        "gold-canyon-neurology", "Neurology", "Gold Canyon, AZ", "weekly",
+        "thin home pool at the metro edge — exercises the ring",
+        pool_floor=4, platforms_expected=(),
     ),
 )
 
