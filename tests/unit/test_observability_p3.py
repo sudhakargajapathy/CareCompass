@@ -492,6 +492,114 @@ class TestWeeklyReport:
 # Workflow files
 # --------------------------------------------------------------------------
 
+def _flaky(fetch, failures):
+    """`fetch`, raising each of `failures` on successive calls before it succeeds."""
+    queue = list(failures)
+    calls = []
+
+    def wrapped(**kwargs):
+        calls.append(kwargs)
+        if queue:
+            raise queue.pop(0)
+        return fetch(**kwargs)
+
+    wrapped.calls = calls
+    return wrapped
+
+
+def _read_timeout():
+    import httpx
+    return httpx.ReadTimeout("The read operation timed out")
+
+
+class TestWeeklyReportResilience:
+    """The 2026-09-28 Monday export died on ONE call — `ReadTimeout: The read
+    operation timed out`, five seconds into the step — and that week's rows,
+    the public system of record, were not written. The SDK's timeout was its
+    5 s default, its own retry loop only ever inspects an HTTP RESPONSE (a
+    timeout raises before one exists, so it was never retried), and the
+    export is 1 + N calls, so one slow reply anywhere lost the week. A manual
+    re-run the same day succeeded at the same volume: a latency spike, which
+    a weekly batch job must absorb rather than report."""
+
+    def _week(self):
+        base = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+        traces = [fake_trace(f"t{i}", base + timedelta(hours=i)) for i in range(3)]
+        scores = {t.id: fake_scores(t.id, pool_raw=100 + i) for i, t in enumerate(traces)}
+        start, end, _ = weekly_report.week_bounds(NOW, 0)
+        return fake_client(traces, scores), start, end
+
+    def test_a_timeout_on_the_trace_list_is_retried_not_fatal(self, monkeypatch):
+        slept = []
+        monkeypatch.setattr(weekly_report, "_sleep", slept.append)
+        client, start, end = self._week()
+        client.api.trace.list = _flaky(client.api.trace.list, [_read_timeout()])
+        rows = weekly_report.fetch_rows(client, start, end)
+        assert [r["trace_id"] for r in rows] == ["t0", "t1", "t2"]
+        assert slept == [5.0]
+
+    def test_a_timeout_on_one_traces_scores_is_retried_and_its_row_is_complete(self, monkeypatch):
+        """Not just the first call: each trace's scores are their own request,
+        and a timeout there would have dropped the run or the whole week."""
+        monkeypatch.setattr(weekly_report, "_sleep", lambda s: None)
+        client, start, end = self._week()
+        client.api.scores.get_many = _flaky(client.api.scores.get_many, [_read_timeout()])
+        rows = weekly_report.fetch_rows(client, start, end)
+        assert [(r["trace_id"], r["pool_raw"]) for r in rows] == [("t0", 100.0), ("t1", 101.0), ("t2", 102.0)]
+
+    def test_a_persistent_timeout_still_turns_the_job_red(self, tmp_path, monkeypatch, capsys):
+        """Retrying must not swallow a real outage: the red job IS the alert."""
+        slept = []
+        monkeypatch.setattr(weekly_report, "_sleep", slept.append)
+        client, _, _ = self._week()
+        client.api.trace.list = _flaky(client.api.trace.list, [_read_timeout() for _ in range(3)])
+        monkeypatch.setattr(weekly_report, "_client", lambda env: client)
+        keys = {"LANGFUSE_PUBLIC_KEY": "pk", "LANGFUSE_SECRET_KEY": "sk", "LANGFUSE_BASE_URL": "https://us.cloud.langfuse.com"}
+        assert weekly_report.main(["--out-dir", str(tmp_path)], env=keys) == 1
+        err = capsys.readouterr().err
+        assert "export failed — ReadTimeout" in err
+        assert len(client.api.trace.list.calls) == 3 and slept == [5.0, 15.0]
+        assert err.count("retrying in") == 2, "a retry that rescues a run must still show in the job log"
+        assert not (tmp_path / weekly_report.ROWS_FILE).exists()
+
+    def test_http_errors_are_not_retried(self, monkeypatch):
+        """A 401 from a rotated key is configuration: retrying only delays the
+        red job, and the SDK already retries the transient HTTP statuses."""
+        import httpx
+
+        slept = []
+        monkeypatch.setattr(weekly_report, "_sleep", slept.append)
+        client, start, end = self._week()
+        request = httpx.Request("GET", "https://us.cloud.langfuse.com/api/public/traces")
+        unauthorized = httpx.HTTPStatusError("401 Unauthorized", request=request, response=httpx.Response(401, request=request))
+        client.api.trace.list = _flaky(client.api.trace.list, [unauthorized])
+        with pytest.raises(httpx.HTTPStatusError):
+            weekly_report.fetch_rows(client, start, end)
+        assert len(client.api.trace.list.calls) == 1 and slept == []
+
+    def test_the_client_is_given_a_batch_timeout_not_the_sdk_default(self, monkeypatch):
+        """The SDK's default is 5 s — the budget that failed. The job passes its
+        own, and `LANGFUSE_TIMEOUT` (the SDK's own knob) still overrides it."""
+        import sys
+        import types
+
+        seen = {}
+
+        class FakeLangfuse:
+            def __init__(self, **kw):
+                seen.clear()
+                seen.update(kw)
+
+        module = types.ModuleType("langfuse")
+        module.Langfuse = FakeLangfuse
+        monkeypatch.setitem(sys.modules, "langfuse", module)
+        keys = {"LANGFUSE_PUBLIC_KEY": "pk", "LANGFUSE_SECRET_KEY": "sk", "LANGFUSE_BASE_URL": "https://us.cloud.langfuse.com"}
+        weekly_report._client(keys)
+        assert seen["timeout"] == weekly_report.REPORT_API_TIMEOUT_S == 30
+        weekly_report._client({**keys, "LANGFUSE_TIMEOUT": " 60 "})
+        assert seen["timeout"] == 60
+
+
 class TestP3Workflows:
     def test_tier_b_workflow(self):
         import yaml
