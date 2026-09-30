@@ -36,6 +36,7 @@ import argparse
 import json
 import statistics
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -52,6 +53,32 @@ ROW_EXTRA_FIELDS = ("trace_id", "environment")
 ROW_FIELDS: Tuple[str, ...] = RUN_RECORD_FIELDS + ROW_EXTRA_FIELDS
 REPORTED_SOURCES = ("user", "canary", "smoke", "eval")
 PAGE_SIZE = 100
+
+# The 2026-09-28 export died on ONE call — "ReadTimeout: The read operation
+# timed out", about five seconds into the step — and that week's rows, the
+# public system of record, were not written. Three things lined up. The
+# SDK's timeout defaults to 5 s (`LANGFUSE_TIMEOUT` unset), a budget sized
+# for the tracing path, not for an analytical list query over a week. The
+# SDK's own retry loop inspects only an HTTP RESPONSE (>= 500, 429/408/409):
+# a timeout raises before any response exists, so it was never retried. And
+# the export is 1 + N calls (the trace list, then every trace's scores), so
+# one slow reply anywhere lost the week. Two runs at the same volume had
+# succeeded, so this was a latency spike, not growth — which is exactly the
+# failure a weekly batch job must absorb rather than report.
+#
+# 30 s is six times the default that failed; nobody waits on this job, and a
+# hung connection still ends in bounded time. `LANGFUSE_TIMEOUT` (the SDK's
+# own knob) still overrides it, so it can be retuned without a code change.
+REPORT_API_TIMEOUT_S = 30
+# Transport failures only (no response arrived: timeouts, resets, refused
+# connections). HTTP errors are NOT retried here: the SDK already retries
+# the transient statuses, and the rest — a 401 from a rotated key, a 400 from
+# a renamed parameter — are configuration, which a retry only delays.
+# Considered and rejected: one windowed scores query instead of one per
+# trace. It turns 1 + N calls into ~2, but a trace stamped at 23:59:58 on
+# Sunday whose scores land after midnight would lose them at the boundary —
+# fewer calls bought with silently incomplete rows.
+_RETRY_DELAYS_S = (5.0, 15.0)
 
 
 # --------------------------------------------------------------------------
@@ -156,10 +183,37 @@ def is_pipeline(row: Mapping[str, Any]) -> bool:
     return row.get("judge_applied") is not None or bool(row.get("shortlist_size"))
 
 
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _call(fetch, **kwargs) -> Any:
+    """One API call, retried on transport failures (see `_RETRY_DELAYS_S`).
+
+    Every retry is printed: a flaky API that the retry keeps rescuing must
+    still be visible in the job log, or it degrades silently until the day
+    it fails outright. The final failure propagates — a persistent outage
+    must still turn the job red, because the red job is the alert.
+    """
+    import httpx
+
+    attempts = len(_RETRY_DELAYS_S) + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return fetch(**kwargs)
+        except httpx.TransportError as exc:
+            if attempt == attempts:
+                raise
+            delay = _RETRY_DELAYS_S[attempt - 1]
+            print(f"weekly report: {type(exc).__name__} on attempt {attempt}/{attempts}, "
+                  f"retrying in {delay:g}s", file=sys.stderr)
+            _sleep(delay)
+
+
 def _paged(fetch, **kwargs) -> Iterable[Any]:
     page = 1
     while True:
-        result = fetch(page=page, limit=PAGE_SIZE, **kwargs)
+        result = _call(fetch, page=page, limit=PAGE_SIZE, **kwargs)
         for item in result.data or []:
             yield item
         meta = getattr(result, "meta", None)
@@ -461,6 +515,7 @@ def _client(env: Mapping[str, str]) -> Any:
     return Langfuse(
         public_key=env["LANGFUSE_PUBLIC_KEY"].strip(), secret_key=env["LANGFUSE_SECRET_KEY"].strip(),
         base_url=env["LANGFUSE_BASE_URL"].strip(), tracing_enabled=False,
+        timeout=int(str(env.get("LANGFUSE_TIMEOUT") or "").strip() or REPORT_API_TIMEOUT_S),
     )
 
 

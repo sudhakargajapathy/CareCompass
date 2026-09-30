@@ -122,7 +122,7 @@ _HG_SPECIALTY_LINE = re.compile(r"^Specialty:\s*(?P<specialty>[^\n]+?)\s*$", re.
 # The address link, whose text now carries the page's own mileage AFTER the
 # ZIP — on one line, or wrapped onto a second:
 #
-#     [2051 Hamill Rd Ste 301A Hixson, TN 37343 9.0 mi miles away](…/physician/…)
+#     [1250 W Main St Ste 301A Apache Junction, AZ 85120 9.0 mi miles away](…/physician/…)
 #     [2563 S Val Vista Dr Ste 101AGilbert, AZ 85295
 #     4.9 mi miles away](…/physician/…)
 #
@@ -194,8 +194,8 @@ _VITALS_CITY = re.compile(r"^(?P<city>[A-Z][A-Za-z .'-]{2,40},\s*[A-Z]{2})", re.
 # states the provider's practice city even when the row itself states no
 # address:
 #
-#     ![Dr. Anne E Allen, MD - Knoxville, TN - Dermatology](…)
-#     ![Image 34: Dr. James Jay Merrill, MD - Bristol, TN - Cardiovascular Disease](…)
+#     ![Dr. Clara M Hale, MD - Tucson, AZ - Dermatology](…)
+#     ![Image 34: Dr. Thomas Wade Ellery, MD - Yuma, AZ - Cardiovascular Disease](…)
 #
 # That is the only place some rows say where the provider is. A city directory
 # for a SMALL market is largely national virtual practices, and those rows
@@ -240,8 +240,8 @@ _TELEHEALTH_SERVICE_AREA = re.compile(
 
 # The one quoted patient review a webmd or vitals entry carries:
 #
-#     … Bristol, TN, 37620 "Dr. Merrill is an excellent physician.Very
-#     informative, patient and kind."…View Profile
+#     … Yuma, AZ, 85364 "Dr. Ellery is a superb physician.Very
+#     thorough, patient and kind."…View Profile
 #     "Dr. Khanna was incredibly compassionate and reassuring during a very
 #     stressful time for me." [View Profile](/doctors/trisha-khanna-st91aw)
 #

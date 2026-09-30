@@ -41,7 +41,7 @@ from utils.security import InputValidator  # noqa: E402
 
 # Two metros on opposite coasts. A slug that works in one and not the other is
 # a finding in itself; a slug that works in neither is the real target.
-REFERENCE_CITIES = ("Chandler, AZ", "Chattanooga, TN")
+REFERENCE_CITIES = ("Chandler, AZ", "Tucson, AZ")
 
 # Below this, a body is the platform's generic marketing page rather than a
 # directory. Measured: the stub served for an unknown vitals slug is 1,326

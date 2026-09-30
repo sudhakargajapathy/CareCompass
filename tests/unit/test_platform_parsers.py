@@ -2955,7 +2955,7 @@ class TestListingPaginationAllPlatforms:
 
 class TestHealthgradesRowAddressCarriesMileage:
     """A directory row states its address INSIDE a link whose text now runs on
-    past the ZIP: `[… TN 37343 9.0 mi miles away](…/physician/…#locations)`,
+    past the ZIP: `[… AZ 85120 9.0 mi miles away](…/physician/…#locations)`,
     and on wider rows the mileage wraps onto a second line. The pattern used to
     require the "]" straight after the ZIP, on one line, so BOTH shapes read as
     no address — every row, on every directory page measured.
@@ -2967,23 +2967,23 @@ class TestHealthgradesRowAddressCarriesMileage:
     the research budget fills with whoever the page listed first.
     """
 
-    CITY = "https://www.healthgrades.com/dermatology-directory/tn-tennessee/soddy-daisy"
+    CITY = "https://www.healthgrades.com/dermatology-directory/az-arizona/gold-canyon"
     METRO = "https://www.healthgrades.com/neurology-directory/az-arizona/chandler"
 
     def test_mileage_on_the_same_line_still_yields_the_address(self):
         text = "\n".join([
-            "### [Dr. Deanna Brown, MD](https://www.healthgrades.com/physician/dr-deanna-brown-g3m9g)", "",
+            "### [Dr. Dana Whitfield, MD](https://www.healthgrades.com/physician/dr-dana-whitfield-k7p2w)", "",
             "Specialty: Dermatology", "",
             "Rated 4.7 out of 5 4.7 from 10 ratings•[10 written reviews]"
-            "(https://www.healthgrades.com/physician/dr-deanna-brown-g3m9g#ratings)", "",
-            "[2051 Hamill Rd Ste 301A Hixson, TN 37343 9.0 mi miles away]"
-            "(https://www.healthgrades.com/physician/dr-deanna-brown-g3m9g#locations)", "",
+            "(https://www.healthgrades.com/physician/dr-dana-whitfield-k7p2w#ratings)", "",
+            "[1250 W Main St Ste 301A Apache Junction, AZ 85120 9.0 mi miles away]"
+            "(https://www.healthgrades.com/physician/dr-dana-whitfield-k7p2w#locations)", "",
         ])
         row = parse_listing(self.CITY, text)[0]
-        assert row["location"] == "2051 Hamill Rd Ste 301A Hixson, TN 37343"
+        assert row["location"] == "1250 W Main St Ste 301A Apache Junction, AZ 85120"
         # The page's own mileage is measured from the page's city, never the
         # member's, so it must not survive into the address in any form.
-        assert "mi" not in row["location"].split("TN")[-1]
+        assert "mi" not in row["location"].split("AZ")[-1]
         assert (row["rating"], row["review_count"]) == (4.7, 10)
 
     def test_mileage_wrapped_onto_a_second_line_still_yields_the_address(self):
@@ -3035,34 +3035,36 @@ class TestHealthgradesRowAddressCarriesMileage:
         from agents.data_gatherer import _listing_row_to_provider
 
         text = (
-            "### [Dr. Deanna Brown, MD](/physician/dr-deanna-brown-g3m9g)\n\n"
+            "### [Dr. Dana Whitfield, MD](/physician/dr-dana-whitfield-k7p2w)\n\n"
             "Specialty: Dermatology\n\n"
-            "[2051 Hamill Rd Ste 301A Hixson, TN 37343 9.0 mi miles away]"
-            "(/physician/dr-deanna-brown-g3m9g#locations)\n"
+            "[1250 W Main St Ste 301A Apache Junction, AZ 85120 9.0 mi miles away]"
+            "(/physician/dr-dana-whitfield-k7p2w#locations)\n"
         )
         row = parse_listing(self.CITY, text)[0]
         provider = _listing_row_to_provider(row, "Dermatology")
-        assert provider["location"] == "2051 Hamill Rd Ste 301A Hixson, TN 37343"
+        assert provider["location"] == "1250 W Main St Ste 301A Apache Junction, AZ 85120"
         assert provider["location_source"] == f"listing_parser:{self.CITY}"
         # ZIP precision is the point: a city-only fallback cannot separate two
         # providers in one town, and the radius bound reads this number.
-        assert parse_location(provider["location"])["zip"] == "37343"
+        assert parse_location(provider["location"])["zip"] == "85120"
 
 
 # A small market's city directory, as two platforms actually render one. Both
 # shapes are real: the rows that state no street address, the photo caption
 # that is the only place some of them say where the provider is, and the
 # service-area lines that mark a virtual practice listed in a town it does not
-# sit in. Providers are named as the pages name them.
+# sit in. The MARKUP is the pages' own; the places, physicians, addresses and
+# quoted reviews are placeholders (real towns, so distances stay computable,
+# with the original geometry kept: near stays inside the radius, far outside).
 WEBMD_SMALL_MARKET = """## All Results * VERIFIED
 
-![Dr. Anne E Allen, MD - Knoxville, TN - Dermatology](https://img.lb.wbmdstatic.com/a.jpg)
+![Dr. Clara M Hale, MD - Tucson, AZ - Dermatology](https://img.lb.wbmdstatic.com/a.jpg)
 
-## [Dr. Anne E Allen, MD](https://doctor.webmd.com/doctor/anne-allen-39dc0b60-overview)
+## [Dr. Clara M Hale, MD](https://doctor.webmd.com/doctor/clara-hale-5e7f1a24-overview)
 
 Dermatology
 
-[5.0 32 Ratings](https://doctor.webmd.com/doctor/anne-allen-39dc0b60-overview#ratings)
+[5.0 32 Ratings](https://doctor.webmd.com/doctor/clara-hale-5e7f1a24-overview#ratings)
 
 9 Years Experience
 
@@ -3070,9 +3072,9 @@ Accepting New Patients
 
 Telehealth Only
 
-![Dr. Luke Josiah Maxfield, DO - Soddy Daisy, TN - Dermatology, Internal Medicine](https://img.lb.wbmdstatic.com/b.jpg)
+![Dr. Owen Reid Calder, DO - Gold Canyon, AZ - Dermatology, Internal Medicine](https://img.lb.wbmdstatic.com/b.jpg)
 
-## [Dr. Luke Josiah Maxfield, DO](https://doctor.webmd.com/doctor/luke-maxfield-11dabf02-overview)
+## [Dr. Owen Reid Calder, DO](https://doctor.webmd.com/doctor/owen-calder-8c3d9e17-overview)
 
 Dermatology
 
@@ -3125,27 +3127,27 @@ class TestRowCaptionSuppliesTheCityAndMarksServiceAreaListings:
     AREA.
     """
 
-    WEBMD = "https://doctor.webmd.com/providers/specialty/dermatology/tennessee/soddy-daisy"
+    WEBMD = "https://doctor.webmd.com/providers/specialty/dermatology/arizona/gold-canyon"
     VITALS = "https://www.vitals.com/dermatology/or/sutherlin"
 
     def test_the_caption_supplies_a_city_when_the_row_states_no_address(self):
         rows = {r["name"]: r for r in parse_listing(self.WEBMD, WEBMD_SMALL_MARKET)}
-        assert rows["Dr. Luke Josiah Maxfield, DO"]["location"] == "Soddy Daisy, TN"
-        assert rows["Dr. Anne E Allen, MD"]["location"] == "Knoxville, TN"
-        assert rows["Dr. Luke Josiah Maxfield, DO"]["location_from_caption"] is True
+        assert rows["Dr. Owen Reid Calder, DO"]["location"] == "Gold Canyon, AZ"
+        assert rows["Dr. Clara M Hale, MD"]["location"] == "Tucson, AZ"
+        assert rows["Dr. Owen Reid Calder, DO"]["location_from_caption"] is True
 
     def test_a_stated_street_address_always_wins_over_the_caption(self):
         """City precision cannot separate two providers in one town, so the
         coarser source must never overwrite the finer one."""
         text = (
-            "![Dr. Jung Ho Lee, MD - Hendersonville, TN - Cardiovascular Disease](a.jpg) "
-            "## [Dr. Jung Ho Lee, MD](https://doctor.webmd.com/doctor/jung-lee-6349c816-overview)\n"
+            "![Dr. Min Soo Park, MD - Prescott, AZ - Cardiovascular Disease](a.jpg) "
+            "## [Dr. Min Soo Park, MD](https://doctor.webmd.com/doctor/min-park-2f84b1d0-overview)\n"
             "Cardiovascular Disease\n\n"
-            "[4.5 33 Ratings](https://doctor.webmd.com/doctor/jung-lee-6349c816-overview#ratings)"
-            "  35 Years Exp erience 353 New Shackle Island Rd Ste 300C, Hendersonville, TN, 37075\n"
+            "[4.5 33 Ratings](https://doctor.webmd.com/doctor/min-park-2f84b1d0-overview#ratings)"
+            "  35 Years Exp erience 200 N Main St Ste 300C, Prescott, AZ, 86301\n"
         )
         row = parse_listing(self.WEBMD, text)[0]
-        assert row["location"] == "353 New Shackle Island Rd Ste 300C, Hendersonville, TN 37075"
+        assert row["location"] == "200 N Main St Ste 300C, Prescott, AZ 86301"
         assert row["location_from_caption"] is False
 
     def test_a_row_never_inherits_the_next_entrys_caption(self):
@@ -3183,7 +3185,7 @@ class TestRowCaptionSuppliesTheCityAndMarksServiceAreaListings:
 
     @pytest.mark.parametrize("marker", [
         "Telehealth Only",
-        "ACCEPTING NEW PATIENTS FOR TELEHEALTH SERVICES in AL, AK, AR, CA, CO, TN and WY",
+        "ACCEPTING NEW PATIENTS FOR TELEHEALTH SERVICES in AL, AK, AR, CA, CO, NV and WY",
         "Dermatology, Medical and Cosmetic Dermatology, Virtual Visits in all 50 states",
     ])
     def test_a_stated_service_area_marks_the_row(self, marker):
@@ -3212,17 +3214,17 @@ class TestRowCaptionSuppliesTheCityAndMarksServiceAreaListings:
         """The healthgrades attribute bullet reads "Virtual Visits" and sits
         beside a real street address."""
         text = "\n".join([
-            "### [Dr. Deanna Brown, MD](/physician/dr-deanna-brown-g3m9g)", "",
+            "### [Dr. Dana Whitfield, MD](/physician/dr-dana-whitfield-k7p2w)", "",
             "Specialty: Dermatology", "",
-            "[2051 Hamill Rd Ste 301A Hixson, TN 37343 9.0 mi miles away]"
-            "(/physician/dr-deanna-brown-g3m9g#locations)", "",
+            "[1250 W Main St Ste 301A Apache Junction, AZ 85120 9.0 mi miles away]"
+            "(/physician/dr-dana-whitfield-k7p2w#locations)", "",
             "*   Virtual Visits", "",
             "*   Found trustworthy",
         ])
         row = parse_listing(
-            "https://www.healthgrades.com/dermatology-directory/tn-tennessee/soddy-daisy", text)[0]
+            "https://www.healthgrades.com/dermatology-directory/az-arizona/gold-canyon", text)[0]
         assert row["telehealth_only"] is False
-        assert row["location"] == "2051 Hamill Rd Ste 301A Hixson, TN 37343"
+        assert row["location"] == "1250 W Main St Ste 301A Apache Junction, AZ 85120"
 
 
 class TestServiceAreaRowsLeaveTheGathererBeforeTheBudget:
@@ -3231,14 +3233,14 @@ class TestServiceAreaRowsLeaveTheGathererBeforeTheBudget:
     rows must not reach the research budget, where each one costs an enrichment
     fetch, a judge slot and a critic verdict."""
 
-    WEBMD = "https://doctor.webmd.com/providers/specialty/dermatology/tennessee/soddy-daisy"
+    WEBMD = "https://doctor.webmd.com/providers/specialty/dermatology/arizona/gold-canyon"
 
     def test_the_service_area_row_is_dropped_and_the_local_row_survives(self, gatherer):
         from unittest.mock import patch as _patch
         with _patch.object(gatherer, "_extract_page_shard"):
             out = gatherer._extract_provider_data(
-                [_page(self.WEBMD, WEBMD_SMALL_MARKET)], "Dermatology", "Soddy Daisy, TN")
-        assert [p["name"] for p in out] == ["Dr. Luke Josiah Maxfield, DO"]
+                [_page(self.WEBMD, WEBMD_SMALL_MARKET)], "Dermatology", "Gold Canyon, AZ")
+        assert [p["name"] for p in out] == ["Dr. Owen Reid Calder, DO"]
 
     def test_the_drop_is_counted_and_named_never_silent(self, gatherer):
         """A bound that quietly shrinks the pool is indistinguishable from a
@@ -3247,18 +3249,18 @@ class TestServiceAreaRowsLeaveTheGathererBeforeTheBudget:
         from unittest.mock import patch as _patch
         with _patch.object(gatherer, "_extract_page_shard"):
             gatherer._extract_provider_data(
-                [_page(self.WEBMD, WEBMD_SMALL_MARKET)], "Dermatology", "Soddy Daisy, TN")
+                [_page(self.WEBMD, WEBMD_SMALL_MARKET)], "Dermatology", "Gold Canyon, AZ")
         stats = gatherer.fetch_stats()
         assert stats["telehealth_rows_dropped"] == 1
-        assert stats["telehealth_names"] == ["Dr. Anne E Allen, MD"]
+        assert stats["telehealth_names"] == ["Dr. Clara M Hale, MD"]
 
     def test_the_surviving_row_carries_its_caption_provenance(self, gatherer):
         from unittest.mock import patch as _patch
         with _patch.object(gatherer, "_extract_page_shard"):
             out = gatherer._extract_provider_data(
-                [_page(self.WEBMD, WEBMD_SMALL_MARKET)], "Dermatology", "Soddy Daisy, TN")
+                [_page(self.WEBMD, WEBMD_SMALL_MARKET)], "Dermatology", "Gold Canyon, AZ")
         provider = out[0]
-        assert provider["location"] == "Soddy Daisy, TN"
+        assert provider["location"] == "Gold Canyon, AZ"
         assert provider["location_source"] == f"listing_parser:{self.WEBMD} (photo caption)"
 
     def test_the_count_reaches_the_run_record_as_an_aggregate(self):
@@ -3466,40 +3468,40 @@ class TestListingReviewExcerpts:
     and for that case it is the only review text obtainable.
     """
 
-    WEBMD = "https://doctor.webmd.com/providers/specialty/cardiovascular-disease/tennessee/soddy-daisy"
-    VITALS = "https://www.vitals.com/dermatology/tn/soddy-daisy"
+    WEBMD = "https://doctor.webmd.com/providers/specialty/cardiovascular-disease/arizona/gold-canyon"
+    VITALS = "https://www.vitals.com/dermatology/az/gold-canyon"
 
     def test_the_quoted_review_is_parsed_from_the_row(self):
         text = (
-            "## [Dr. James Jay Merrill, MD](https://doctor.webmd.com/doctor/james-merrill-d1eb-overview)\n"
+            "## [Dr. Thomas Wade Ellery, MD](https://doctor.webmd.com/doctor/thomas-ellery-a7c3-overview)\n"
             "Cardiovascular Disease\n\n"
-            "[4.5 31 Ratings](https://doctor.webmd.com/doctor/james-merrill-d1eb-overview#ratings)"
-            "  40 Years Exp erience 1 Medical Park Blvd, Bristol, TN, 37620 "
-            '"Dr. Merrill is an excellent physician.Very informative, patient and kind."'
+            "[4.5 31 Ratings](https://doctor.webmd.com/doctor/thomas-ellery-a7c3-overview#ratings)"
+            "  40 Years Exp erience 1 Medical Plaza Dr, Yuma, AZ, 85364 "
+            '"Dr. Ellery is a superb physician.Very thorough, patient and kind."'
             "...View Profile\n"
         )
         row = parse_listing(self.WEBMD, text)[0]
         assert row["review_snippet"] == (
-            "Dr. Merrill is an excellent physician.Very informative, patient and kind.")
+            "Dr. Ellery is a superb physician.Very thorough, patient and kind.")
 
     def test_the_platforms_own_generated_blurb_is_never_taken_as_patient_feedback(self):
         """The unquoted sentence beside the quote is the platform's own copy.
         Presenting it as a patient review would be an invented endorsement."""
         text = (
-            "## [Dr. Jung Ho Lee, MD](https://doctor.webmd.com/doctor/jung-lee-6349-overview)\n"
+            "## [Dr. Min Soo Park, MD](https://doctor.webmd.com/doctor/min-park-2f84-overview)\n"
             "Cardiovascular Disease\n\n"
-            "[4.5 33 Ratings](https://doctor.webmd.com/doctor/jung-lee-6349-overview#ratings)"
-            "  35 Years Exp erience 353 New Shackle Island Rd, Hendersonville, TN, 37075 "
-            "Dr. Jung Lee brings 35 years of cardiovascular disease experience to his "
-            "practice across multiple Tennessee locations....View Profile\n"
+            "[4.5 33 Ratings](https://doctor.webmd.com/doctor/min-park-2f84-overview#ratings)"
+            "  35 Years Exp erience 200 N Main St, Prescott, AZ, 86301 "
+            "Dr. Min Park brings 35 years of cardiovascular disease experience to his "
+            "practice across multiple Arizona locations....View Profile\n"
         )
         assert parse_listing(self.WEBMD, text)[0]["review_snippet"] is None
 
     def test_a_link_title_is_too_short_to_be_a_review(self):
         text = (
-            "### [Dr. Luke Josiah Maxfield, DO](/doctors/luke-maxfield-73wrra)\n\n"
+            "### [Dr. Owen Reid Calder, DO](/doctors/owen-calder-4mzq8t)\n\n"
             "Dermatology\n\n10 years exp\n\n"
-            '[View Profile](/doctors/luke-maxfield-73wrra "View Profile")\n'
+            '[View Profile](/doctors/owen-calder-4mzq8t "View Profile")\n'
         )
         assert parse_listing(self.VITALS, text)[0]["review_snippet"] is None
 
@@ -3779,30 +3781,31 @@ class TestExcerptSummaryIsALastResortAndSaysSo:
 
 
 # Two small markets in different regions, as their directory pages actually
-# render. The point of having both is that the failure is a PROPERTY OF THIN
+# render (markup verbatim; the southwest market's names and places are
+# placeholders, as above). The point of having both is that the failure is a PROPERTY OF THIN
 # WEB PRESENCE, not of one region: the same national virtual practices appear
 # on both pages, the local doctor is the one the platform has least to say
 # about, and the row shapes differ between the two renderings.
-SOUTHEAST_MARKET = {
-    "search": ("Dermatology", "Soddy Daisy, TN"),
+SOUTHWEST_MARKET = {
+    "search": ("Dermatology", "Gold Canyon, AZ"),
     "healthgrades": (
-        "https://www.healthgrades.com/dermatology-directory/tn-tennessee/soddy-daisy",
+        "https://www.healthgrades.com/dermatology-directory/az-arizona/gold-canyon",
         "\n".join([
-            '## We found 12 results within 10 miles for "Dermatologists near Soddy Daisy, TN"', "",
-            "### [Dr. Deanna Brown, MD](/physician/dr-deanna-brown-g3m9g)", "",
+            '## We found 12 results within 10 miles for "Dermatologists near Gold Canyon, AZ"', "",
+            "### [Dr. Dana Whitfield, MD](/physician/dr-dana-whitfield-k7p2w)", "",
             "Specialty: Dermatology", "",
-            "Rated 4.7 out of 5 4.7 from 10 ratings•[10 written reviews](/physician/dr-deanna-brown-g3m9g#ratings)", "",
-            "[2051 Hamill Rd Ste 301A Hixson, TN 37343 9.0 mi miles away]"
-            "(/physician/dr-deanna-brown-g3m9g#locations)", "",
+            "Rated 4.7 out of 5 4.7 from 10 ratings•[10 written reviews](/physician/dr-dana-whitfield-k7p2w#ratings)", "",
+            "[1250 W Main St Ste 301A Apache Junction, AZ 85120 9.0 mi miles away]"
+            "(/physician/dr-dana-whitfield-k7p2w#locations)", "",
             "*   Virtual Visits", "",
         ]),
     ),
     "webmd": (
-        "https://doctor.webmd.com/providers/specialty/dermatology/tennessee/soddy-daisy",
+        "https://doctor.webmd.com/providers/specialty/dermatology/arizona/gold-canyon",
         WEBMD_SMALL_MARKET,
     ),
-    "local": "Dr. Luke Josiah Maxfield, DO",
-    "local_city": "Soddy Daisy, TN",
+    "local": "Dr. Owen Reid Calder, DO",
+    "local_city": "Gold Canyon, AZ",
 }
 
 WEST_COAST_MARKET = {
@@ -3821,12 +3824,12 @@ WEST_COAST_MARKET = {
         "https://doctor.webmd.com/providers/specialty/dermatology/oregon/sutherlin",
         "\n".join([
             "All Results * VERIFIED", "",
-            "![Dr. Anne E Allen, MD - Knoxville, TN - Dermatology](https://img.lb.wbmdstatic.com/a.jpg)", "",
-            "## [Dr. Anne E Allen, MD](https://doctor.webmd.com/doctor/anne-allen-39dc0b60-overview)", "",
+            "![Dr. Clara M Hale, MD - Tucson, AZ - Dermatology](https://img.lb.wbmdstatic.com/a.jpg)", "",
+            "## [Dr. Clara M Hale, MD](https://doctor.webmd.com/doctor/clara-hale-5e7f1a24-overview)", "",
             "Dermatology", "",
-            "[5.0 32 Ratings](https://doctor.webmd.com/doctor/anne-allen-39dc0b60-overview#ratings)", "",
+            "[5.0 32 Ratings](https://doctor.webmd.com/doctor/clara-hale-5e7f1a24-overview#ratings)", "",
             "9 Years Experience", "", "Telehealth Only", "",
-            '"Wonderful, deeply compassionate and caring doctor who is an amazing diagnostician."', "",
+            '"Warm, thorough and caring doctor who is a remarkably careful diagnostician."', "",
             "![Dr. Jarod Conley, MD - Boulder, CO - Dermatology](https://img.lb.wbmdstatic.com/b.jpg)", "",
             "## [Dr. Jarod Conley, MD](https://doctor.webmd.com/doctor/jarod-conley-8ab12c-overview)", "",
             "Dermatology", "", "12 Years Experience", "", "Virtual Visit available", "",
@@ -3837,8 +3840,8 @@ WEST_COAST_MARKET = {
 }
 
 
-@pytest.mark.parametrize("market", [SOUTHEAST_MARKET, WEST_COAST_MARKET],
-                         ids=["southeast", "west-coast"])
+@pytest.mark.parametrize("market", [SOUTHWEST_MARKET, WEST_COAST_MARKET],
+                         ids=["southwest", "west-coast"])
 class TestSmallMarketDiscoveryEndToEnd:
     """Composed over the whole discovery read for two small markets.
 

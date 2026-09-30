@@ -2218,9 +2218,9 @@ class TestABlankPlatformRingsOut:
     granularity. The same slug served 59 rows for the metro 16 miles away.
     """
 
-    HG = "https://www.healthgrades.com/cardiology-directory/tn-tennessee/soddy-daisy"
-    WM = "https://doctor.webmd.com/providers/specialty/cardiovascular-disease/tennessee/soddy-daisy"
-    VI = "https://www.vitals.com/cardiovascular-disease/tn/soddy-daisy"
+    HG = "https://www.healthgrades.com/cardiology-directory/az-arizona/gold-canyon"
+    WM = "https://doctor.webmd.com/providers/specialty/cardiovascular-disease/arizona/gold-canyon"
+    VI = "https://www.vitals.com/cardiovascular-disease/az/gold-canyon"
 
     def test_the_live_shape_names_the_blank_platform(self):
         assert _blank_listing_domains(
@@ -2292,13 +2292,13 @@ class TestTheTriggerIsWiredAndRecorded:
                           return_value=[{"url": "https://example.com/a", "title": "t"}]), \
              patch.object(gatherer, "_extract_provider_data", return_value=providers), \
              patch("agents.data_gatherer.nearby_cities",
-                   return_value=["Chattanooga, TN"]) as nearby:
+                   return_value=["Apache Junction, AZ"]) as nearby:
             # `_discover_candidates` is left REAL: the suite pins
             # TAVILY_MODE=search, where it is the function that calls
             # `_search_providers`, so stubbing it out empties `search_results`
             # and the ring block never runs at all.
             result = gatherer.gather_providers(
-                specialty="Dermatology", location="Soddy Daisy, TN 37379",
+                specialty="Dermatology", location="Gold Canyon, AZ 85118",
                 radius_miles=radius, enrich=False,
             )
         return result, nearby
@@ -2309,8 +2309,8 @@ class TestTheTriggerIsWiredAndRecorded:
         """The live dermatology shape: 13 raw, 9 inside 25 miles, budget 8."""
         data_gatherer.config.RING_MIN_IN_RADIUS_POOL = 16
         pool = (
-            [{"name": f"Dr. Near {i}", "location": "Soddy Daisy, TN 37379"} for i in range(9)]
-            + [{"name": f"Dr. Far {i}", "location": "Nashville, TN 37203"} for i in range(4)]
+            [{"name": f"Dr. Near {i}", "location": "Gold Canyon, AZ 85118"} for i in range(9)]
+            + [{"name": f"Dr. Far {i}", "location": "Flagstaff, AZ 86001"} for i in range(4)]
         )
         result, nearby = self._run(data_gatherer, pool)
 
@@ -2326,7 +2326,7 @@ class TestTheTriggerIsWiredAndRecorded:
         no knob at all."""
         data_gatherer.config.RING_MIN_IN_RADIUS_POOL = 8
         pool = [
-            {"name": f"Dr. Near {i}", "location": "Soddy Daisy, TN 37379"} for i in range(9)
+            {"name": f"Dr. Near {i}", "location": "Gold Canyon, AZ 85118"} for i in range(9)
         ]
         result, nearby = self._run(data_gatherer, pool)
 
@@ -2340,7 +2340,7 @@ class TestTheTriggerIsWiredAndRecorded:
         """Ringing past the chosen radius imports cities the radius bound then
         deletes — credits and an extraction spent on rows that cannot survive."""
         data_gatherer.config.RING_MIN_IN_RADIUS_POOL = 16
-        pool = [{"name": "Dr. Solo", "location": "Soddy Daisy, TN 37379"}]
+        pool = [{"name": "Dr. Solo", "location": "Gold Canyon, AZ 85118"}]
         _, nearby = self._run(data_gatherer, pool, radius=10)
 
         assert nearby.call_args.args[1] == 10
