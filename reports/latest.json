@@ -1,10 +1,9 @@
 {
   "generated_at": "2026-09-28T23:07:14+00:00",
   "week": "2026-W39",
-  "rows_added": 12,
-  "rows_total": 45,
+  "rows_added": 11,
+  "rows_total": 27,
   "environments": [
-    "demo",
     "ci"
   ]
 }
