@@ -56,6 +56,12 @@ pathology directory, which does not exist at any level and is mapped to None.
 A wrong slug is invisible by construction — the platform answers with a
 marketing page, not an error — so this sweep is the only thing that finds one,
 and its result is the tables below.
+
+Re-measured 2026-10-21 after a weekly canary read zero webmd rows for
+cardiology: 140 of 142 constructed URLs served a readable directory, and the
+two that did not were webmd cardiology in both reference cities. A slug that
+probed clean can go stale when the PLATFORM renames a directory, so the sweep
+is worth re-running whenever a canary reports a platform at zero rows.
 """
 
 import re
@@ -103,7 +109,20 @@ _HEALTHGRADES_SPECIALTY_SLUGS: Dict[str, Optional[str]] = {
 _WEBMD_SPECIALTY_SLUGS: Dict[str, Optional[str]] = {
     # Observed on live URLs 2026-09-02: webmd's vocabulary names the
     # discipline, not the colloquial specialty.
-    "cardiology": "cardiovascular-disease",
+    #
+    # Cardiology is deliberately ABSENT, so it builds the naive `cardiology`.
+    # It was `cardiovascular-disease` until webmd renamed the directory in
+    # October 2026, and the old path did not 404: it served a 6,365-char "no
+    # doctors" placeholder (byte-identical in every city) or webmd's generic
+    # "Find Doctors Near You" landing page, both of which parse to zero rows
+    # and read exactly like a city with no cardiologists. The two shapes
+    # alternated with the real listing for about a week before the old path
+    # stopped serving rows at all. Measured 2026-10-21: the old path gave 0
+    # rows in Chandler, Tempe, Mesa and Tucson, while `/cardiology/` gave
+    # 60 / 55 / 60 / 50 rows in Chandler, Tempe, Phoenix and Tucson, and
+    # webmd's own pages now link the directory as `/providers/specialty/
+    # cardiology`. vitals still uses `cardiovascular-disease` (below), so the
+    # two platforms' vocabularies no longer agree on this one.
     "endocrinology": "endocrinology-diabetes-metabolism",
     "obstetrics": "obstetrics-gynecology",
     "gynecology": "obstetrics-gynecology",
@@ -117,7 +136,8 @@ _WEBMD_SPECIALTY_SLUGS: Dict[str, Optional[str]] = {
 }
 
 # vitals shares webmd's vocabulary (both are Internet Brands properties) and
-# publishes it at `vitals.com/specialties`. Read off that index 2026-09-17 and
+# publishes it at `vitals.com/specialties` — except cardiology since webmd's
+# October 2026 rename (see the webmd table). Read off that index 2026-09-17 and
 # then verified by fetching each candidate: the six specialties below served a
 # 1,326-char marketing STUB under the naive slug — identical bytes in every
 # city, which is why a wrong slug looks exactly like a city with no providers
