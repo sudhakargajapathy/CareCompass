@@ -7,8 +7,8 @@ one page fewer, every run, for that specialty, and nothing says why.
 
 That is what these assertions are for. They pin the slug each platform
 actually serves, verified by fetching the URL (`evals/probe_listing_slugs.py`,
-swept over the whole allowlist on two reference cities, 2026-09-17). No
-network here: the sweep is the measurement, this is the guard that its result
+swept over the whole allowlist on two reference cities, 2026-09-17, and again
+2026-10-21 after webmd renamed its cardiology directory). No network here: the sweep is the measurement, this is the guard that its result
 cannot drift back.
 """
 import pytest
@@ -45,8 +45,10 @@ PINNED = [
     # No pathology directory exists at any level on this platform.
     ("healthgrades", "pathology", None),
 
+    # Not a departure any more, pinned anyway: webmd renamed this directory
+    # in October 2026 and the old path kept answering (see the test below).
     ("webmd", "cardiology",
-     "https://doctor.webmd.com/providers/specialty/cardiovascular-disease/arizona/chandler"),
+     "https://doctor.webmd.com/providers/specialty/cardiology/arizona/chandler"),
     ("webmd", "endocrinology",
      "https://doctor.webmd.com/providers/specialty/endocrinology-diabetes-metabolism/arizona/chandler"),
     ("webmd", "obstetrics",
@@ -106,6 +108,20 @@ class TestVerifiedSpecialtySlugs:
         medicine` was the one that was actively wrong rather than missing: it
         carried a different platform's term."""
         assert naive not in (vitals_listing_url(specialty, CITY, STATE) or "")
+
+    def test_webmd_cardiology_never_uses_the_retired_directory(self):
+        """webmd renamed its cardiology directory in October 2026, and the old
+        `/cardiovascular-disease/` path did not 404: it served a 6,365-char
+        "no doctors" placeholder or webmd's generic landing page, both parsing
+        to zero rows. Every cardiology search lost webmd and rang out to
+        neighbouring cities for nothing, while vitals — which still uses
+        `cardiovascular-disease` — kept the run looking healthy. The two
+        platforms used to agree on this slug, which is exactly the shape a
+        well-meaning "keep them consistent" edit would restore."""
+        url = webmd_listing_url("Cardiology", CITY, STATE)
+        assert "/cardiovascular-disease/" not in url
+        assert "/providers/specialty/cardiology/" in url
+        assert "/cardiovascular-disease/" in vitals_listing_url("Cardiology", CITY, STATE)
 
     def test_an_unknown_specialty_still_builds_nothing_rather_than_guessing(self):
         assert healthgrades_listing_url("", CITY, STATE) is None

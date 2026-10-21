@@ -1,10 +1,12 @@
 """Probe every allowlisted specialty's city-listing URL on all three platforms.
 
 A platform's specialty vocabulary is its own. "Cardiology" is
-`cardiovascular-disease` on two of the three, primary care is
-`family-practice` on one, and a slug the platform does not use returns a
-~1.3 KB marketing stub rather than an error — so a wrong slug looks exactly
-like a city with no providers. That is invisible in aggregate and total for
+`cardiovascular-disease` on vitals (and was on webmd until webmd renamed the
+directory in October 2026), primary care is `family-practice` on one, and a
+slug the platform does not use returns a marketing stub rather than an error
+— so a wrong slug looks exactly like a city with no providers. Platforms also
+RENAME directories, and the retired path keeps answering the same way, so a
+slug that probed clean once is not clean forever. That is invisible in aggregate and total for
 the affected specialty: discovery fetches one page fewer, every run, and no
 surface says why.
 

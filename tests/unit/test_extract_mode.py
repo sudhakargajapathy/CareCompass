@@ -79,10 +79,13 @@ class TestConstructedUrls:
 
     def test_webmd_specialty_vocabulary_override(self):
         """webmd names the discipline, not the colloquial specialty — observed
-        live: cardiology pages live under /cardiovascular-disease/."""
-        url = webmd_listing_url("Cardiology", "Chandler", "AZ")
-        assert "/cardiovascular-disease/" in url
-        assert "/cardiology/" not in url
+        live: endocrinology pages live under
+        /endocrinology-diabetes-metabolism/. (This test used cardiology until
+        webmd renamed that directory to the plain /cardiology/ in October
+        2026; the platform-URL tests pin that case.)"""
+        url = webmd_listing_url("Endocrinology", "Chandler", "AZ")
+        assert "/endocrinology-diabetes-metabolism/" in url
+        assert "/endocrinology/" not in url
 
     def test_specialty_casing_is_insensitive(self):
         assert (
