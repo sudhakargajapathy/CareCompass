@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-11-09T14:42:24+00:00",
-  "week": "2026-W45",
+  "generated_at": "2026-11-16T14:18:27+00:00",
+  "week": "2026-W46",
   "rows_added": 11,
-  "rows_total": 95,
+  "rows_total": 106,
   "environments": [
     "ci"
   ]
