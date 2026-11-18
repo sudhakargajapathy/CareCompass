@@ -45,6 +45,13 @@ EMPTY_BODY_RATE_CEILING = 0.30
 # Monday plus slack for a late run — GitHub disables idle crons silently,
 # and this is the watchdog for the watcher.
 REPORT_MAX_AGE_DAYS = 8
+# Live-app (the Space's own traffic, `evals/live_watch.py`). Before the pool
+# reset, every search after a day idle logged 1-8 first-attempt Tavily
+# errors, each a 30 s stall; with the reset and the shorter first timeout one
+# stray error a day is a blip the retry absorbs in seconds. Two in one window
+# is a pattern, and any error on a RETRY means a page was lost outright.
+LIVE_FIRST_ATTEMPT_ERROR_CEILING = 1   # fires at 2+ in the window
+LIVE_RETRY_ERROR_CEILING = 0           # fires at 1+
 
 # Gather statuses that mean the measurement never happened. "no_results" and
 # "no_providers_extracted" are NOT here: those are measurements (a pool of
@@ -153,6 +160,17 @@ FIRST_STEPS = {
     "latency_high": (
         "The trace's step spans say which stage grew; compare call_timings on validation."
     ),
+    "live_tavily_errors": (
+        "Langfuse → the live environment, filter name tavily.* and level ERROR: 30 s (or 15 s) "
+        "timeouts and fast SSL EOFs on attempt 1 are stale pooled sockets (check the gatherer "
+        "still resets its Tavily session at the start of every search); errors on attempt 2 "
+        "too, or 4xx/5xx text, are the vendor."
+    ),
+    "live_latency_high": (
+        "Open the slowest live trace in the window: if gather_data or the enrichment step holds "
+        "the extra ~30 s, it is a stalled Tavily call (see live_tavily_errors); otherwise "
+        "compare its step spans with a canary run of the same week."
+    ),
 }
 
 CHECK_TITLES = {
@@ -179,6 +197,8 @@ CHECK_TITLES = {
     "critic_shard_failed": "Critic shard failed",
     "cost_out_of_band": "Cost out of band",
     "latency_high": "Latency high",
+    "live_tavily_errors": "Tavily errors in the live app",
+    "live_latency_high": "Live app latency high",
 }
 
 # Recovery scopes. The watcher's own check rides in every tier: a case that
@@ -203,7 +223,11 @@ GOLDEN_CHECKS: FrozenSet[str] = frozenset({
     "golden_identity_failure", "template_drift", "golden_page_missing", "golden_needs_review",
 })
 GOLDEN_CASE_ID = "golden-set"
-ALL_CHECKS: FrozenSet[str] = PIPELINE_CHECKS | WATCHER_CHECKS | REPORT_CHECKS | GOLDEN_CHECKS
+# The live app's own traffic: one pseudo-case, because the live Space is one
+# process with one history, not a set of scheduled searches.
+LIVE_CHECKS: FrozenSet[str] = frozenset({"live_tavily_errors", "live_latency_high"})
+LIVE_CASE_ID = "live-app"
+ALL_CHECKS: FrozenSet[str] = PIPELINE_CHECKS | WATCHER_CHECKS | REPORT_CHECKS | GOLDEN_CHECKS | LIVE_CHECKS
 
 
 def checks_for_tier(tier: str) -> FrozenSet[str]:
@@ -429,6 +453,50 @@ def evaluate_report_freshness(latest: Optional[Mapping[str, Any]], now: Optional
             f"≤ {REPORT_MAX_AGE_DAYS} days",
         )]
     return []
+
+
+def evaluate_live(payload: Optional[Mapping[str, Any]]) -> List[Finding]:
+    """Findings over the live app's window (`evals/live_watch.py`'s counts).
+
+    Tavily errors are judged whether or not a visitor searched: an error
+    span is its own evidence. Latency needs at least one measured run.
+    """
+    payload = payload or {}
+    findings: List[Finding] = []
+    tavily = payload.get("tavily") or {}
+    first = int(tavily.get("first_attempt_errors") or 0)
+    retry = int(tavily.get("retry_errors") or 0)
+    if first > LIVE_FIRST_ATTEMPT_ERROR_CEILING or retry > LIVE_RETRY_ERROR_CEILING:
+        kinds = tavily.get("by_kind") or {}
+        kind_text = ", ".join(f"{k} {v}" for k, v in sorted(kinds.items()) if v)
+        hours = (payload.get("window") or {}).get("hours")
+        findings.append(Finding(
+            "live_tavily_errors", "P2", LIVE_CASE_ID,
+            f"{first} first-attempt, {retry} after retry across {tavily.get('runs_affected', 0)} run(s)"
+            + (f" in {hours} h" if hours else "") + (f" ({kind_text})" if kind_text else ""),
+            f"≤ {LIVE_FIRST_ATTEMPT_ERROR_CEILING} first-attempt, ≤ {LIVE_RETRY_ERROR_CEILING} after retry",
+        ))
+    latency = payload.get("latency_s") or {}
+    p95 = latency.get("p95")
+    if p95 is not None and float(p95) > LATENCY_CEILING_S:
+        findings.append(Finding(
+            "live_latency_high", "P3", LIVE_CASE_ID,
+            f"p95 {float(p95):.0f} s over {payload.get('runs', 0)} run(s)", f"≤ {LATENCY_CEILING_S:.0f} s",
+        ))
+    return findings
+
+
+def live_scope(payload: Optional[Mapping[str, Any]]) -> FrozenSet[str]:
+    """The live checks a window may declare recovered.
+
+    A quiet window (no visitor searched) proves nothing about latency, so it
+    cannot close a latency issue; silence is not a recovery. The Tavily
+    check needs a run too: no search means no Tavily call that could have
+    failed.
+    """
+    if not payload or not int(payload.get("runs") or 0):
+        return frozenset()
+    return LIVE_CHECKS
 
 
 _GOLDEN_STATUS_CHECK = {

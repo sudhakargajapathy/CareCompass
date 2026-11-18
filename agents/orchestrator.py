@@ -1,7 +1,9 @@
 """LangGraph Orchestrator for coordinating the multi-agent healthcare provider matching workflow."""
 
 import logging
+import threading
 import time
+from contextlib import contextmanager
 from typing import Dict, List, Any, Optional, TypedDict, Callable
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
@@ -173,6 +175,68 @@ class WorkflowState(TypedDict):
     # Final output
     final_recommendations: List[Dict[str, Any]]
     workflow_summary: Dict[str, Any]
+
+
+
+# ONE SEARCH AT A TIME PER PROCESS. The app caches its orchestrator for the
+# life of the process (`st.cache_resource`), so every visitor shares it, and
+# several pieces of per-run state are process-wide: the cost tracker (reset
+# at the start of every run), the active Langfuse trace, the gatherer's and
+# judge's run counters, and `self.progress_callback`. Two overlapping
+# searches therefore crossed: the second visitor's start reset the first
+# one's cost card mid-run, both runs' spans landed under whichever trace was
+# active, the first visitor's progress panel began showing the second's
+# steps, and when the first finished its `finally` cleared the callback so
+# the second's panel froze. Recommendations never mixed (each run carries its
+# own graph state), but every number around them could.
+#
+# A lock rather than per-run state: the live Space sees about one search a
+# day, so a rare wait of a minute or two costs almost nothing, while
+# threading per-run context through six thread pools risks losing spans and
+# counts in a way only a live trace would show. The lock is MODULE-level, not
+# per instance: the app can hold two cached orchestrators (network check on
+# and off) that still share the one cost tracker and the one active trace.
+#
+# 5 minutes: a normal run takes 40-60 s and the slowest traced live run 117 s,
+# so the wait covers a queue of two or three searches; past that something is
+# stuck, and the visitor gets a plain "busy, try again" instead of a page that
+# spins forever.
+_SEARCH_LOCK = threading.Lock()
+SEARCH_WAIT_S = 300
+BUSY_MESSAGE = "CareCompass is finishing another search. Please try again in a minute."
+
+
+class SearchBusyError(RuntimeError):
+    """Another search held the process for longer than SEARCH_WAIT_S."""
+
+
+@contextmanager
+def _one_search_at_a_time(notify: Optional[Callable[[Dict[str, Any]], None]] = None):
+    """Hold the process-wide search lock for one run; tell a waiting visitor why.
+
+    The waiting line goes through the run's own progress callback (the app's
+    queue), never `self.progress_callback`, which still belongs to the run
+    holding the lock. Released in `finally`, so a run that crashes cannot
+    leave every later search waiting.
+    """
+    if not _SEARCH_LOCK.acquire(blocking=False):
+        if notify:
+            try:
+                notify({
+                    "agent_name": "Orchestrator",
+                    "action": "Another search is finishing; yours starts as soon as it does",
+                    "status": "waiting",
+                    "progress_percentage": 0,
+                })
+            except Exception as exc:  # a broken callback must not cost the search
+                logger.debug("Waiting notice failed: %s", exc)
+        logger.info("Search queued behind a running search")
+        if not _SEARCH_LOCK.acquire(timeout=SEARCH_WAIT_S):
+            raise SearchBusyError(BUSY_MESSAGE)
+    try:
+        yield
+    finally:
+        _SEARCH_LOCK.release()
 
 
 class ProviderMatchingOrchestrator:
@@ -1315,7 +1379,8 @@ class ProviderMatchingOrchestrator:
         return {
             "success": False,
             "final_recommendations": [],
-            "workflow_summary": {"workflow_failed": True, "error": str(error)},
+            "workflow_summary": {"workflow_failed": True, "error": str(error),
+                                 "busy": isinstance(error, SearchBusyError)},
             "cost_summary": {},
             "execution_log": [],
             "agent_outputs": {},
@@ -1352,6 +1417,15 @@ class ProviderMatchingOrchestrator:
         initial_state = self._initial_state(
             specialty, location, insurance, preferences, use_cache, source, case_id, client
         )
+        try:
+            with _one_search_at_a_time():
+                return self._run_workflow(initial_state, specialty, location)
+        except SearchBusyError as e:
+            logger.warning("Search refused: %s", e)
+            return self._failure_result(e, initial_state)
+
+    def _run_workflow(self, initial_state: Dict[str, Any], specialty: str, location: str) -> Dict[str, Any]:
+        """The non-streaming run; the caller holds the search lock."""
         with tracing.start_run(**self._trace_args(initial_state)) as run:
             try:
                 logger.info(f"Starting provider matching workflow: {specialty} in {location}")
@@ -1396,11 +1470,27 @@ class ProviderMatchingOrchestrator:
         Returns:
             Dictionary containing workflow results and recommendations (same format as execute_workflow)
         """
-        self.progress_callback = progress_callback
         initial_state = self._initial_state(
             specialty, location, insurance, preferences, use_cache, source, case_id, client
         )
+        try:
+            with _one_search_at_a_time(progress_callback):
+                return self._run_workflow_streaming(initial_state, specialty, location, progress_callback)
+        except SearchBusyError as e:
+            logger.warning("Search refused: %s", e)
+            return self._failure_result(e, initial_state)
 
+    def _run_workflow_streaming(
+        self, initial_state: Dict[str, Any], specialty: str, location: str,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]],
+    ) -> Dict[str, Any]:
+        """The streaming run; the caller holds the search lock.
+
+        The callback is installed only HERE, under the lock: set before it,
+        a queued search would have taken over the running search's progress
+        panel, and the running search's `finally` would then have cleared it.
+        """
+        self.progress_callback = progress_callback
         try:
             with tracing.start_run(**self._trace_args(initial_state)) as run:
                 try:

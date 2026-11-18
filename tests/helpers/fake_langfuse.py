@@ -6,9 +6,16 @@ steps under the root, worker-thread spans under the open step, model calls
 under their provider span — without a network.
 """
 
+import contextvars
 import sys
 import threading
 import types
+
+# What the real SDK's `propagate_attributes` keeps: the trace attributes in
+# force for spans STARTED now, in a contextvar — so, like the real one, it
+# reaches only spans opened inside the `with`, and never a thread-pool worker
+# (a pool does not copy the submitting thread's context).
+_PROPAGATED = contextvars.ContextVar("fake_langfuse_propagated", default={})
 
 
 class FakeSpan:
@@ -20,6 +27,8 @@ class FakeSpan:
         self.ended = False
         self.thread = threading.current_thread().name
         self.trace_context = None
+        # The trace attributes the SDK would stamp on this span at start.
+        self.propagated = dict(_PROPAGATED.get())
         client.spans.append(self)
 
     def start_observation(self, *, name, as_type="span", **kw):
@@ -70,14 +79,17 @@ class FakeLangfuse:
         self.flushes += 1
 
 
-class _NullContext:
+class _PropagationContext:
     def __init__(self, **kw):
         self.kw = kw
+        self._token = None
 
     def __enter__(self):
+        self._token = _PROPAGATED.set({**_PROPAGATED.get(), **self.kw})
         return None
 
     def __exit__(self, *exc):
+        _PROPAGATED.reset(self._token)
         return False
 
 
@@ -92,7 +104,7 @@ def install_fake_tracing(monkeypatch, env="ci"):
 
     def propagate_attributes(**kw):
         captured.update(kw)
-        return _NullContext(**kw)
+        return _PropagationContext(**kw)
 
     module.propagate_attributes = propagate_attributes
     monkeypatch.setitem(sys.modules, "langfuse", module)

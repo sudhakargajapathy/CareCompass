@@ -238,7 +238,7 @@ class TestPipelineThresholds:
         assert "no_shortlist" not in checks_for_tier("A") and "canary_did_not_run" in checks_for_tier("A")
         assert checks_for_tier("B") > checks_for_tier("A")
         assert set(thresholds.CHECK_TITLES) == set(thresholds.FIRST_STEPS) == thresholds.ALL_CHECKS
-        assert thresholds.ALL_CHECKS == checks_for_tier("B") | thresholds.REPORT_CHECKS | thresholds.GOLDEN_CHECKS
+        assert thresholds.ALL_CHECKS == checks_for_tier("B") | thresholds.REPORT_CHECKS | thresholds.GOLDEN_CHECKS | thresholds.LIVE_CHECKS
         with pytest.raises(ValueError):
             checks_for_tier("C")
 

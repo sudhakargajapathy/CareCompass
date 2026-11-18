@@ -21,10 +21,16 @@ Two outputs, both public, both aggregates only:
                               written is invisible from inside the report.
 
 Rows are built from exactly two places on the trace — the run record in
-its metadata (descriptors + structured fields) and its scores (the
-measurements) — never from the trace's input/output or any observation, so
+its ROOT observation's metadata (descriptors + structured fields) and its
+scores (the measurements) — never from any observation's input/output (the
+`io` field group is never requested) or from a step below the root, so
 nothing a page or a prompt contained can reach the public file. The
 `verify` source (account-check traces) is dropped.
+
+Langfuse v4 (cutover November 2026) removed the trace list and the v2
+scores read this used, so the runs come from Observations API v2 (the
+run's root observation, by name) and the scores from Scores API v3, both
+paged by cursor.
 
 Reads only through the public API with the same three LANGFUSE_* keys
 tracing uses. A failed pull is exit 1 — the job goes red, which is the P3
@@ -52,6 +58,8 @@ LATEST_FILE = "latest.json"
 ROW_EXTRA_FIELDS = ("trace_id", "environment")
 ROW_FIELDS: Tuple[str, ...] = RUN_RECORD_FIELDS + ROW_EXTRA_FIELDS
 REPORTED_SOURCES = ("user", "canary", "smoke", "eval")
+# 100 is the Scores API v3 maximum (it answers 400 above it); Observations
+# API v2 allows 1000, and one size for both keeps the loop single.
 PAGE_SIZE = 100
 
 # The 2026-09-28 export died on ONE call — "ReadTimeout: The read operation
@@ -211,16 +219,80 @@ def _call(fetch, **kwargs) -> Any:
 
 
 def _paged(fetch, **kwargs) -> Iterable[Any]:
-    page = 1
+    """Every item `fetch` returns, following the cursor the v4 read APIs use.
+
+    Observations API v2 and Scores API v3 page by `meta.cursor`, not by
+    page number: the page-numbered trace and v2 score endpoints this export
+    was written against were removed in the Langfuse v4 cutover, and a page
+    number sent to the new endpoints means nothing to them.
+    """
+    cursor: Optional[str] = None
     while True:
-        result = _call(fetch, page=page, limit=PAGE_SIZE, **kwargs)
+        result = _call(fetch, limit=PAGE_SIZE, cursor=cursor, **kwargs)
         for item in result.data or []:
             yield item
-        meta = getattr(result, "meta", None)
-        total_pages = getattr(meta, "total_pages", None) or 1
-        if page >= total_pages:
+        following = getattr(getattr(result, "meta", None), "cursor", None)
+        # An empty page can still carry a cursor (rows filtered server-side),
+        # so the cursor alone decides; one that does not move would loop.
+        if not following or following == cursor:
             return
-        page += 1
+        cursor = following
+
+
+def _run_record_of(metadata: Any) -> Any:
+    """Root metadata with `run_record` as a dict, whatever form it arrived in.
+
+    The v3 trace API returned metadata parsed. Observations API v2 returns
+    what the OpenTelemetry attributes carried, and a nested dict travels as
+    a JSON STRING there: read raw, every root would look record-less and
+    `row_from_trace` would export zero rows with nothing red to show for it.
+    A value that does not parse is left as it is, and the row is skipped.
+    """
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except ValueError:
+            return {}
+    if not isinstance(metadata, dict):
+        return {}
+    record = metadata.get("run_record")
+    if isinstance(record, str):
+        try:
+            metadata = {**metadata, "run_record": json.loads(record)}
+        except ValueError:
+            pass
+    return metadata
+
+
+def trace_from_root(observation: Any) -> Any:
+    """The fields `row_from_trace` reads, off a run's ROOT observation.
+
+    Langfuse v4 has no trace object to list: a trace's attributes live on
+    its observations. The run record is written onto the root
+    (`RunTrace.finish` → `root.update(metadata=...)`), its start time is the
+    run's timestamp, and the trace's tags and environment come back with it
+    (`trace_context` and `basic` field groups).
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        id=getattr(observation, "trace_id", None),
+        timestamp=getattr(observation, "start_time", None),
+        tags=getattr(observation, "tags", None) or [],
+        environment=getattr(observation, "environment", None),
+        metadata=_run_record_of(getattr(observation, "metadata", None)),
+    )
+
+
+# The field groups the export reads off each root: `core` (trace id, start
+# time), `basic` (name, environment), `metadata` and `trace_context` (tags).
+# The default is `core,basic`, which carries neither the run record nor the
+# tags, and every row would be skipped as "not a run".
+ROOT_FIELDS = "core,basic,metadata,trace_context"
+# Metadata values over 200 characters come back TRUNCATED unless the key is
+# named here, and a run record is always longer than that: without it every
+# `run_record` arrives as an unparseable fragment.
+ROOT_EXPAND_METADATA = "run_record"
 
 
 def parse_environments(text: Optional[str]) -> List[str]:
@@ -249,14 +321,23 @@ def fetch_rows(client: Any, start: datetime, end: datetime,
     pre-filter behaviour.
     """
     wanted = {label.lower() for label in (environments or []) if label}
-    kwargs: Dict[str, Any] = dict(name=ROOT_NAME, from_timestamp=start, to_timestamp=end)
+    # Only the run's root observation carries ROOT_NAME (steps are
+    # `step.*`, model calls and tool calls carry their own names), so the
+    # name filter alone yields one row per run.
+    kwargs: Dict[str, Any] = dict(name=ROOT_NAME, from_start_time=start, to_start_time=end,
+                                  fields=ROOT_FIELDS, expand_metadata=ROOT_EXPAND_METADATA)
     if wanted:
         kwargs["environment"] = sorted(wanted)
     rows: List[Dict[str, Any]] = []
-    for trace in _paged(client.api.trace.list, **kwargs):
-        if wanted and str(getattr(trace, "environment", "") or "").lower() not in wanted:
+    seen: set = set()
+    for root in _paged(client.api.observations.get_many, **kwargs):
+        trace = trace_from_root(root)
+        if not trace.id or trace.id in seen:
             continue
-        scores = list(_paged(client.api.scores.get_many, trace_id=trace.id))
+        seen.add(trace.id)
+        if wanted and str(trace.environment or "").lower() not in wanted:
+            continue
+        scores = list(_paged(client.api.scores_v3.get_many_v3, trace_id=trace.id))
         row = row_from_trace(trace, scores)
         if row is not None and is_run(row):
             rows.append(row)

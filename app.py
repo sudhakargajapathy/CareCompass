@@ -93,7 +93,7 @@ PORTFOLIO_GITHUB_URL = os.getenv(
 )
 
 # Import our agent system
-from agents.orchestrator import create_orchestrator
+from agents.orchestrator import BUSY_MESSAGE, create_orchestrator
 from agents.critic_validator import is_judge_concern
 # The card's "Closest" chip must compare the same effective distance the
 # scorer ranks on, or the badge contradicts the ordering beside it.
@@ -3334,6 +3334,10 @@ def main():
                     user=user,
                     details={"providers": 0, "elapsed_s": round(elapsed_s, 1)}
                 )
+            elif (workflow_results.get("workflow_summary") or {}).get("busy"):
+                status.update(label="Another search is running", state="error", expanded=False)
+                _snapshot_run_progress(active_job, "Another search is running", "error")
+                log_audit_event("workflow_busy", user=user, success=False)
             else:
                 status.update(label="Search failed", state="error", expanded=False)
                 _snapshot_run_progress(active_job, "Search failed", "error")
@@ -3478,6 +3482,13 @@ def main():
                                 .get("data_gatherer", {})
                                 .get("search_metadata", {}),
             )
+
+        elif (workflow_results.get("workflow_summary") or {}).get("busy"):
+            # Not a failure of this search: another visitor's search held the
+            # process past the wait (see the orchestrator's search lock), so
+            # nothing ran and nothing was spent. "Check your input" would send
+            # the visitor hunting for a mistake they did not make.
+            st.warning(BUSY_MESSAGE)
 
         else:
             st.error("Search failed. Please check your input and try again.")

@@ -54,6 +54,7 @@ the auth check, the traces and the run records, so the two can never drift.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import hashlib
 import logging
 import os
@@ -345,17 +346,60 @@ class _NoopGeneration(GenerationHandle):
         super().__init__(None, model, agent)
 
 
+def _propagation(attributes: Optional[Dict[str, Any]]) -> Any:
+    """The SDK's `propagate_attributes` context for these trace attributes.
+
+    Langfuse v4 filters, aggregates and evaluates per OBSERVATION, so a
+    trace-level attribute (tags such as `source:canary`, the trace name,
+    the run's metadata) only counts where an observation carries it. The
+    SDK stamps them at span START, from the context active at that moment —
+    and the first version entered that context only around the root's
+    creation, so every step, model call and Tavily call was born after it
+    closed and carried none of them. Worker threads (enrichment, judge and
+    critic shards) never see the opener's context at all: it lives in
+    contextvars, which a thread pool does not copy. So every child opens
+    under its OWN short propagation scope (`RunTrace.start_child`), which
+    works on any thread. Never raises: tracing must not cost a run.
+    """
+    if not attributes:
+        return contextlib.nullcontext()
+    try:
+        from langfuse import propagate_attributes
+
+        return propagate_attributes(**attributes)
+    except Exception as exc:
+        logger.debug("propagate_attributes unavailable (%s); child spans go unlabelled", exc)
+        return contextlib.nullcontext()
+
+
 class RunTrace:
     """One workflow run's trace: root span, step stack, and the record at the end."""
 
-    def __init__(self, client: Any, run_id: str, root: Any, trace_id: str):
+    def __init__(self, client: Any, run_id: str, root: Any, trace_id: str,
+                 propagated: Optional[Dict[str, Any]] = None):
         self._client = client
         self.run_id = run_id
         self.root = root
         self.trace_id = trace_id
+        # The trace attributes every observation of this run must carry.
+        self.propagated: Dict[str, Any] = dict(propagated or {})
         self._steps: List[Tuple[str, Any]] = []
         self._lock = threading.Lock()
         self.finished = False
+
+    def start_child(self, parent: Any, **kwargs: Any) -> Any:
+        """`parent.start_observation(**kwargs)`, labelled with the run's trace attributes.
+
+        A propagation the SDK refuses on entry (a value it rejects) costs
+        the labels, never the span: the span is the record.
+        """
+        stack = contextlib.ExitStack()
+        try:
+            stack.enter_context(_propagation(self.propagated))
+        except Exception as exc:
+            logger.debug("trace attributes not propagated to %s: %s", kwargs.get("name"), exc)
+        with stack:
+            return parent.start_observation(**kwargs)
 
     # ---- parents -----------------------------------------------------------
     def current_parent(self) -> Any:
@@ -369,7 +413,7 @@ class RunTrace:
     def step_started(self, name: str, details: Optional[Dict[str, Any]] = None) -> None:
         try:
             parent = self.current_parent()
-            span = parent.start_observation(name=f"step.{name}", as_type="span", input=summarize(details or {}))
+            span = self.start_child(parent, name=f"step.{name}", as_type="span", input=summarize(details or {}))
             with self._lock:
                 self._steps.append((name, span))
         except Exception as exc:
@@ -467,11 +511,12 @@ def start_run(
         return
     run: Optional[RunTrace] = None
     try:
-        from langfuse import Langfuse, propagate_attributes
+        from langfuse import Langfuse
 
         trace_id = Langfuse.create_trace_id(seed=run_id)
         trace_metadata = {k: str(v) for k, v in (metadata or {}).items() if v is not None}
-        with propagate_attributes(trace_name=ROOT_NAME, tags=list(tags or []), metadata=trace_metadata):
+        propagated = {"trace_name": ROOT_NAME, "tags": list(tags or []), "metadata": trace_metadata}
+        with _propagation(propagated):
             root = client.start_observation(
                 trace_context={"trace_id": trace_id},
                 name=ROOT_NAME,
@@ -479,7 +524,7 @@ def start_run(
                 input=_cap(input or {}),
                 metadata=trace_metadata,
             )
-        run = RunTrace(client, run_id, root, trace_id)
+        run = RunTrace(client, run_id, root, trace_id, propagated=propagated)
     except Exception as exc:
         logger.warning("Tracing: could not open the run trace (%s); continuing untraced", exc)
         yield None
@@ -538,7 +583,8 @@ def generation(
     span = None
     try:
         parent = run.current_parent()
-        span = parent.start_observation(
+        span = run.start_child(
+            parent,
             name=name,
             as_type="generation",
             model=model,
@@ -575,7 +621,7 @@ def tool(name: str, input: Optional[Dict[str, Any]] = None) -> Iterator[_SpanHan
         return
     span = None
     try:
-        span = run.current_parent().start_observation(name=name, as_type="tool", input=_cap(input or {}))
+        span = run.start_child(run.current_parent(), name=name, as_type="tool", input=_cap(input or {}))
     except Exception as exc:
         logger.debug("tool span open failed for %s: %s", name, exc)
     handle: _SpanHandle = _SpanHandle(span) if span is not None else _NoopHandle()
@@ -611,7 +657,7 @@ def span(name: str, input: Optional[Dict[str, Any]] = None) -> Iterator[_SpanHan
     created = None
     previous = _thread_parent()
     try:
-        created = run.current_parent().start_observation(name=name, as_type="span", input=_cap(input or {}))
+        created = run.start_child(run.current_parent(), name=name, as_type="span", input=_cap(input or {}))
         _local.parent = created
     except Exception as exc:
         logger.debug("span open failed for %s: %s", name, exc)

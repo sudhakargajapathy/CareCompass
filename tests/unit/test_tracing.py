@@ -199,6 +199,66 @@ class TestSpanTree:
         assert all(s.ended for s in client.spans)
         assert client.flushes >= 1
 
+    def test_every_observation_carries_the_trace_attributes_on_any_thread(self, traced):
+        """Langfuse v4 filters, aggregates and evaluates per OBSERVATION. The
+        trace's tags, name and metadata used to be propagated only while the
+        ROOT was created, so every step, model call and Tavily call — all born
+        later, and the enrichment and judge ones on pool threads the opener's
+        context never reaches — carried none of them: filtering `tavily.*`
+        errors by `source:canary` matched nothing. The fake propagates through
+        a contextvar exactly as the SDK does, so it is blind across threads."""
+        tags = ["source:canary", "case:chandler-neurology"]
+        with tracing.start_run(run_id="run-p", metadata={"source": "canary", "case_id": "chandler-neurology"}, tags=tags) as run:
+            run.step_started("gather_data", {})
+            with tracing.tool("tavily.extract", input={"url_count": 4}) as call:
+                call.finish(output={"fetched": 4})
+            run.step_finished("gather_data", "completed", {})
+            run.step_started("enrich_reviews", {})
+
+            def worker(i):
+                with tracing.span("enrichment.provider", input={"provider": f"Dr {i}"}):
+                    with tracing.generation("enrichment.extract", model="claude-haiku-4-5", agent="data_gatherer") as gen:
+                        gen.finish(None)
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                list(pool.map(worker, range(2)))
+            run.step_finished("enrich_reviews", "completed", {})
+            run.finish(record={}, output={"ok": True})
+
+        client = FakeLangfuse.instances[0]
+        assert {s.thread for s in _by_name(client, "enrichment.extract")} != {threading.current_thread().name}
+        expected = {"trace_name": tracing.ROOT_NAME, "tags": tags,
+                    "metadata": {"source": "canary", "case_id": "chandler-neurology"}}
+        for span in client.spans:
+            assert span.propagated == expected, f"{span.name} on {span.thread} carries {span.propagated}"
+
+    def test_a_failing_propagation_never_costs_the_span(self, traced, monkeypatch):
+        """Labels are a nicety; the span is the record. If the SDK refuses the
+        attributes (say a value over its 200-character limit), the child must
+        still open."""
+        import contextlib
+        import sys
+
+        def refuse_on_call(**kw):
+            raise ValueError("metadata value too long")
+
+        @contextlib.contextmanager
+        def refuse_on_enter(**kw):
+            raise ValueError("metadata value too long")
+            yield  # pragma: no cover
+
+        real = sys.modules["langfuse"].propagate_attributes
+        for refuse in (refuse_on_call, refuse_on_enter):
+            FakeLangfuse.instances.clear()
+            tracing.reset_client()
+            monkeypatch.setattr(sys.modules["langfuse"], "propagate_attributes", real)
+            with tracing.start_run(run_id="run-q", tags=["source:canary"]) as run:
+                monkeypatch.setattr(sys.modules["langfuse"], "propagate_attributes", refuse)
+                run.step_started("gather_data", {})
+                run.step_finished("gather_data", "completed", {})
+                run.finish(record={}, output={"ok": True})
+            assert _by_name(FakeLangfuse.instances[0], "step.gather_data"), refuse.__name__
+
     def test_a_step_that_never_reported_completion_is_unwound_by_the_next_close(self, traced):
         with tracing.start_run(run_id="run-3") as run:
             run.step_started("score_providers", {})

@@ -84,14 +84,14 @@ class TestStability:
         out = tmp_path / "reports"
         out.mkdir()
         (out / weekly_report.ROWS_FILE).write_text(json.dumps(previous) + "\n")
-        trace = SimpleNamespace(id="t-cur", timestamp=NOW, tags=["source:canary"], environment="ci",
-                                metadata={"run_record": {"run_id": "cur", "source": "canary", "case_id": "chandler-neurology",
-                                                          "ts": NOW.isoformat(), "extra": current["extra"]}})
+        root = SimpleNamespace(trace_id="t-cur", start_time=NOW, tags=["source:canary"], environment="ci",
+                               metadata={"run_record": {"run_id": "cur", "source": "canary", "case_id": "chandler-neurology",
+                                                         "ts": NOW.isoformat(), "extra": current["extra"]}})
         scores = [SimpleNamespace(name=k, value=float(current[k]), data_type="NUMERIC", trace_id="t-cur")
                   for k in ("pool_raw", "cost_usd", "shortlist_size", "judge_applied", "evidence_present_rate")]
         api = SimpleNamespace(
-            trace=SimpleNamespace(list=lambda **kw: SimpleNamespace(data=[trace] if kw["page"] == 1 else [], meta=SimpleNamespace(total_pages=1))),
-            scores=SimpleNamespace(get_many=lambda **kw: SimpleNamespace(data=scores, meta=SimpleNamespace(total_pages=1))),
+            observations=SimpleNamespace(get_many=lambda **kw: SimpleNamespace(data=[root] if kw["cursor"] is None else [], meta=SimpleNamespace(cursor=None))),
+            scores_v3=SimpleNamespace(get_many_v3=lambda **kw: SimpleNamespace(data=scores, meta=SimpleNamespace(cursor=None))),
         )
         result = weekly_report.generate(SimpleNamespace(api=api), out, weeks_back=0, now=NOW)
         assert result["added"] == 1 and "4/5 shared · 4 same slot" in result["report"]

@@ -8,7 +8,9 @@ from itertools import zip_longest
 from typing import Callable, Dict, List, Any, Optional, Tuple, Union
 import json
 import re
+import requests
 from tavily import TavilyClient
+from tavily.errors import TimeoutError as TavilyTimeoutError
 from anthropic import Anthropic
 
 from utils.config import get_config
@@ -1536,6 +1538,41 @@ def _blended_platform_rating(observations) -> Optional[Dict[str, Any]]:
 
 # Filler words stripped when distilling the user's free-text requirements
 # into search keywords for the per-provider enrichment query
+
+# How long a failed Tavily call waits before its one retry. The sleep is for
+# the vendor's side (a 5xx, a rate limit) and is wasted on a dead connection:
+# on the live Space the 30 s first-attempt timeouts on stale pooled sockets
+# were each followed by this sleep and then a retry that succeeded in 1-3 s on
+# a new socket, so every stall cost 32 s instead of 30. A connection failure
+# retries at once; anything else keeps the pause.
+_TAVILY_RETRY_PAUSE_S = 2.0
+
+
+def _is_connection_failure(exc: BaseException) -> bool:
+    """True when a Tavily call died on the CONNECTION, not on the vendor.
+
+    tavily-python converts every `requests` timeout (read AND connect) into its
+    own `TimeoutError`, and lets the rest of `requests`' connection errors
+    escape raw: a reused socket the far end had closed came back on the live
+    Space as `SSLError ... UNEXPECTED_EOF_WHILE_READING` in 0.02-0.06 s, and an
+    `SSLError` is a `requests.ConnectionError`. A truncated body is
+    `ChunkedEncodingError`. All of these are fixed by a new connection, which
+    the retry gets because urllib3 discards a socket that failed, so waiting
+    buys nothing. An HTTP status error (429, 5xx, a bad key) is the vendor
+    talking and keeps the pause.
+    """
+    return isinstance(exc, (
+        TavilyTimeoutError,
+        requests.exceptions.ConnectionError,
+        requests.exceptions.ChunkedEncodingError,
+    ))
+
+
+def _tavily_retry_pause(exc: BaseException) -> float:
+    """Seconds to wait before retrying a Tavily call that raised `exc`."""
+    return 0.0 if _is_connection_failure(exc) else _TAVILY_RETRY_PAUSE_S
+
+
 class DataGathererAgent:
     """Agent responsible for gathering healthcare provider data using Tavily search and Claude Haiku for extraction."""
 
@@ -1857,8 +1894,13 @@ class DataGathererAgent:
 
             except Exception as e:
                 if attempt == 1:
-                    logger.warning(f"Tavily search failed (attempt 1), retrying: {e}")
-                    time.sleep(2)
+                    pause = _tavily_retry_pause(e)
+                    logger.warning(
+                        f"Tavily search failed (attempt 1), retrying"
+                        f"{' now' if not pause else f' in {pause:g}s'}: {e}"
+                    )
+                    if pause:
+                        time.sleep(pause)
                 else:
                     logger.error(f"Tavily search failed after retry: {e}")
         return []
@@ -1881,6 +1923,29 @@ class DataGathererAgent:
     # Tavily /extract's documented per-request URL cap. The batching below
     # chunks to it, so nothing else depends on the exact number.
     _EXTRACT_URL_BATCH = 20
+
+    # The first /extract attempt gets a SHORTER timeout than the vendor's 30 s
+    # default; the retry gets the full 30. On the live Space every stalled
+    # first attempt ran the whole 30 s on a dead pooled socket (30 of 34
+    # first-attempt failures, 30.04-30.15 s each) while every retry on a new
+    # connection succeeded in 1.2-2.8 s, so the first 30 s bought nothing but
+    # latency: discovery and enrichment each wait on their slowest parallel
+    # call, so one stall held a whole stage. 15 s is five times the slowest
+    # successful extract seen in those traces and still halves the cost of a
+    # stall. NOT measured: the p99 of successful extracts across all traces,
+    # which would settle whether 15 s ever cuts off a slow-but-healthy batch;
+    # the retry at 30 s is the backstop if it does. Tavily also receives the
+    # value in the request body and bounds its own page fetching by it, so a
+    # slow page is more likely to come back in `failed_results` than as an
+    # exception.
+    _EXTRACT_FIRST_ATTEMPT_TIMEOUT_S = 15.0
+    _EXTRACT_RETRY_TIMEOUT_S = 30.0
+
+    def _extract_timeout(self, attempt: int) -> float:
+        """The /extract timeout for this attempt (1 = first try)."""
+        if attempt == 1:
+            return self._EXTRACT_FIRST_ATTEMPT_TIMEOUT_S
+        return self._EXTRACT_RETRY_TIMEOUT_S
 
     def _extract_pages(self, urls: Optional[List[str]], purpose: str = "", stage: str = "discovery") -> List[Dict[str, Any]]:
         """Fetch page bodies via Tavily /extract, shaped like search results.
@@ -1940,7 +2005,8 @@ class DataGathererAgent:
                         "attempt": attempt,
                     }) as call:
                         response = self.tavily_client.extract(
-                            urls=chunk, extract_depth="basic", format="markdown"
+                            urls=chunk, extract_depth="basic", format="markdown",
+                            timeout=self._extract_timeout(attempt),
                         )
                         get_cost_tracker().record_tavily_extract(
                             len(chunk), agent="data_gatherer", stage=stage
@@ -1987,10 +2053,13 @@ class DataGathererAgent:
                     break
                 except Exception as e:
                     if attempt == 1:
+                        pause = _tavily_retry_pause(e)
                         logger.warning(
-                            f"Tavily extract failed (attempt 1), retrying: {e}"
+                            f"Tavily extract failed (attempt 1), retrying"
+                            f"{' now' if not pause else f' in {pause:g}s'}: {e}"
                         )
-                        time.sleep(2)
+                        if pause:
+                            time.sleep(pause)
                     else:
                         logger.error(f"Tavily extract failed after retry: {e}")
         logger.info(
@@ -4402,6 +4471,38 @@ Response (JSON object only):"""
         )
         return merged
 
+    def _refresh_tavily_connections(self) -> None:
+        """Drop every pooled Tavily connection so this search opens fresh ones.
+
+        The app holds ONE orchestrator for the life of the Space process
+        (`@st.cache_resource`), so ONE `TavilyClient` and its
+        `requests.Session` pool outlive every search. `requests` keeps idle
+        keep-alive sockets with no expiry; after about a day without a search
+        the far end has closed them, and the next search writes into a dead
+        socket. Measured on the live demo over 14 days (2026-11-03..16): all
+        34 ERROR observations were `tavily.extract` attempt 1, demo only, CI
+        never — 30 hung to the 30 s client timeout, 4 failed in ~0.05 s with
+        `SSL: UNEXPECTED_EOF_WHILE_READING` — and every retry succeeded in
+        1-3 s on a new connection. Discovery and enrichment each wait for
+        their slowest parallel call, so one dead socket cost a stage ~32 s
+        and runs after an idle day took 65-117 s against CI's ~40 s. CI
+        cannot see it: every canary is a fresh process with an empty pool.
+
+        Closing the session's adapters empties the pool; the session stays
+        usable and opens new connections on demand (one TLS handshake per
+        concurrent call, ~100 ms). Once per search, at the top of
+        `gather_providers`, which covers enrichment too: it runs seconds
+        later in the same search. Never fails a search.
+        """
+        session = getattr(self.tavily_client, "session", None)
+        close = getattr(session, "close", None)
+        if not callable(close):
+            return
+        try:
+            close()
+        except Exception as exc:  # a pool reset must never cost a search
+            logger.debug("Tavily session reset failed: %s", exc)
+
     def gather_providers(self, specialty: str, location: str, insurance: Optional[str] = None,
                          enrich: bool = True, radius_miles: Optional[float] = None) -> Dict[str, Any]:
         """Main method to gather healthcare provider data.
@@ -4422,6 +4523,7 @@ Response (JSON object only):"""
         """
         self._identity_contradictions = []
         self._reset_run_stats()
+        self._refresh_tavily_connections()
         try:
             # Validate and sanitize inputs first
             validation_result = validate_search_params(specialty, location, insurance)
