@@ -29,13 +29,16 @@ from evals.summary import render_summary, write_step_summary
 from evals.thresholds import (
     GOLDEN_CASE_ID,
     GOLDEN_CHECKS,
+    LIVE_CASE_ID,
     REPORT_CASE_ID,
     Finding,
     checks_for_tier,
     evaluate_fetch,
     evaluate_golden,
+    evaluate_live,
     evaluate_pipeline,
     evaluate_report_freshness,
+    live_scope,
 )
 
 DEFAULT_INPUTS = {"A": Path("evals/out/canary_fetch.json"), "B": Path("evals/out/canary_pipeline.json")}
@@ -125,6 +128,35 @@ def evaluate_golden_file(path: Optional[Path]) -> Tuple[List[Finding], Dict[str,
     return evaluate_golden(payload), {GOLDEN_CASE_ID: set(GOLDEN_CHECKS) | {"canary_did_not_run"}}
 
 
+def evaluate_live_file(path: Optional[Path]) -> Tuple[List[Finding], Dict[str, Set[str]], Optional[str]]:
+    """The live app's window, when this run was expected to measure it.
+
+    Same contract as the golden set: passing a path means the live watch
+    SHOULD have run, so a missing file is `canary_did_not_run` under the
+    live pseudo-case. Returns a one-line note for the summary too — counts
+    only, like the file.
+    """
+    if not path:
+        return [], {}, None
+    payload = load_results(path)
+    if payload is None:
+        return (
+            [Finding("canary_did_not_run", "P1", LIVE_CASE_ID, "no live health file", "one live window per run")],
+            {LIVE_CASE_ID: {"canary_did_not_run"}},
+            None,
+        )
+    tavily = payload.get("tavily") or {}
+    latency = payload.get("latency_s") or {}
+    p95 = latency.get("p95")
+    note = (
+        f"live app ({', '.join(payload.get('environments') or []) or '?'}, last "
+        f"{(payload.get('window') or {}).get('hours', '?')} h): {payload.get('runs', 0)} run(s), "
+        f"p95 {'—' if p95 is None else f'{float(p95):.0f} s'}, Tavily errors "
+        f"{tavily.get('first_attempt_errors', 0)} first-attempt / {tavily.get('retry_errors', 0)} after retry"
+    )
+    return evaluate_live(payload), {LIVE_CASE_ID: set(live_scope(payload)) | {"canary_did_not_run"}}, note
+
+
 def expected_cases(tier: str, schedule: str, case_id: Optional[str]) -> Optional[Sequence[CanaryCase]]:
     """Which cases this run should have measured; None for an unknown case id."""
     if case_id:
@@ -149,6 +181,8 @@ def main(argv: Optional[Sequence[str]] = None, env: Mapping[str, str] = os.envir
                         help="also check the weekly report's freshness stamp in this directory")
     parser.add_argument("--golden", type=Path, default=None,
                         help="the golden-set grades this run was expected to produce (evals/out/golden.json)")
+    parser.add_argument("--live", type=Path, default=None,
+                        help="the live-app window this run was expected to measure (evals/out/live_health.json)")
     args = parser.parse_args(argv)
 
     expected = expected_cases(args.tier, args.schedule, args.case)
@@ -164,8 +198,11 @@ def main(argv: Optional[Sequence[str]] = None, env: Mapping[str, str] = os.envir
     findings.extend(golden_findings)
     evaluated.update(golden_scope)
     golden_payload = load_results(args.golden) if args.golden else None
+    live_findings, live_scope_map, live_note = evaluate_live_file(args.live)
+    findings.extend(live_findings)
+    evaluated.update(live_scope_map)
     run_url = run_url_from_env(env)
-    notes: List[str] = []
+    notes: List[str] = [live_note] if live_note else []
 
     token, repo = env.get("GITHUB_TOKEN"), env.get("GITHUB_REPOSITORY")
     if args.no_issues:

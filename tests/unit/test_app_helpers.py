@@ -2212,12 +2212,12 @@ class TestStatusPersistence:
         assert st.session_state.last_run_progress["progress"] == 55
 
     def test_every_harvest_outcome_snapshots_and_the_rerun_replays(self):
-        """Wiring: all four status.update sites snapshot (success,
-        no-results, generic failure, exception), and main's job-less branch
-        replays. A helper-only test would let any of the five call sites
-        be deleted with the suite green."""
+        """Wiring: all five status.update sites snapshot (success,
+        no-results, busy, generic failure, exception), and main's job-less
+        branch replays. A helper-only test would let any of the six call
+        sites be deleted with the suite green."""
         src = inspect.getsource(app.main)
-        assert src.count("_snapshot_run_progress(") == 4
+        assert src.count("_snapshot_run_progress(") == 5
         assert "_render_last_run_status()" in src
 
     def test_the_replay_renders_the_snapshot(self, monkeypatch):

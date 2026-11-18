@@ -97,6 +97,7 @@ jobs:
           CRON: ${{ github.event.schedule }}
           INPUT_SCHEDULE: ${{ github.event.inputs.schedule }}
           INPUT_CASE: ${{ github.event.inputs.case }}
+          LIVE_WATCH_ENVIRONMENTS: ${{ vars.LIVE_WATCH_ENVIRONMENTS }}
         run: |
           if [ "$EVENT_NAME" = "schedule" ]; then
             # Weekly = the Sunday cron (day-of-week field 0), detected by the
@@ -124,6 +125,18 @@ jobs:
             GOLDEN=true
             WATCH_ARGS="$WATCH_ARGS --golden evals/out/golden.json"
           fi
+          # The live app's own traffic (counts only), when the repository
+          # names its environment label. The canaries cannot see a failure
+          # that lives in a long-running process — the 100+ s live searches of
+          # November 2026 were invisible to every fresh-process check — so
+          # this reads what visitors hit. Unset, nothing is measured and the
+          # watcher does not expect it.
+          LIVE=false
+          if [ -n "$LIVE_WATCH_ENVIRONMENTS" ] && [ -z "$INPUT_CASE" ]; then
+            LIVE=true
+            WATCH_ARGS="$WATCH_ARGS --live evals/out/live_health.json"
+          fi
+          echo "live=$LIVE" >> "$GITHUB_OUTPUT"
           echo "args=$ARGS" >> "$GITHUB_OUTPUT"
           echo "golden=$GOLDEN" >> "$GITHUB_OUTPUT"
           echo "watch_args=$WATCH_ARGS" >> "$GITHUB_OUTPUT"
@@ -137,6 +150,16 @@ jobs:
         # (the private artifact below), grades in evals/out/golden.json.
         if: always() && steps.plan.outputs.golden == 'true'
         run: python -m evals.golden_check
+
+      - name: Measure the live app
+        # Opt-in: set the repository VARIABLE LIVE_WATCH_ENVIRONMENTS to the
+        # live Space's trace environment label (e.g. demo). Reads Langfuse
+        # only, spends no credits, writes counts (never searches) to
+        # evals/out/live_health.json.
+        if: always() && steps.plan.outputs.live == 'true'
+        env:
+          LIVE_WATCH_ENVIRONMENTS: ${{ vars.LIVE_WATCH_ENVIRONMENTS }}
+        run: python -m evals.live_watch
 
       - name: Evaluate, summarize, sync issues
         # always(): a crashed canary is exactly what canary_did_not_run reports.

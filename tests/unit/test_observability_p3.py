@@ -277,26 +277,51 @@ def fake_scores(trace_id, **values):
 
 
 class FakeApi:
+    """The two v4 read endpoints the weekly export uses, shaped like the wire.
+
+    Observations API v2 returns each run's ROOT observation (trace id, start
+    time, tags, environment, metadata), pages by cursor, and — like the real
+    endpoint — TRUNCATES a metadata value over 200 characters unless its key
+    is named in `expand_metadata`. The run record travels as a JSON string,
+    which is how a nested dict crosses the OpenTelemetry attributes.
+    """
+
     def __init__(self, traces, scores):
         self._traces, self._scores = traces, scores
         self.calls = []
-        self.trace = SimpleNamespace(list=self._list)
-        self.scores = SimpleNamespace(get_many=self._get_many)
+        self.observations = SimpleNamespace(get_many=self._get_observations)
+        self.scores_v3 = SimpleNamespace(get_many_v3=self._get_scores)
 
-    def _list(self, *, page, limit, name, from_timestamp, to_timestamp, environment=None):
-        # Recorded but NOT applied: the fake ignores the filter on purpose, so
-        # the exporter's own client-side check has to do the dropping.
-        self.calls.append(("trace.list", page, name) + ((environment,) if environment is not None else ()))
+    @staticmethod
+    def _root(trace, expand):
+        metadata = {}
+        for key, value in (trace.metadata or {}).items():
+            text = json.dumps(value) if isinstance(value, (dict, list)) else value
+            if isinstance(text, str) and len(text) > 200 and key not in expand:
+                text = text[:200] + "..."
+            metadata[key] = text
+        return SimpleNamespace(trace_id=trace.id, start_time=trace.timestamp, tags=trace.tags,
+                               environment=trace.environment, metadata=metadata, name=trace.name)
+
+    def _get_observations(self, *, limit, cursor, name, from_start_time, to_start_time, fields,
+                          expand_metadata=None, environment=None):
+        # The environment filter is recorded but NOT applied: the fake ignores
+        # it on purpose, so the exporter's own client-side check has to drop.
+        page = int(cursor or 1)
+        self.calls.append(("observations.get_many", page, name) + ((environment,) if environment is not None else ()))
         assert name == "carecompass.search"
-        window = [t for t in self._traces if from_timestamp <= t.timestamp < to_timestamp]
+        assert set(fields.split(",")) >= {"core", "basic", "metadata", "trace_context"}
+        expand = set((expand_metadata or "").split(","))
+        window = [t for t in self._traces if from_start_time <= t.timestamp < to_start_time]
         size = 2  # force pagination
-        chunk = window[(page - 1) * size: page * size]
-        total_pages = max(1, -(-len(window) // size))
-        return SimpleNamespace(data=chunk, meta=SimpleNamespace(total_pages=total_pages))
+        chunk = [self._root(t, expand) for t in window[(page - 1) * size: page * size]]
+        following = str(page + 1) if page * size < len(window) else None
+        return SimpleNamespace(data=chunk, meta=SimpleNamespace(cursor=following))
 
-    def _get_many(self, *, page, limit, trace_id):
-        self.calls.append(("scores.get_many", page, trace_id))
-        return SimpleNamespace(data=self._scores.get(trace_id, []), meta=SimpleNamespace(total_pages=1))
+    def _get_scores(self, *, limit, cursor, trace_id):
+        assert limit <= 100, "Scores API v3 answers 400 above 100"
+        self.calls.append(("scores_v3.get_many_v3", cursor, trace_id))
+        return SimpleNamespace(data=self._scores.get(trace_id, []), meta=SimpleNamespace(cursor=None))
 
 
 def fake_client(traces, scores):
@@ -340,7 +365,9 @@ class TestWeeklyReport:
         start, end, _ = weekly_report.week_bounds(NOW, 0)
         rows = weekly_report.fetch_rows(client, start, end)
         assert [r["trace_id"] for r in rows] == ["t0", "t1", "t3", "t4"]
-        assert [c for c in client.api.calls if c[0] == "trace.list"] == [("trace.list", 1, "carecompass.search"), ("trace.list", 2, "carecompass.search"), ("trace.list", 3, "carecompass.search")]
+        assert [c for c in client.api.calls if c[0] == "observations.get_many"] == [
+            ("observations.get_many", 1, "carecompass.search"), ("observations.get_many", 2, "carecompass.search"),
+            ("observations.get_many", 3, "carecompass.search")]
 
     def test_only_runs_that_spent_or_measured_are_exported(self):
         """Seven of the fourteen leaked test traces were mocked FAILURES —
@@ -402,7 +429,7 @@ class TestWeeklyReport:
         def broken(env):
             def fail(**kw):
                 raise ConnectionError("api down")
-            return SimpleNamespace(api=SimpleNamespace(trace=SimpleNamespace(list=fail), scores=None))
+            return SimpleNamespace(api=SimpleNamespace(observations=SimpleNamespace(get_many=fail), scores_v3=None))
 
         monkeypatch.setattr(weekly_report, "_client", broken)
         assert weekly_report.main(["--out-dir", str(tmp_path)], env=keys) == 1
@@ -453,7 +480,7 @@ class TestWeeklyReport:
         start, end, label = weekly_report.week_bounds(NOW, 0)
         rows = weekly_report.fetch_rows(client, start, end, environments=["demo", "ci"])
         assert [r["trace_id"] for r in rows] == ["d1", "c1"]
-        assert client.api.calls[0] == ("trace.list", 1, "carecompass.search", ["ci", "demo"]), "the API is asked to filter"
+        assert client.api.calls[0] == ("observations.get_many", 1, "carecompass.search", ["ci", "demo"]), "the API is asked to filter"
         assert [r["trace_id"] for r in weekly_report.fetch_rows(client, start, end)] == ["d1", "v1", "c1"], "no filter = all"
         assert weekly_report.parse_environments(" Demo, ci ,,demo") == ["demo", "ci"]
         assert weekly_report.parse_environments(None) == [] and weekly_report.parse_environments("  ") == []
@@ -522,6 +549,56 @@ class TestWeeklyReportResilience:
     re-run the same day succeeded at the same volume: a latency spike, which
     a weekly batch job must absorb rather than report."""
 
+    def test_the_run_record_is_asked_for_in_full_or_every_row_is_lost(self, monkeypatch):
+        """Observations API v2 cuts a metadata value at 200 characters unless
+        `expandMetadata` names its key, and a run record is always longer.
+        Without the expansion every root's `run_record` arrives as a JSON
+        fragment, no row parses, and the week exports ZERO rows while the job
+        stays green."""
+        base = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+        traces = [fake_trace("t1", base), fake_trace("t2", base + timedelta(hours=1))]
+        assert all(len(json.dumps(t.metadata["run_record"])) > 200 for t in traces), "the fixture must be long enough to truncate"
+        client = fake_client(traces, {t.id: fake_scores(t.id, pool_raw=100) for t in traces})
+        start, end, _ = weekly_report.week_bounds(NOW, 0)
+        assert [r["trace_id"] for r in weekly_report.fetch_rows(client, start, end)] == ["t1", "t2"]
+        monkeypatch.setattr(weekly_report, "ROOT_EXPAND_METADATA", "")
+        assert weekly_report.fetch_rows(client, start, end) == [], "the trap this guards: truncated records parse to nothing"
+
+    def test_a_root_observation_reads_as_the_trace_it_roots(self):
+        """v4 has no trace object to list. The run's root observation carries
+        the run record (as a JSON string or already parsed), its start time is
+        the run's timestamp, and its trace context carries the tags."""
+        ts = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+        record = {"run_id": "run-x", "source": "canary", "extra": {"pipeline": True}}
+        for metadata in ({"run_record": record}, {"run_record": json.dumps(record)}, json.dumps({"run_record": record})):
+            root = SimpleNamespace(trace_id="x", start_time=ts, tags=["source:canary"], environment="ci", metadata=metadata)
+            trace = weekly_report.trace_from_root(root)
+            assert (trace.id, trace.timestamp, trace.tags, trace.environment) == ("x", ts, ["source:canary"], "ci")
+            assert trace.metadata["run_record"] == record
+        broken = SimpleNamespace(trace_id="y", start_time=ts, tags=None, environment=None, metadata={"run_record": '{"run_id": "ru'})
+        assert weekly_report.row_from_trace(weekly_report.trace_from_root(broken), []) is None, "a fragment is skipped, never half-read"
+
+    def test_scores_v3_typed_values_land_in_the_row(self):
+        """Scores API v3 returns one typed `value`: BOOLEAN as a real bool,
+        NUMERIC as a float. Both must come out the way the v2 shape did."""
+        trace = fake_trace("t1", NOW)
+        scores = [SimpleNamespace(name="fallback_fired", value=True, data_type="BOOLEAN"),
+                  SimpleNamespace(name="ring_fired", value=False, data_type="BOOLEAN"),
+                  SimpleNamespace(name="pool_raw", value=117.0, data_type="NUMERIC"),
+                  SimpleNamespace(name="cost_usd", value=0.024, data_type="NUMERIC")]
+        row = weekly_report.row_from_trace(trace, scores)
+        assert row["fallback_fired"] is True and row["ring_fired"] is False
+        assert row["pool_raw"] == 117 and isinstance(row["pool_raw"], int) and row["cost_usd"] == 0.024
+
+    def test_a_run_listed_twice_exports_once(self):
+        """Cursor pages are not snapshots: a root can reappear across pages."""
+        base = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+        t = fake_trace("t1", base)
+        client = fake_client([t, t, fake_trace("t2", base + timedelta(hours=1))], {"t1": fake_scores("t1", pool_raw=1), "t2": fake_scores("t2", pool_raw=2)})
+        start, end, _ = weekly_report.week_bounds(NOW, 0)
+        assert [r["trace_id"] for r in weekly_report.fetch_rows(client, start, end)] == ["t1", "t2"]
+        assert [c[2] for c in client.api.calls if c[0] == "scores_v3.get_many_v3"] == ["t1", "t2"]
+
     def _week(self):
         base = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
         traces = [fake_trace(f"t{i}", base + timedelta(hours=i)) for i in range(3)]
@@ -529,11 +606,11 @@ class TestWeeklyReportResilience:
         start, end, _ = weekly_report.week_bounds(NOW, 0)
         return fake_client(traces, scores), start, end
 
-    def test_a_timeout_on_the_trace_list_is_retried_not_fatal(self, monkeypatch):
+    def test_a_timeout_on_the_run_list_is_retried_not_fatal(self, monkeypatch):
         slept = []
         monkeypatch.setattr(weekly_report, "_sleep", slept.append)
         client, start, end = self._week()
-        client.api.trace.list = _flaky(client.api.trace.list, [_read_timeout()])
+        client.api.observations.get_many = _flaky(client.api.observations.get_many, [_read_timeout()])
         rows = weekly_report.fetch_rows(client, start, end)
         assert [r["trace_id"] for r in rows] == ["t0", "t1", "t2"]
         assert slept == [5.0]
@@ -543,7 +620,7 @@ class TestWeeklyReportResilience:
         and a timeout there would have dropped the run or the whole week."""
         monkeypatch.setattr(weekly_report, "_sleep", lambda s: None)
         client, start, end = self._week()
-        client.api.scores.get_many = _flaky(client.api.scores.get_many, [_read_timeout()])
+        client.api.scores_v3.get_many_v3 = _flaky(client.api.scores_v3.get_many_v3, [_read_timeout()])
         rows = weekly_report.fetch_rows(client, start, end)
         assert [(r["trace_id"], r["pool_raw"]) for r in rows] == [("t0", 100.0), ("t1", 101.0), ("t2", 102.0)]
 
@@ -552,13 +629,13 @@ class TestWeeklyReportResilience:
         slept = []
         monkeypatch.setattr(weekly_report, "_sleep", slept.append)
         client, _, _ = self._week()
-        client.api.trace.list = _flaky(client.api.trace.list, [_read_timeout() for _ in range(3)])
+        client.api.observations.get_many = _flaky(client.api.observations.get_many, [_read_timeout() for _ in range(3)])
         monkeypatch.setattr(weekly_report, "_client", lambda env: client)
         keys = {"LANGFUSE_PUBLIC_KEY": "pk", "LANGFUSE_SECRET_KEY": "sk", "LANGFUSE_BASE_URL": "https://us.cloud.langfuse.com"}
         assert weekly_report.main(["--out-dir", str(tmp_path)], env=keys) == 1
         err = capsys.readouterr().err
         assert "export failed — ReadTimeout" in err
-        assert len(client.api.trace.list.calls) == 3 and slept == [5.0, 15.0]
+        assert len(client.api.observations.get_many.calls) == 3 and slept == [5.0, 15.0]
         assert err.count("retrying in") == 2, "a retry that rescues a run must still show in the job log"
         assert not (tmp_path / weekly_report.ROWS_FILE).exists()
 
@@ -570,12 +647,12 @@ class TestWeeklyReportResilience:
         slept = []
         monkeypatch.setattr(weekly_report, "_sleep", slept.append)
         client, start, end = self._week()
-        request = httpx.Request("GET", "https://us.cloud.langfuse.com/api/public/traces")
+        request = httpx.Request("GET", "https://us.cloud.langfuse.com/api/public/v2/observations")
         unauthorized = httpx.HTTPStatusError("401 Unauthorized", request=request, response=httpx.Response(401, request=request))
-        client.api.trace.list = _flaky(client.api.trace.list, [unauthorized])
+        client.api.observations.get_many = _flaky(client.api.observations.get_many, [unauthorized])
         with pytest.raises(httpx.HTTPStatusError):
             weekly_report.fetch_rows(client, start, end)
-        assert len(client.api.trace.list.calls) == 1 and slept == []
+        assert len(client.api.observations.get_many.calls) == 1 and slept == []
 
     def test_the_client_is_given_a_batch_timeout_not_the_sdk_default(self, monkeypatch):
         """The SDK's default is 5 s — the budget that failed. The job passes its
