@@ -250,8 +250,9 @@ ALL_CHECKS: FrozenSet[str] = PIPELINE_CHECKS | WATCHER_CHECKS | REPORT_CHECKS | 
 # its stripped copies (at least 34 hours when this was written). A daily red
 # run that asks nothing of the reader trains the reader to skip red runs,
 # which is how the alerts that DO need a parser fixed get missed. So an
-# advisory finding still opens its issue (one notification) and still closes
-# on recovery (a second), and that is all it does. Keep this set small: a
+# advisory finding is tracked in ONE issue per check, shared by every case and
+# platform and rewritten in place (evals/alerts): one notification when the
+# condition starts, one when it ends, and that is all it does. Keep this set small: a
 # check belongs here only when the run recovered by itself AND a failing
 # check already covers the case where it did not — here, the row, coverage
 # and template-drift checks, which fire when the refetch stops restoring.
