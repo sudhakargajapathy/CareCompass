@@ -98,6 +98,17 @@ VI_LISTING_WHOLE = (
     '## 142 Neurologists near Chandler, AZ\n\n'
     '### Dr. Brandon Craig Woods\nNeurology\n3.5 12 ratings\n18 years exp\nMesa, AZ9.8 mi\n'
 )
+# vitals' Gilbert family-medicine listing as the 2026-11-23 canary received
+# it (5,476 chars): the filter panel, an explainer and an FAQ. No entry and
+# no "N Family Physicians Found" line.
+VI_FRAME_LISTING = "https://www.vitals.com/family-medicine/az/gilbert"
+VI_LISTING_FRAME_ONLY = (
+    "## Filter Family Physicians Results\n\n"
+    "## What is a Family Physician and How Can They Help You?\n\n"
+    "A family physician provides continuous, comprehensive healthcare.\n\n"
+    "## Frequently Asked Questions\n\n"
+    "## Ensuring Data Transparency and Trust: A Guide to Vitals Doctor Listings and Reviews\n"
+)
 VI_PROFILE_WHOLE = (golden.FIXTURE_DIR / "vitals" / "hemant-pandey.md").read_text(encoding="utf-8")
 
 
@@ -139,6 +150,29 @@ class TestRecognition:
     ])
     def test_a_whole_page_is_left_alone(self, url, body):
         assert degraded_reason(url, body) is None
+
+    def test_a_vitals_listing_cut_to_its_frame_is_stripped_even_with_no_total(self):
+        """The first public canary run on the refetch still reported "vitals:
+        0 rows" for gilbert-family-medicine: the stored copy had lost its
+        entries AND its "1,552 Family Physicians Found" line, so the
+        states-a-total rule passed it. The same request past the cache
+        returned 56 rows. The filter panel heading is what marks the body as
+        a listing that lost its results."""
+        from utils.listing_parser import listing_result_count
+        assert listing_result_count(VI_FRAME_LISTING, VI_LISTING_FRAME_ONLY) is None
+        assert parse_listing(VI_FRAME_LISTING, VI_LISTING_FRAME_ONLY) == []
+        assert degraded_reason(VI_FRAME_LISTING, VI_LISTING_FRAME_ONLY) == LISTING_WITHOUT_ROWS
+        # The panel on a page that still has its rows is a healthy listing.
+        assert degraded_reason(VI_LISTING, "## Filter Neurologists Results\n\n" + VI_LISTING_WHOLE) is None
+        # Another platform's page is not judged by vitals' frame.
+        assert degraded_reason(HG_LISTING, VI_LISTING_FRAME_ONLY) is None
+
+    def test_the_frame_only_listing_is_refetched_and_its_rows_reach_the_caller(self):
+        gatherer = _gatherer({VI_FRAME_LISTING: VI_LISTING_FRAME_ONLY}, {VI_FRAME_LISTING: VI_LISTING_WHOLE})
+        pages = gatherer._extract_pages([VI_FRAME_LISTING], purpose="discovery")
+        assert [p["raw_content"] for p in pages] == [VI_LISTING_WHOLE]
+        assert _calls(gatherer)[1].kwargs["use_cache"] is False
+        assert len(parse_listing(VI_FRAME_LISTING, pages[0]["raw_content"])) == 1
 
     def test_a_listing_page_that_states_no_total_is_not_judged(self):
         """A wrong slug is answered with a marketing page that states no
@@ -369,7 +403,7 @@ class _Issues:
     """An in-memory Issues API behind the alerts transport seam."""
 
     def __init__(self):
-        self.issues, self.comments = [], []
+        self.issues, self.comments, self.patches = [], [], []
 
     def __call__(self, method, path, body, params):
         if "/labels/" in path:
@@ -386,7 +420,8 @@ class _Issues:
         if method == "PATCH":
             for issue in self.issues:
                 if issue["number"] == int(path.split("/")[-1]):
-                    issue["state"] = body["state"]
+                    issue.update({k: body[k] for k in ("state", "body") if k in body})
+                    self.patches.append((issue["number"], sorted(body)))
             return 200, {}
         raise AssertionError(f"unexpected call {method} {path}")
 
@@ -442,27 +477,99 @@ class TestRestoredPageIsAdvisory:
         for check in ("platform_rows_zero", "template_drift", "pool_size_low", "canary_did_not_run"):
             assert check in thresholds.ALL_CHECKS and check not in thresholds.ADVISORY_CHECKS
 
-    def test_the_issue_opens_once_is_not_commented_on_and_closes_on_recovery(self):
-        """Two notifications for the whole episode: one when the vendor
-        starts serving stripped copies, one when it stops. A failing finding
-        beside it keeps its daily 'still breached' comment."""
+    def _restored(self, case_id, domain, count=2):
+        return thresholds.Finding(
+            "degraded_fetch_recovered", "P3", case_id,
+            f"{domain}: {count} stripped page(s) restored by a cache-bypass refetch", "0 stripped pages", detail=domain)
+
+    def test_every_restored_page_shares_one_issue_that_is_rewritten_in_place(self):
+        """The first public run opened TWELVE issues for one vendor condition
+        (four cases and the golden set, up to three platforms each) and the
+        one finding that needed a person sat in the middle of them. One
+        condition is one issue: opened once, its table rewritten on every
+        run, never commented on, closed once."""
         from evals import alerts
         gh = _Issues()
         client = alerts.GitHubIssues("tok", "o/r", transport=gh)
-        scope = {"chandler-neurology": checks_for_tier("A")}
-        first = alerts.sync_issues(client, [RESTORED, HG_ZERO], scope, "https://gh/run/1", now=NOW)
-        assert first.opened == [RESTORED.title, HG_ZERO.title] and gh.comments == []
-        restored_issue = gh.issues[0]
-        assert "It is advisory: it does not fail the run" in restored_issue["body"]
-        assert "advisory" not in gh.issues[1]["body"]
+        weekly = {c: checks_for_tier("A") for c in ("chandler-neurology", "phoenix-cardiology")}
+        found = [self._restored("chandler-neurology", "healthgrades.com", 4),
+                 self._restored("chandler-neurology", "doctor.webmd.com"),
+                 self._restored("phoenix-cardiology", "healthgrades.com"), HG_ZERO]
+        first = alerts.sync_issues(client, found, weekly, "https://gh/run/1", now=NOW)
+        assert sorted(i["title"] for i in gh.issues) == sorted([
+            "[P3] Stripped page restored by refetch — all-cases", HG_ZERO.title]), "three restored findings, one issue"
+        assert first.opened.count("[P3] Stripped page restored by refetch — all-cases") == 1
+        rollup = next(i for i in gh.issues if "all-cases" in i["title"])
+        for cell in ("| chandler-neurology | healthgrades.com | healthgrades.com: 4 stripped page(s)",
+                     "| chandler-neurology | doctor.webmd.com |", "| phoenix-cardiology | healthgrades.com |",
+                     "It is advisory: it does not fail the run", "Send the vendor the URLs"):
+            assert cell in rollup["body"]
 
-        second = alerts.sync_issues(client, [RESTORED, HG_ZERO], scope, "https://gh/run/2", now=NOW)
-        assert second.opened == [] and second.still_open == [RESTORED.title] and second.commented == [HG_ZERO.title]
-        assert [number for number, _ in gh.comments] == [gh.issues[1]["number"]], (
-            "only the failing finding is commented on while it persists")
-        assert "advisory still open (no comment) 1" in second.describe()
+        # The DAILY run evaluates Chandler only: webmd came back clean there,
+        # healthgrades did not. Phoenix was not looked at and must keep its row.
+        later = datetime(2026, 11, 24, 13, 0, tzinfo=timezone.utc)
+        daily = {"chandler-neurology": checks_for_tier("A")}
+        second = alerts.sync_issues(client, [self._restored("chandler-neurology", "healthgrades.com", 1), HG_ZERO],
+                                    daily, "https://gh/run/2", now=later)
+        assert second.opened == [] and second.updated == [rollup["title"]] and second.commented == [HG_ZERO.title]
+        assert len(gh.issues) == 2 and gh.patches == [(rollup["number"], ["body"])]
+        assert [n for n, _ in gh.comments] == [next(i["number"] for i in gh.issues if i is not rollup)], (
+            "the failing finding is commented on; the rolled-up issue never is while it is open")
+        body = rollup["body"]
+        assert "healthgrades.com: 1 stripped page(s)" in body and "| 2026-11-24 13:00 UTC |" in body
+        assert "| chandler-neurology | doctor.webmd.com |" not in body, "an evaluated case that came back clean loses its row"
+        assert "| phoenix-cardiology | healthgrades.com |" in body and "| 2026-11-23 13:00 UTC |" in body, (
+            "a case this run did not evaluate keeps its row and its own last-seen time")
+        assert "- Opened: 2026-11-23 13:00 UTC" in body and "- Updated: 2026-11-24 13:00 UTC" in body
+        assert "Latest run: https://gh/run/2" in body
 
-        third = alerts.sync_issues(client, [], scope, "https://gh/run/3", now=NOW)
-        assert sorted(third.closed) == sorted([RESTORED.title, HG_ZERO.title])
-        assert restored_issue["state"] == "closed"
-        assert (restored_issue["number"], alerts.recovery_comment("https://gh/run/3", NOW)) in gh.comments
+        # Chandler clean on the next daily run: Phoenix still holds the issue open.
+        third = alerts.sync_issues(client, [], daily, "https://gh/run/3", now=later)
+        assert rollup["state"] == "open" and "chandler-neurology" not in rollup["body"].split("First step")[0]
+        assert third.closed == [HG_ZERO.title]
+        # The run that evaluates Phoenix and finds it clean closes it, once.
+        fourth = alerts.sync_issues(client, [], weekly, "https://gh/run/4", now=later)
+        assert rollup["state"] == "closed" and fourth.closed == [rollup["title"]]
+        assert gh.comments[-1] == (rollup["number"], alerts.recovery_comment("https://gh/run/4", later))
+
+    def test_the_older_per_case_issues_are_folded_into_the_one_issue(self):
+        """What the public repository holds today: one advisory issue per
+        case and platform, opened before the roll-up, including a pair of
+        duplicates from two runs started the same second. They are closed
+        into the single issue whatever this run evaluated — a Gilbert issue
+        must not wait for Sunday to disappear."""
+        from evals import alerts
+        gh = _Issues()
+        old = [self._restored("chandler-neurology", "healthgrades.com"),
+               self._restored("chandler-neurology", "healthgrades.com"),
+               self._restored("gilbert-family-medicine", "doctor.webmd.com")]
+        for number, finding in enumerate(old, start=28):
+            gh.issues.append({"number": number, "state": "open", "title": finding.title, "labels": ["canary"],
+                              "body": alerts.issue_body(finding, None, None, NOW)})
+        gh.issues.append({"number": 34, "state": "open", "title": HG_ZERO.title, "labels": ["canary"],
+                          "body": alerts.issue_body(HG_ZERO, None, None, NOW)})
+        client = alerts.GitHubIssues("tok", "o/r", transport=gh)
+        result = alerts.sync_issues(client, [self._restored("chandler-neurology", "healthgrades.com"), HG_ZERO],
+                                    {"chandler-neurology": checks_for_tier("A")}, "https://gh/run/9", now=NOW)
+        still_open = sorted(i["title"] for i in gh.issues if i["state"] == "open")
+        assert still_open == sorted(["[P3] Stripped page restored by refetch — all-cases", HG_ZERO.title])
+        assert len(result.folded) == 3 and "folded into it 3" in result.describe()
+        rollup = next(i for i in gh.issues if "all-cases" in i["title"])
+        assert (28, f"This finding is now tracked in #{rollup['number']}, which is updated in place on every run.") in gh.comments
+        assert result.untouched == 0, "the folded issues are not also counted as left open"
+
+    def test_a_second_roll_up_is_folded_and_an_unreadable_one_costs_only_its_rows(self):
+        from evals import alerts
+        gh = _Issues()
+        finding = alerts.rollup_finding("degraded_fetch_recovered", {})
+        for number, body in ((40, "table lost in a hand edit\n" + alerts.marker(finding)),
+                             (41, alerts.rollup_body("degraded_fetch_recovered", {"x|y": {"observed": "o", "seen": "s"}}, "then", None, NOW))):
+            gh.issues.append({"number": number, "state": "open", "title": finding.title, "labels": ["canary"], "body": body})
+        client = alerts.GitHubIssues("tok", "o/r", transport=gh)
+        result = alerts.sync_issues(client, [self._restored("chandler-neurology", "vitals.com")],
+                                    {"chandler-neurology": checks_for_tier("A")}, None, now=NOW)
+        assert [i["state"] for i in gh.issues] == ["open", "closed"] and result.errors == []
+        assert "| chandler-neurology | vitals.com |" in gh.issues[0]["body"]
+        assert alerts.rollup_entries(gh.issues[0]) == {
+            "chandler-neurology|vitals.com": {"observed": self._restored("chandler-neurology", "vitals.com").observed,
+                                              "seen": "2026-11-23 13:00 UTC"}}

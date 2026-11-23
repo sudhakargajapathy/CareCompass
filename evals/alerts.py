@@ -16,22 +16,31 @@ people, markers are not. Recovery is scoped to what the run EVALUATED
 close the weekly cases' issues, and a fetch-only run must not close a
 pipeline-tier issue. Silence about a check is not a recovery of it.
 
-An ADVISORY finding (`Finding.advisory`) is opened and closed like any
-other and is NOT commented on while it persists: it asks nothing of the
-reader, so a daily "still breached" on it would be a daily notification
-about something already known. Its issue says so in its own words.
+ADVISORY findings (`Finding.advisory`) are the exception to one issue per
+identity. They share ONE issue per check, whose body is rewritten in place
+on every run and never commented on. The first live run with them opened
+twelve issues for one vendor condition (four cases and the golden set, times
+up to three platforms), which buried the single finding in that list that
+needed a person; and because a daily run evaluates one case, the other
+cases' issues could only close on the weekly run. The one issue lists every
+affected (case, platform) with its count and when it was last seen, keeps
+the rows of cases this run did not evaluate, drops the rows of evaluated
+cases that came back clean, and closes when no row is left. The rows live
+in the body itself (a JSON comment), because the watcher has no other state
+between runs.
 
 Transport is injectable so the tests drive a fake GitHub; the default uses
 `requests` against api.github.com with the Actions `GITHUB_TOKEN`
 (`permissions: issues: write` on the workflow).
 """
 
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from evals.thresholds import Finding
+from evals.thresholds import ADVISORY_CHECKS, Finding
 
 LABEL = "canary"
 LABEL_COLOR = "b60205"
@@ -69,14 +78,8 @@ def issue_body(finding: Finding, run_url: Optional[str], trace_url: Optional[str
         f"- Trace: {trace_url or 'n/a'}",
         f"- Opened: {_stamp(now)}",
         "",
-        (
-            "This issue is managed by the canary watcher. It is advisory: it does not fail the "
-            "run, it is not commented on while the condition persists, and it is closed "
-            "automatically when a run evaluates the check and it passes."
-            if finding.advisory else
-            "This issue is managed by the canary watcher: it is commented on while the breach "
-            "persists and closed automatically when a run evaluates the check and it passes."
-        ),
+        "This issue is managed by the canary watcher: it is commented on while the breach "
+        "persists and closed automatically when a run evaluates the check and it passes.",
         "",
         marker(finding),
     ]
@@ -88,6 +91,65 @@ def repeat_comment(finding: Finding, run_url: Optional[str], trace_url: Optional
         f"Still breached at {_stamp(now)}: observed {finding.observed} (threshold {finding.threshold}).\n"
         f"Run: {run_url or 'n/a'} · Trace: {trace_url or 'n/a'}"
     )
+
+
+ROLLUP_CASE = "all-cases"
+STATE_RE = re.compile(r"<!--\s*canary-state\s+(\{.*?\})\s*-->", re.DOTALL)
+
+
+def rollup_finding(check: str, entries: Mapping[str, Mapping[str, Any]]) -> Finding:
+    """The stand-in finding that gives the one issue its title and identity."""
+    cases = sorted({key.split("|", 1)[0] for key in entries})
+    return Finding(check, "P3", ROLLUP_CASE, f"{len(entries)} platform(s) across {len(cases)} case(s)", "none")
+
+
+def rollup_entries(issue: Optional[Mapping[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """The (case|platform) rows an open rolled-up issue carries, {} if unreadable.
+
+    An unreadable body costs the rows of cases this run did not evaluate;
+    their next run writes them back. It must never cost the sync.
+    """
+    match = STATE_RE.search(str((issue or {}).get("body") or ""))
+    if not match:
+        return {}
+    try:
+        data = json.loads(match.group(1))
+    except ValueError:
+        return {}
+    rows = data.get("rows") if isinstance(data, dict) else None
+    return {str(k): dict(v) for k, v in rows.items() if isinstance(v, dict)} if isinstance(rows, dict) else {}
+
+
+def rollup_body(check: str, entries: Mapping[str, Mapping[str, Any]], opened: str,
+                run_url: Optional[str], now: Optional[datetime] = None) -> str:
+    finding = rollup_finding(check, entries)
+    lines = [
+        f"**{finding.title}**",
+        "",
+        "| Case | Platform | Observed | Last seen |",
+        "|---|---|---|---|",
+    ]
+    for key in sorted(entries):
+        case_id, _, detail = key.partition("|")
+        row = entries[key]
+        lines.append(f"| {case_id} | {detail or '—'} | {row.get('observed', '')} | {row.get('seen', '')} |")
+    lines += [
+        "",
+        f"- First step: {finding.first_step}",
+        f"- Latest run: {run_url or 'n/a'}",
+        f"- Opened: {opened}",
+        f"- Updated: {_stamp(now)}",
+        "",
+        "This issue is managed by the canary watcher. It is advisory: it does not fail the run. "
+        "It is the only issue for this condition; the table above is rewritten on every run "
+        "(a case's rows change only when a run evaluates that case), and the issue is closed "
+        "automatically when no row is left.",
+        "",
+        marker(finding),
+        "<!-- canary-state " + json.dumps({"opened": opened, "rows": {k: dict(entries[k]) for k in sorted(entries)}},
+                                          sort_keys=True) + " -->",
+    ]
+    return "\n".join(lines)
 
 
 def recovery_comment(run_url: Optional[str], now: Optional[datetime] = None) -> str:
@@ -127,6 +189,12 @@ class GitHubIssues:
         status, data = self._call("POST", f"/repos/{self.repo}/issues/{number}/comments", {"body": body}, None)
         if status >= 400:
             raise GitHubError(f"comment on #{number}: HTTP {status}")
+        return data
+
+    def update_body(self, number: int, body: str) -> Dict[str, Any]:
+        status, data = self._call("PATCH", f"/repos/{self.repo}/issues/{number}", {"body": body}, None)
+        if status >= 400:
+            raise GitHubError(f"update #{number}: HTTP {status}")
         return data
 
     def close(self, number: int) -> Dict[str, Any]:
@@ -179,7 +247,8 @@ class SyncResult:
     opened: List[str] = field(default_factory=list)
     commented: List[str] = field(default_factory=list)
     closed: List[str] = field(default_factory=list)
-    still_open: List[str] = field(default_factory=list)  # advisory, already open: no comment
+    updated: List[str] = field(default_factory=list)  # the rolled-up advisory issue, rewritten in place
+    folded: List[str] = field(default_factory=list)   # per-case advisory issues closed into it
     untouched: int = 0
     errors: List[str] = field(default_factory=list)
 
@@ -187,7 +256,8 @@ class SyncResult:
         return (
             f"issues: opened {len(self.opened)}, commented {len(self.commented)}, "
             f"closed {len(self.closed)}, left open (not evaluated this run) {self.untouched}"
-            + (f", advisory still open (no comment) {len(self.still_open)}" if self.still_open else "")
+            + (f", advisory issue updated {len(self.updated)}" if self.updated else "")
+            + (f", folded into it {len(self.folded)}" if self.folded else "")
             + (f", errors {len(self.errors)}" if self.errors else "")
         )
 
@@ -220,17 +290,26 @@ def sync_issues(
         key = identity_of(issue)
         if key and key not in by_identity:
             by_identity[key] = issue
+    advisory = [f for f in findings if f.advisory]
+    advisory_checks = {f.check for f in advisory} | {key[0] for key in by_identity if key[0] in ADVISORY_CHECKS}
+    for check in sorted(advisory_checks):
+        try:
+            _sync_rollup(client, result, check, [f for f in advisory if f.check == check],
+                         open_issues, evaluated, run_url, label, now)
+        except GitHubError as exc:
+            result.errors.append(f"{check}: {exc}")
+    by_identity = {key: issue for key, issue in by_identity.items() if key[0] not in advisory_checks}
     current = set()
     for finding in findings:
+        if finding.advisory:
+            continue
         key = finding.identity
         if key in current:
             continue  # two findings with one identity (should not happen) → one issue
         current.add(key)
         trace = trace_urls.get(finding.case_id)
         try:
-            if key in by_identity and finding.advisory:
-                result.still_open.append(finding.title)
-            elif key in by_identity:
+            if key in by_identity:
                 client.comment(int(by_identity[key]["number"]), repeat_comment(finding, run_url, trace, now))
                 result.commented.append(finding.title)
             else:
@@ -253,3 +332,62 @@ def sync_issues(
         else:
             result.untouched += 1
     return result
+
+
+def _sync_rollup(
+    client: GitHubIssues,
+    result: SyncResult,
+    check: str,
+    findings: Sequence[Finding],
+    open_issues: Sequence[Mapping[str, Any]],
+    evaluated: Mapping[str, Iterable[str]],
+    run_url: Optional[str],
+    label: str,
+    now: Optional[datetime],
+) -> None:
+    """Keep exactly one open issue for an advisory check, rewritten in place."""
+    mine = [i for i in open_issues if (identity_of(i) or ("",))[0] == check]
+    rollups = sorted((i for i in mine if identity_of(i)[1] == ROLLUP_CASE), key=lambda i: int(i["number"]))
+    legacy = [i for i in mine if identity_of(i)[1] != ROLLUP_CASE]
+    issue = rollups[0] if rollups else None
+
+    entries = rollup_entries(issue)
+    looked = {case_id for case_id, checks in evaluated.items() if check in set(checks)}
+    # A run speaks only for the cases it evaluated: their rows are replaced by
+    # what it found (possibly nothing), everyone else's are carried forward.
+    entries = {key: row for key, row in entries.items() if key.split("|", 1)[0] not in looked}
+    for finding in findings:
+        entries[f"{finding.case_id}|{finding.detail}"] = {"observed": finding.observed, "seen": _stamp(now)}
+
+    number: Optional[int] = int(issue["number"]) if issue else None
+    title = rollup_finding(check, entries).title
+    if entries:
+        match = STATE_RE.search(str((issue or {}).get("body") or ""))
+        opened = _stamp(now)
+        if match:
+            try:
+                opened = str(json.loads(match.group(1)).get("opened") or opened)
+            except ValueError:
+                pass
+        body = rollup_body(check, entries, opened, run_url, now)
+        if number is None:
+            number = int(client.create(title, body, [label]).get("number") or 0) or None
+            result.opened.append(title)
+        else:
+            client.update_body(number, body)
+            result.updated.append(title)
+    elif number is not None:
+        client.comment(number, recovery_comment(run_url, now))
+        client.close(number)
+        result.closed.append(str(issue.get("title") or number))
+        number = None
+
+    # Issues from before the roll-up (one per case and platform), and a second
+    # roll-up opened by two runs that listed at the same second: one condition
+    # gets one issue, so these are closed whatever this run evaluated.
+    where = f"#{number}" if number else "one issue for the whole condition"
+    for extra in legacy + rollups[1:]:
+        extra_number = int(extra["number"])
+        client.comment(extra_number, f"This finding is now tracked in {where}, which is updated in place on every run.")
+        client.close(extra_number)
+        result.folded.append(str(extra.get("title") or extra_number))
