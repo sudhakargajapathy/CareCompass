@@ -16,6 +16,11 @@ people, markers are not. Recovery is scoped to what the run EVALUATED
 close the weekly cases' issues, and a fetch-only run must not close a
 pipeline-tier issue. Silence about a check is not a recovery of it.
 
+An ADVISORY finding (`Finding.advisory`) is opened and closed like any
+other and is NOT commented on while it persists: it asks nothing of the
+reader, so a daily "still breached" on it would be a daily notification
+about something already known. Its issue says so in its own words.
+
 Transport is injectable so the tests drive a fake GitHub; the default uses
 `requests` against api.github.com with the Actions `GITHUB_TOKEN`
 (`permissions: issues: write` on the workflow).
@@ -64,8 +69,14 @@ def issue_body(finding: Finding, run_url: Optional[str], trace_url: Optional[str
         f"- Trace: {trace_url or 'n/a'}",
         f"- Opened: {_stamp(now)}",
         "",
-        "This issue is managed by the canary watcher: it is commented on while the breach "
-        "persists and closed automatically when a run evaluates the check and it passes.",
+        (
+            "This issue is managed by the canary watcher. It is advisory: it does not fail the "
+            "run, it is not commented on while the condition persists, and it is closed "
+            "automatically when a run evaluates the check and it passes."
+            if finding.advisory else
+            "This issue is managed by the canary watcher: it is commented on while the breach "
+            "persists and closed automatically when a run evaluates the check and it passes."
+        ),
         "",
         marker(finding),
     ]
@@ -168,6 +179,7 @@ class SyncResult:
     opened: List[str] = field(default_factory=list)
     commented: List[str] = field(default_factory=list)
     closed: List[str] = field(default_factory=list)
+    still_open: List[str] = field(default_factory=list)  # advisory, already open: no comment
     untouched: int = 0
     errors: List[str] = field(default_factory=list)
 
@@ -175,6 +187,7 @@ class SyncResult:
         return (
             f"issues: opened {len(self.opened)}, commented {len(self.commented)}, "
             f"closed {len(self.closed)}, left open (not evaluated this run) {self.untouched}"
+            + (f", advisory still open (no comment) {len(self.still_open)}" if self.still_open else "")
             + (f", errors {len(self.errors)}" if self.errors else "")
         )
 
@@ -215,7 +228,9 @@ def sync_issues(
         current.add(key)
         trace = trace_urls.get(finding.case_id)
         try:
-            if key in by_identity:
+            if key in by_identity and finding.advisory:
+                result.still_open.append(finding.title)
+            elif key in by_identity:
                 client.comment(int(by_identity[key]["number"]), repeat_comment(finding, run_url, trace, now))
                 result.commented.append(finding.title)
             else:

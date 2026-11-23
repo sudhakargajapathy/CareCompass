@@ -16,6 +16,7 @@ from anthropic import Anthropic
 from utils.config import get_config
 from utils import tracing
 from utils.cost_tracker import TAVILY_COST_PER_CREDIT, TAVILY_CREDITS_PER_SEARCH, get_cost_tracker, safe_usage
+from utils.degraded_fetch import degraded_reason
 from utils.excerpt import build_excerpt, clip_words
 from utils.json_salvage import salvage_json_objects
 from utils.listing_parser import (
@@ -1601,7 +1602,10 @@ class DataGathererAgent:
     def _reset_run_stats(self) -> None:
         with self._stats_lock:
             self._fetch_stats: Dict[str, Dict[str, Any]] = {
-                stage: {"planned": 0, "fetched": 0, "empty": 0, "failed": 0, "by_domain": {}}
+                stage: {
+                    "planned": 0, "fetched": 0, "empty": 0, "failed": 0,
+                    "degraded": 0, "recovered": 0, "by_domain": {},
+                }
                 for stage in ("discovery", "enrichment")
             }
             self._listing_rows: Dict[str, int] = {}
@@ -1628,6 +1632,26 @@ class DataGathererAgent:
                 domain = source_domain(url) or "other"
                 per = slot["by_domain"].setdefault(domain, {"fetched": 0, "empty": 0})
                 per["fetched" if has_body else "empty"] += 1
+
+    def _note_degraded(self, stage: str, urls: List[str], recovered: bool = False) -> None:
+        """Count bodies that arrived stripped, and the ones a second fetch restored.
+
+        Separate from `empty`: a stripped body is NOT empty, which is exactly
+        how it passed every existing count while the parsers read nothing
+        from it. Per domain as well as per stage, because the watcher's
+        finding names the platform. The per-domain keys appear only once
+        there is something to count, so a healthy run's accounting is
+        unchanged.
+        """
+        stage = stage if stage in ("discovery", "enrichment") else "discovery"
+        field = "recovered" if recovered else "degraded"
+        with self._stats_lock:
+            slot = self._fetch_stats[stage]
+            slot[field] += len(urls)
+            for url in urls:
+                domain = source_domain(url) or "other"
+                per = slot["by_domain"].setdefault(domain, {"fetched": 0, "empty": 0})
+                per[field] = per.get(field, 0) + 1
 
     def _note_listing_rows(
         self, url: Any, rows: int, dropped: int, telehealth: Optional[List[str]] = None,
@@ -2062,11 +2086,115 @@ class DataGathererAgent:
                             time.sleep(pause)
                     else:
                         logger.error(f"Tavily extract failed after retry: {e}")
+        self._refetch_degraded(shaped, purpose, stage)
         logger.info(
             "Extract fetched %d/%d page(s)%s",
             len(shaped), len(deduped), f" ({purpose})" if purpose else "",
         )
         return shaped
+
+    def _refetch_degraded(
+        self, pages: List[Dict[str, Any]], purpose: str = "", stage: str = "discovery",
+    ) -> None:
+        """Ask once more, past the vendor's stored copy, for any body that came back stripped.
+
+        2026-11-22: both canaries went red on a commit that was green the day
+        before. /extract was answering specific URLs from a stored copy that
+        had lost the page's substance — healthgrades and webmd city listings
+        with no provider headings or links (0 rows from two of three
+        platforms), webmd and vitals profiles without their rating — while
+        the bodies were non-empty, so the empty-body count read zero and
+        every researched provider quietly carried vitals data only. The
+        parsers and the sites were both fine: the same request with
+        `use_cache=False` returned every page whole.
+
+        The whole measurement, 2026-11-23, nine stripped URLs (4 listings,
+        4 profiles, 1 URL whose query-string variant had gone bad), three
+        rounds each way:
+
+            default            0.2-0.5 s per 9-URL batch   9 of 9 stripped
+            use_cache=False    4.5-8.3 s per 9-URL batch   9 of 9 whole
+
+        `use_cache` is NOT in the vendor's published parameters or the SDK's
+        signature; it was found by probing, and it travels through the
+        SDK's pass-through keyword arguments. Names that did nothing against
+        the same stripped URL: no_cache, cache, max_age, maxAge,
+        force_refresh, refresh, live_crawl, livecrawl, fresh, bypass_cache,
+        skip_cache, and a `Cache-Control: no-cache` request header.
+        `extract_depth="advanced"` and `format="text"` returned the stripped
+        copy too.
+
+        Decided against:
+
+          * sending `use_cache=False` on EVERY extract. One line, and it
+            turns every sub-second batch into a 4-8 s live fetch on runs
+            where nothing is wrong, while removing the count that says how
+            often the stored copy is bad.
+          * varying the URL (`?cb=7`). It works on first use and then goes
+            bad itself: the same tagged URL returned the whole page at
+            06:05 UTC and the stripped copy at 06:20. First sight of a URL
+            is fetched live; the copy stored from it is the stripped one.
+            A unique tag per call would hold, but it changes the URL every
+            downstream consumer keys on.
+
+        ONE attempt, no retry: this is already the second request for these
+        pages, and a failure here leaves each page exactly as the first
+        fetch delivered it. A body is replaced only when the fresh one no
+        longer looks stripped — a profile of a doctor nobody has rated reads
+        the same both times and must not be counted as a recovery. Billed
+        and traced as the extract call it is, marked `refetch` so the trace
+        separates it from a first fetch.
+        """
+        suspects = [
+            page for page in pages
+            if degraded_reason(page.get("url"), page.get("raw_content"))
+        ]
+        if not suspects or not self.tavily_client:
+            return
+        by_url = {page["url"]: page for page in suspects}
+        urls = list(by_url)
+        self._note_degraded(stage, urls)
+        recovered: List[str] = []
+        for start in range(0, len(urls), self._EXTRACT_URL_BATCH):
+            chunk = urls[start:start + self._EXTRACT_URL_BATCH]
+            try:
+                with tracing.tool("tavily.extract", input={
+                    "url_count": len(chunk), "purpose": purpose, "stage": stage,
+                    "attempt": 1, "refetch": "cache_bypass",
+                }) as call:
+                    response = self.tavily_client.extract(
+                        urls=chunk, extract_depth="basic", format="markdown",
+                        timeout=self._EXTRACT_RETRY_TIMEOUT_S, use_cache=False,
+                    )
+                    get_cost_tracker().record_tavily_extract(
+                        len(chunk), agent="data_gatherer", stage=stage
+                    )
+                    restored: List[Dict[str, Any]] = []
+                    for item in response.get("results", []) or []:
+                        page = by_url.get(item.get("url", ""))
+                        raw = item.get("raw_content") or ""
+                        if page is None or not raw or degraded_reason(page["url"], raw):
+                            continue
+                        page["raw_content"] = raw
+                        restored.append(page)
+                        recovered.append(page["url"])
+                    credits = -(-len(chunk) // 5)
+                    call.finish(output={
+                        "refetched": len(chunk), "recovered": len(restored),
+                        "credits": credits, "pages": tracing.page_digest(restored),
+                    }, cost_usd=credits * TAVILY_COST_PER_CREDIT)
+            except Exception as e:
+                logger.warning(
+                    "Cache-bypass refetch failed for %d stripped page(s)%s; keeping the "
+                    "first fetch's bodies: %s",
+                    len(chunk), f" ({purpose})" if purpose else "", e,
+                )
+        self._note_degraded(stage, recovered, recovered=True)
+        logger.warning(
+            "Extract returned %d stripped page(s)%s; a cache-bypass refetch restored %d: %s",
+            len(urls), f" ({purpose})" if purpose else "", len(recovered),
+            ", ".join(urls),
+        )
 
     def _extract_discovery_pages(
         self, urls: List[str], purpose: str

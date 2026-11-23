@@ -49,7 +49,10 @@ def _gatherer():
 class TestGathererFetchSpans:
     def test_extract_batch_is_a_tool_span_with_digests_and_feeds_fetch_stats(self, traced):
         gatherer = _gatherer()
-        body = "PRIVATE-LOOKING REVIEW PROSE " * 50
+        # The body states a rating and a count so it reads as a whole profile:
+        # one that states neither is asked for a second time past the vendor's
+        # stored copy, and this test is about the FIRST fetch's span.
+        body = "# Dr. Kan Yu, MD\n\n4.3 Star Rating\n\nBased on 6 reviews\n\n" + "PRIVATE-LOOKING REVIEW PROSE " * 50
         gatherer.tavily_client.extract.return_value = {
             "results": [{"url": HG, "raw_content": body}, {"url": VI, "raw_content": ""}],
             "failed_results": [{"url": "https://doctor.webmd.com/x", "error": "404"}],

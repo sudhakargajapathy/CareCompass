@@ -13,7 +13,9 @@ seen for three weeks. The severity vocabulary is exactly three words:
   P3  cost & freshness — money, time, or a monitor that stopped reporting
 
 An alert nobody can act on is noise nobody reads, so every finding names
-its FIRST diagnostic step; those steps are the runbook, inline.
+its FIRST diagnostic step; those steps are the runbook, inline. For the same
+reason a few findings are ADVISORY (`ADVISORY_CHECKS`): they open and close
+their issue and never turn a run red.
 
 Two rules the checks follow:
 
@@ -130,6 +132,14 @@ FIRST_STEPS = {
         "The vendor is returning pages with empty bodies again (the August class): compare "
         "the trace's per-page digests with a direct /extract of the same URL."
     ),
+    "degraded_fetch_recovered": (
+        "The vendor answered that platform's page(s) with a stripped stored copy — a listing "
+        "that states its result total and names nobody, or a profile with no rating — and one "
+        "refetch with use_cache=False restored them, so this run's numbers are whole and no "
+        "parser needs touching. Send the vendor the URLs from the gatherer's 'stripped page(s)' "
+        "log line. If the same platform ALSO shows zero rows or template drift, the refetch has "
+        "stopped working: use_cache is an undocumented parameter, so check it first."
+    ),
     "no_shortlist": (
         "Zero recommendations: read the run's withheld reasons on the trace output — a "
         "collapsed validation (vendor) reads differently from a coverage gap."
@@ -189,6 +199,7 @@ CHECK_TITLES = {
     "platform_rows_zero": "Platform listing rows zero",
     "fetch_mode_fallback": "Fetch-mode fallback fired",
     "empty_body_rate_high": "Empty-body rate high",
+    "degraded_fetch_recovered": "Stripped page restored by refetch",
     "no_shortlist": "No shortlist",
     "validation_collapsed": "Validation collapsed",
     "no_profile_found_high": "no_profile_found high",
@@ -206,6 +217,7 @@ CHECK_TITLES = {
 FETCH_CHECKS: FrozenSet[str] = frozenset({
     "vendor_error", "gather_failed", "no_pages_fetched", "pool_size_low",
     "platform_rows_zero", "fetch_mode_fallback", "empty_body_rate_high",
+    "degraded_fetch_recovered",
 })
 PIPELINE_CHECKS: FrozenSet[str] = FETCH_CHECKS | frozenset({
     "pipeline_failed", "no_shortlist", "validation_collapsed", "no_profile_found_high",
@@ -221,6 +233,7 @@ REPORT_CASE_ID = "weekly-report"
 # `detail` so each page's problem has its own issue, under one pseudo-case.
 GOLDEN_CHECKS: FrozenSet[str] = frozenset({
     "golden_identity_failure", "template_drift", "golden_page_missing", "golden_needs_review",
+    "degraded_fetch_recovered",
 })
 GOLDEN_CASE_ID = "golden-set"
 # The live app's own traffic: one pseudo-case, because the live Space is one
@@ -228,6 +241,21 @@ GOLDEN_CASE_ID = "golden-set"
 LIVE_CHECKS: FrozenSet[str] = frozenset({"live_tavily_errors", "live_latency_high"})
 LIVE_CASE_ID = "live-app"
 ALL_CHECKS: FrozenSet[str] = PIPELINE_CHECKS | WATCHER_CHECKS | REPORT_CHECKS | GOLDEN_CHECKS | LIVE_CHECKS
+# Findings that are REPORTED and never fail the run. A restored page is the
+# refetch doing its job: the run's numbers are whole and there is nothing to
+# fix on our side, only a vendor to tell. When it failed the run like any
+# other finding, the first live runs after the refetch shipped read 258 rows
+# from 10 of 10 pages and were red anyway, and would have stayed red — one
+# failure email and one issue comment a day — for as long as the vendor kept
+# its stripped copies (at least 34 hours when this was written). A daily red
+# run that asks nothing of the reader trains the reader to skip red runs,
+# which is how the alerts that DO need a parser fixed get missed. So an
+# advisory finding still opens its issue (one notification) and still closes
+# on recovery (a second), and that is all it does. Keep this set small: a
+# check belongs here only when the run recovered by itself AND a failing
+# check already covers the case where it did not — here, the row, coverage
+# and template-drift checks, which fire when the refetch stops restoring.
+ADVISORY_CHECKS: FrozenSet[str] = frozenset({"degraded_fetch_recovered"})
 
 
 def checks_for_tier(tier: str) -> FrozenSet[str]:
@@ -256,6 +284,11 @@ class Finding:
     @property
     def identity(self):
         return (self.check, self.case_id, self.detail)
+
+    @property
+    def advisory(self) -> bool:
+        """Reported, but never the reason a run goes red (see ADVISORY_CHECKS)."""
+        return self.check in ADVISORY_CHECKS
 
     @property
     def first_step(self) -> str:
@@ -315,6 +348,38 @@ def _vendor_finding(
     return None
 
 
+def _recovered_findings(case_id: str, stages: Sequence[Mapping[str, Any]]) -> List[Finding]:
+    """One P3 per platform whose stripped page(s) a cache-bypass refetch restored.
+
+    2026-11-22: the vendor served stripped stored copies of healthgrades and
+    webmd listings and of four golden-set profiles, and the canaries reported
+    it in the only words they had — "platform listing rows zero" and
+    "template drift", whose first step is to rewrite a parser. Nothing was
+    wrong with a parser. Now that the gatherer refetches such a page, a
+    RECOVERED one is its own finding with its own first step, and the parser
+    alerts are left for the case where the refetch does not help.
+
+    P3, not P2: the run's numbers are whole. Only RECOVERED pages count — a
+    page that looked stripped and read the same on the refetch is either a
+    profile nobody has rated or a real parser failure, and the existing
+    checks already speak for the second.
+    """
+    per_domain: Dict[str, int] = {}
+    for stage in stages:
+        for domain, counts in ((stage or {}).get("by_domain") or {}).items():
+            got = int((counts or {}).get("recovered") or 0)
+            if got:
+                per_domain[domain] = per_domain.get(domain, 0) + got
+    return [
+        Finding(
+            "degraded_fetch_recovered", "P3", case_id,
+            f"{domain}: {count} stripped page(s) restored by a cache-bypass refetch",
+            "0 stripped pages", detail=domain,
+        )
+        for domain, count in sorted(per_domain.items())
+    ]
+
+
 def evaluate_fetch(
     record: Mapping[str, Any],
     case: CanaryCase,
@@ -367,6 +432,9 @@ def evaluate_fetch(
                 "empty_body_rate_high", "P2", cid, f"{domain}: {empty}/{total} empty",
                 f"≤ {int(EMPTY_BODY_RATE_CEILING * 100)}%", detail=domain,
             ))
+    # Both stages: a Tier B run's stripped PROFILES are fetched by enrichment.
+    fetch = (fetch_stats or {}).get("fetch") or {}
+    findings.extend(_recovered_findings(cid, [fetch.get("discovery") or {}, fetch.get("enrichment") or {}]))
     return findings
 
 
@@ -531,7 +599,15 @@ def evaluate_golden(payload: Optional[Mapping[str, Any]]) -> List[Finding]:
             if check in ("golden_needs_review", "template_drift") else "matches the key"
         )
         findings.append(Finding(check, severity, GOLDEN_CASE_ID, str(notes)[:200], threshold, detail=detail))
+    # The golden pages go through the gatherer's own fetch, so a stripped
+    # copy it restored is counted there and reported here, per platform.
+    findings.extend(_recovered_findings(GOLDEN_CASE_ID, [(payload or {}).get("fetch") or {}]))
     return findings
+
+
+def failing_findings(findings: Sequence[Finding]) -> List[Finding]:
+    """The findings that fail a run: everything except the advisory ones."""
+    return [f for f in findings if not f.advisory]
 
 
 def worst_severity(findings: Sequence[Finding]) -> Optional[str]:
