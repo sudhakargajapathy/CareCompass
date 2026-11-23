@@ -3,9 +3,12 @@
 One evaluator for every tier. The canary scripts measure and write JSON;
 this reads it, applies `evals/thresholds`, writes the run summary (the
 step summary on Actions, stdout everywhere), mirrors the breaches into
-GitHub issues, and FAILS THE JOB on any finding — the failure is what makes
-the run page red and the email go out; the issue is what carries the
-detail and the recovery.
+GitHub issues, and FAILS THE JOB on any finding that is not advisory — the
+failure is what makes the run page red and the email go out; the issue is
+what carries the detail and the recovery. An advisory finding (a stripped
+page the refetch restored) gets the issue and the summary row only: the run
+recovered by itself, and a run that is red every day for something nobody
+here can fix stops being read.
 
 A case the schedule expected and the JSON does not carry is itself a P1
 (`canary_did_not_run`): a canary that silently stops is the failure mode
@@ -13,7 +16,7 @@ nobody planned for — GitHub disabling an idle cron — and the one no
 threshold on a yield can see. A missing file is that finding for every
 expected case.
 
-Exit codes: 0 clean · 1 at least one finding · 2 usage error.
+Exit codes: 0 clean or advisory findings only · 1 at least one failing finding · 2 usage error.
 """
 
 import argparse
@@ -38,6 +41,7 @@ from evals.thresholds import (
     evaluate_live,
     evaluate_pipeline,
     evaluate_report_freshness,
+    failing_findings,
     live_scope,
 )
 
@@ -225,7 +229,7 @@ def main(argv: Optional[Sequence[str]] = None, env: Mapping[str, str] = os.envir
                           payload, findings, expected, run_url, notes, golden=golden_payload)
     print(text)
     write_step_summary(text, env.get("GITHUB_STEP_SUMMARY") or None)
-    return 1 if findings else 0
+    return 1 if failing_findings(findings) else 0
 
 
 if __name__ == "__main__":

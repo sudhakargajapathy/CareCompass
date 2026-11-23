@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from evals.cases import CanaryCase
-from evals.thresholds import Finding, worst_severity
+from evals.thresholds import Finding, failing_findings, worst_severity
 
 TIER_NAMES = {"A": "Tier A fetch canary", "B": "Tier B pipeline canary"}
 
@@ -69,7 +69,7 @@ def findings_table(findings: Sequence[Finding]) -> str:
     lines = ["| Severity | Check | Case | Observed | Threshold |", "|---|---|---|---|---|"]
     for f in findings:
         lines.append(
-            f"| {f.severity} | {_cell(f.title.split('] ', 1)[1].rsplit(' — ', 1)[0])} | {_cell(f.case_id)} "
+            f"| {f.severity}{' (advisory)' if f.advisory else ''} | {_cell(f.title.split('] ', 1)[1].rsplit(' — ', 1)[0])} | {_cell(f.case_id)} "
             f"| {_cell(f.observed)} | {_cell(f.threshold)} |"
         )
     return "\n".join(lines)
@@ -88,11 +88,25 @@ def render_summary(
 ) -> str:
     when = (generated_at or datetime.now(timezone.utc)).strftime("%Y-%m-%d %H:%M UTC")
     title = TIER_NAMES.get(tier, f"Tier {tier}")
-    worst = worst_severity(findings)
+    # The headline severity is the worst FAILING one: this line sits under a
+    # green or red run badge and must agree with it. Advisory findings stay in
+    # the table below and are counted here in their own words.
+    failing = failing_findings(findings)
+    advisory = len(findings) - len(failing)
+    worst = worst_severity(failing)
     entries = [c for c in (payload or {}).get("cases", []) if isinstance(c, dict)] if payload else []
     out: List[str] = [f"## {title} — {schedule} · {when}", ""]
     if worst:
-        out.append(f"**Status: {worst} — {len(findings)} finding(s)** across {len(expected)} scheduled case(s).")
+        out.append(
+            f"**Status: {worst} — {len(failing)} finding(s)** across {len(expected)} scheduled case(s)."
+            + (f" Plus {advisory} advisory finding(s) that do not fail the run." if advisory else "")
+        )
+    elif advisory:
+        out.append(
+            f"**Status: passing with {advisory} advisory finding(s)** — {len(entries)} of {len(expected)} "
+            "scheduled case(s) evaluated, nothing past a failing threshold. Advisory findings are "
+            "reported and tracked in an issue; they do not fail the run."
+        )
     else:
         out.append(f"**Status: clean** — {len(entries)} of {len(expected)} scheduled case(s) evaluated, nothing past a threshold.")
     if run_url:

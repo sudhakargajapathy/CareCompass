@@ -33,6 +33,10 @@ def _default_fetcher() -> Callable[[List[str]], Dict[str, str]]:
         pages = agent._extract_pages(urls, purpose="golden set", stage="discovery")
         return {p["url"]: p.get("raw_content") or "" for p in pages if p.get("url")}
 
+    # The gatherer counts the pages that arrived stripped and the ones its
+    # cache-bypass refetch restored; `run` writes that beside the grades so
+    # the watcher can say "restored" instead of nothing at all.
+    fetch.stats = agent.fetch_stats
     return fetch
 
 
@@ -50,7 +54,8 @@ def run(
         return None
     targets = list(golden.iter_urls(key))
     urls = [url for _, url, _ in targets]
-    bodies = (fetcher or _default_fetcher())(urls)
+    fetch = fetcher or _default_fetcher()
+    bodies = fetch(urls)
     grades: List[golden.PageGrade] = []
     for provider, url, entries in targets:
         live = bodies.get(url)
@@ -74,15 +79,52 @@ def run(
         "counts": golden.summarize_grades(grades),
         "pages": [g.as_dict() for g in grades],
     }
+    refetch = _refetch_counts(fetch)
+    if refetch:
+        payload["fetch"] = refetch
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     return payload
 
 
+def _refetch_counts(fetch: Callable[[List[str]], Dict[str, str]]) -> Optional[Dict[str, Any]]:
+    """Stripped / restored page counts from the fetcher, when it keeps any.
+
+    Counts and domains only. A fetcher that replays saved bodies
+    (`--from-bodies`) fetched nothing and reports nothing, and a stats call
+    that fails costs the run this one line, never its grades.
+    """
+    stats = getattr(fetch, "stats", None)
+    if not callable(stats):
+        return None
+    try:
+        discovery = ((stats() or {}).get("fetch") or {}).get("discovery") or {}
+    except Exception as exc:
+        logger.warning("fetch stats unavailable: %s", exc)
+        return None
+    if not discovery.get("degraded"):
+        return None
+    return {
+        "degraded": int(discovery.get("degraded") or 0),
+        "recovered": int(discovery.get("recovered") or 0),
+        "by_domain": {
+            domain: {k: int(v) for k, v in counts.items() if k in ("degraded", "recovered")}
+            for domain, counts in (discovery.get("by_domain") or {}).items()
+            if counts.get("degraded") or counts.get("recovered")
+        },
+    }
+
+
 def describe(payload: Dict[str, Any]) -> List[str]:
     lines = [f"golden set ({payload.get('case_id')}, key as of {payload.get('key_as_of')}): "
              + ", ".join(f"{k} {v}" for k, v in payload["counts"].items() if v)]
+    fetch = payload.get("fetch") or {}
+    if fetch.get("degraded"):
+        lines.append(
+            f"  {fetch['degraded']} page(s) arrived stripped; a cache-bypass refetch restored "
+            f"{fetch.get('recovered', 0)}"
+        )
     for page in payload["pages"]:
         if page["status"] != "ok":
             lines.append(f"  {page['status']:15s} {page['provider_id']}/{page['platform']}: {'; '.join(page['notes'])}")
